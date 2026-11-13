@@ -55,6 +55,9 @@ if (!parsed) {
 
 async function start(): Promise<void> {
   if (headless || cli.mode === 'agent') app.dock?.hide();
+  if (headless) app.disableHardwareAcceleration();
+  // The elevated child must not touch the user's Chromium profile (cache files owned by an elevated token).
+  if (cli.mode === 'host-setup') app.setPath('userData', path.join(app.getPath('temp'), 'LanPlay-elevated'));
   await app.whenReady();
 
   const paths = computeAppPaths({

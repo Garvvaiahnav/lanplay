@@ -177,6 +177,18 @@ describe('agent pairing flow', () => {
     expect(mock.clients).toHaveLength(0);
   });
 
+  it('matches a multi-homed client by its other address (clientAddresses)', async () => {
+    const { port, mock, log } = await setup();
+    mock.addPending({ name: 'Moonlight', address: '192.168.0.160', expectedPin: '1111' });
+    const body = JSON.stringify({ pin: '1111', clientName: 'Mac mini', clientId: '6f1c2b8e-1d2a-4c55-9b7e-0a1b2c3d4e5f', clientAddresses: ['192.168.0.158', '192.168.0.160'] });
+    expect((await call(port, 'POST', '/v1/pair', body, JSON_CT)).json.status).toBe('paired');
+    expect(JSON.stringify(log.entries)).toContain('"matchedAddress":"192.168.0.160"');
+    const bad = JSON.stringify({ pin: '1111', clientName: 'Mac', clientId: '6f1c2b8e-1d2a', clientAddresses: ['8.8.8.8'] });
+    expect((await call(port, 'POST', '/v1/pair', bad, JSON_CT)).status).toBe(400);
+    const many = JSON.stringify({ pin: '1111', clientName: 'Mac', clientId: '6f1c2b8e-1d2a', clientAddresses: Array.from({ length: 9 }, (_, i) => `10.0.0.${i}`) });
+    expect((await call(port, 'POST', '/v1/pair', many, JSON_CT)).status).toBe(400);
+  });
+
   it('matches an IPv4-mapped pending address', async () => {
     const { port, mock } = await setup();
     mock.addPending({ name: 'Moonlight', address: '::ffff:127.0.0.1', expectedPin: '1111' });

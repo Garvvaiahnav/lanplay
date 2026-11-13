@@ -1,5 +1,6 @@
 // Windows host setup steps. Every decision is made here in TypeScript; PowerShell only reports/does one thing.
 // Each step: probe() is read-only (self-check), apply() is idempotent (setup). Paths: path.win32 only.
+import { X509Certificate } from 'node:crypto';
 import path from 'node:path';
 import { LANPLAY, SUNSHINE, SUNSHINE_MANAGED_CONFIG, SunshineApiError } from '../../contracts.js';
 import type { HostStep, HostStepContext, HostStepId, SunshineClient, SunshineClientOptions, SunshineFactsPs, SunshineInstall } from '../../contracts.js';
@@ -204,6 +205,16 @@ export function evaluateAgentFirewall(rules: FirewallRuleFact[], port: number): 
   }
   const blockRules = rules.filter((r) => r.matchedBy === 'program' && r.enabled && /^inbound$/i.test(r.direction) && /^block$/i.test(r.action));
   return { ok: problems.length === 0, problems, blockRules };
+}
+
+/** Non-secret certificate facts for diagnostics (helps if Electron's BoringSSL treats Sunshine's cert differently). */
+export function certSummary(pem: string): Record<string, unknown> {
+  try {
+    const c = new X509Certificate(pem);
+    return { subject: c.subject, issuer: c.issuer, serialNumber: c.serialNumber, validFrom: c.validFrom, validTo: c.validTo, ca: c.ca, keyType: c.publicKey.asymmetricKeyType ?? null };
+  } catch (e) {
+    return { error: (e as Error).message };
+  }
 }
 
 /* ------------------------------------------------------------------ steps */
@@ -417,6 +428,7 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
         s.data.pinnedFrom = from;
         if (!pem) return { status: 'fail', message: `No pinned Sunshine certificate at ${env.pinnedCertPath}.` };
         s.data.pinnedFingerprint256 = env.fingerprint(pem);
+        s.data.cert = certSummary(pem);
         const tlsr = await env.tlsPinCheck('127.0.0.1', SUNSHINE.webUiPort, pem, 5000);
         s.data.tls = tlsr;
         return tlsr.ok ? { status: 'pass', message: 'Web API up and its certificate matches the pinned one.' } : { status: 'fail', message: `Web API certificate does not match the pinned one: ${tlsr.error}. Run setup again.` };
@@ -443,6 +455,7 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
           return { status: 'fail', message: `Sunshine certificate unreadable: ${(e as Error).message}` };
         }
         s.data.certFingerprint256 = fp;
+        s.data.cert = certSummary(pem);
         const tlsr = await env.tlsPinCheck('127.0.0.1', SUNSHINE.webUiPort, pem, 5000);
         s.data.tls = tlsr;
         if (!tlsr.ok) return { status: 'fail', message: `The web API serves a different certificate than ${ctx.install!.certFile}: ${tlsr.error}` };
@@ -549,7 +562,9 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
       const r = await runPs<{ rules: unknown }>(
         { runner: ctx.runner, systemRoot: ctx.systemRoot, psDir: ctx.psDir, redactor: ctx.log.redactor },
         'set-agent-firewall-rule',
-        { Port: LANPLAY.agentPort, Name: LANPLAY.agentFirewallRuleName },
+        // -Program also adds allow rules bound to LanPlay.exe so Windows never shows its "allow access?" prompt
+        // (dismissing that prompt creates a Block rule, and Block beats Allow).
+        { Port: LANPLAY.agentPort, Name: LANPLAY.agentFirewallRuleName, Program: env.selfExe },
         timing(env).psTimeoutMs,
         s.commands,
       );

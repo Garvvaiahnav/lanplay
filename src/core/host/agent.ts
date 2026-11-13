@@ -4,6 +4,7 @@
 import dgram from 'node:dgram';
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
+import net from 'node:net';
 import type { AddressInfo } from 'node:net';
 import { LANPLAY, SUNSHINE, SunshineApiError } from '../../contracts.js';
 import type {
@@ -93,7 +94,15 @@ export function parsePairRequest(body: unknown): AgentPairRequest | { error: str
   const clientName = sanitizeClientName(b.clientName);
   if (!clientName) return { error: 'clientName must be 1..64 letters, digits, spaces, dots, dashes or underscores' };
   if (typeof b.clientId !== 'string' || !/^[0-9A-Za-z-]{8,64}$/.test(b.clientId)) return { error: 'clientId must be a uuid' };
-  return { pin: b.pin, clientName, clientId: b.clientId };
+  const out: AgentPairRequest = { pin: b.pin, clientName, clientId: b.clientId };
+  if (b.clientAddresses !== undefined) {
+    const a = b.clientAddresses;
+    if (!Array.isArray(a) || a.length > 8 || !a.every((x) => typeof x === 'string' && net.isIP(normalizeAddress(x)) !== 0 && isPrivateAddress(x))) {
+      return { error: 'clientAddresses must be up to 8 private IP addresses' };
+    }
+    out.clientAddresses = [...new Set(a.map((x) => normalizeAddress(x as string)))];
+  }
+  return out;
 }
 
 /** Host header allow-list (DNS rebinding guard). */
@@ -110,6 +119,7 @@ export function isAllowedHost(hostHeader: string | undefined, port: number, iden
 /* ---------------- agent ---------------- */
 interface PendingEntry extends PendingApproval {
   remote: string;
+  alsoFrom: string[];
   pin: string;
   status: 'waiting' | 'approved' | 'denied' | 'expired' | 'done';
   result?: AgentPairResponse;
@@ -315,7 +325,7 @@ export class LanPairAgent implements PairAgent {
     p.status = 'approved';
     this.emit();
     void this.pairMutex
-      .run(() => this.doPair(p.remote, p.pin, p.clientName))
+      .run(() => this.doPair(p.remote, p.pin, p.clientName, p.alsoFrom))
       .then((r) => {
         p.result = r;
         p.status = 'done';
@@ -450,6 +460,7 @@ export class LanPairAgent implements PairAgent {
         clientName: r.clientName,
         remoteAddress: remote,
         remote,
+        alsoFrom: r.clientAddresses ?? [],
         pin: r.pin,
         requestedAt: new Date(t).toISOString(),
         expiresAt: new Date(t + ttl).toISOString(),
@@ -469,7 +480,7 @@ export class LanPairAgent implements PairAgent {
       const out: AgentPairResponse = { status: 'pending-approval', requestId: entry.requestId, expiresInMs: ttl };
       return this.send(res, 202, out);
     }
-    const result = await this.pairMutex.run(() => this.doPair(remote, r.pin, r.clientName));
+    const result = await this.pairMutex.run(() => this.doPair(remote, r.pin, r.clientName, r.clientAddresses ?? []));
     return this.send(res, 200, result);
   }
 
@@ -484,7 +495,7 @@ export class LanPairAgent implements PairAgent {
   }
 
   /** Find Moonlight's pending pairing from `remote` in GET /api/pin and submit the PIN. */
-  private async doPair(remote: string, pin: string, clientName: string): Promise<AgentPairResponse> {
+  private async doPair(remote: string, pin: string, clientName: string, alsoFrom: readonly string[] = []): Promise<AgentPairResponse> {
     const fail = (code: PairErrorCode, message: string): AgentPairResponse => {
       this.log.log('warn', 'agent', `pair failed: ${code}`, { remote, message });
       return { status: 'failed', code, message };
@@ -500,8 +511,12 @@ export class LanPairAgent implements PairAgent {
       for (;;) {
         const list = await this.o.sunshine.getPendingPairings();
         for (const p of list) seen.add(p.address);
-        const mine = list.filter((p) => normalizeAddress(p.address) === remote);
-        match = mine[mine.length - 1];
+        // Prefer the HTTP source address; then the client's other addresses (multi-homed Mac).
+        for (const addr of [remote, ...alsoFrom.filter((a) => a !== remote)]) {
+          const mine = list.filter((p) => normalizeAddress(p.address) === addr);
+          match = mine[mine.length - 1];
+          if (match) break;
+        }
         if (match || this.now() >= deadline) break;
         await new Promise((r) => setTimeout(r, pollMs));
       }
@@ -509,8 +524,8 @@ export class LanPairAgent implements PairAgent {
       return this.sunshineFail(e, fail);
     }
     if (!match) {
-      this.log.log('warn', 'agent', 'no pending pairing from requester', { remote, addressesSeen: [...seen] });
-      return fail('no-pending-pairing', `Sunshine never saw a Moonlight pairing request from ${remote}. Seen: ${[...seen].join(', ') || 'none'}.`);
+      this.log.log('warn', 'agent', 'no pending pairing from requester', { remote, clientAddresses: alsoFrom, addressesSeen: [...seen] });
+      return fail('no-pending-pairing', `Sunshine never saw a Moonlight pairing request from ${[remote, ...alsoFrom.filter((a) => a !== remote)].join(' / ')}. Seen: ${[...seen].join(', ') || 'none'}.`);
     }
     let ok: boolean;
     try {
@@ -531,7 +546,7 @@ export class LanPairAgent implements PairAgent {
       ledger.push({ uuid, name: clientName, enabled: true, pairedVia: 'lanplay', pairedAt: new Date(this.now()).toISOString(), lastAddress: remote });
       this.ledger.set(LEDGER_KEY, ledger.slice(-100));
     }
-    this.log.log('info', 'agent', 'paired', { remote, clientName, uuid: uuid ?? null });
+    this.log.log('info', 'agent', 'paired', { remote, matchedAddress: match.address, clientName, uuid: uuid ?? null });
     this.emit();
     return { status: 'paired', sunshineClientName: clientName };
   }

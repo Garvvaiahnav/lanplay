@@ -59,6 +59,8 @@ export interface PairingDeps {
   log: Logger;
   clientName: () => string;
   clientId: () => string;
+  /** Our private IPv4 addresses (multi-homed Macs); see AgentPairRequest.clientAddresses. */
+  clientAddresses?: () => string[];
   agentPort: number;
   timing?: Partial<Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs', number>>;
   agentRequest?: typeof agentRequest;
@@ -131,6 +133,8 @@ export class ClientPairingService implements PairingService {
 
       progress('contacting-agent', `Asking ${host.name} to accept this Mac…`);
       const req: AgentPairRequest = { pin, clientName: this.d.clientName(), clientId: this.d.clientId() };
+      const addrs = this.d.clientAddresses?.().slice(0, 8) ?? [];
+      if (addrs.length) req.clientAddresses = addrs;
       const agentCall = this.callAgent(ip, req, progress);
       // If Moonlight dies before the agent answers, report Moonlight's error rather than waiting.
       const raced = await Promise.race([agentCall.then((r) => ({ kind: 'agent' as const, r })), early.then((r) => ({ kind: 'moonlight' as const, r }))]);

@@ -645,6 +645,13 @@ export interface AgentPairRequest {
   clientName: string;
   /** Random per-install client id (uuid v4), used to correlate retries; not a secret. */
   clientId: string;
+  /**
+   * Added by logic builder (additive, optional): the client's own private IPv4 addresses (max 8). A Mac with Wi-Fi AND
+   * Ethernet on the same subnet (the Mac mini has two) may reach Sunshine from one address and the agent from the
+   * other; the agent tries the HTTP source address first, then these. A wrong match only makes Sunshine's handshake
+   * fail (the PIN belongs to the requester's own Moonlight), so this does not weaken the address check.
+   */
+  clientAddresses?: string[];
 }
 
 export type AgentPairResponse =

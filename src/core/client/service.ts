@@ -91,6 +91,7 @@ export class MacClientService implements ClientService {
       log: deps.log.child('client'),
       clientName: defaultClientName,
       clientId: () => this.clientId(),
+      clientAddresses: () => localIPv4Interfaces().map((i) => i.address),
       agentPort: LANPLAY.agentPort,
       ...(x.pairing ?? {}),
     });
