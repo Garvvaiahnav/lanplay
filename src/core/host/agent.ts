@@ -352,6 +352,7 @@ export class LanPairAgent implements PairAgent {
       p.result = { status: 'denied' };
       this.emit();
       this.scheduleForget(p);
+      void this.cancelPendingFor(p.remote, p.alsoFrom);
       return;
     }
     p.status = 'approved';
@@ -363,6 +364,23 @@ export class LanPairAgent implements PairAgent {
         p.status = 'done';
         this.scheduleForget(p);
       });
+  }
+
+  /**
+   * A denied / expired request leaves Moonlight's pairing pending inside Sunshine for up to 5 minutes, and Sunshine
+   * allows only one pending pairing per Moonlight client ("A pairing session with this uniqueid already exists"), so
+   * the device's next attempt would fail. Cancel it (DELETE /api/pin {"pairing_id"}). Best effort.
+   * https://github.com/LizardByte/Sunshine/blob/v2026.914.233613/src/confighttp.cpp (cancelPairing)
+   */
+  private async cancelPendingFor(remote: string, alsoFrom: readonly string[]): Promise<void> {
+    try {
+      const addrs = new Set([remote, ...alsoFrom]);
+      for (const p of await this.o.sunshine.getPendingPairings()) {
+        if (addrs.has(normalizeAddress(p.address))) await this.o.sunshine.cancelPairing(p.id);
+      }
+    } catch (e) {
+      this.log.log('debug', 'agent', 'could not cancel the pending pairing in Sunshine', { remote, error: (e as Error).message });
+    }
   }
 
   private scheduleForget(p: PendingEntry): void {
@@ -525,6 +543,7 @@ export class LanPairAgent implements PairAgent {
           entry.result = { status: 'failed', code: 'approval-timeout', message: 'Nobody approved the request on the PC in time.' };
           this.emit();
           this.scheduleForget(entry);
+          void this.cancelPendingFor(entry.remote, entry.alsoFrom);
         }
       }, ttl);
       entry.timer.unref?.();

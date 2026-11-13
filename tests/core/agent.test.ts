@@ -326,6 +326,23 @@ describe('agent pairing flow', () => {
     expect((await call(port, 'GET', `/v1/pair/unknown-id`)).status).toBe(404);
   });
 
+  it('deny and approval timeout cancel the pending pairing inside Sunshine, so the next attempt is not blocked for 5 minutes', async () => {
+    const { port, mock, agent } = await setup({ autoApprove: false, approvalTimeoutMs: 150 });
+    mock.addPending({ name: 'Moonlight', address: '127.0.0.1', expectedPin: '4821' });
+    mock.addPending({ name: 'Other device', address: '192.168.1.77', expectedPin: '9999' });
+    const r = await call(port, 'POST', '/v1/pair', pairBody('4821'), JSON_CT);
+    await agent.decide(r.json.requestId, false);
+    for (let i = 0; i < 50 && mock.pending.length > 1; i++) await new Promise((x) => setTimeout(x, 10));
+    expect(mock.pending.map((p) => p.address)).toEqual(['192.168.1.77']); // only the denied device's pairing was cancelled
+    expect(mock.requests.some((q) => q.method === 'DELETE' && q.url === '/api/pin')).toBe(true);
+
+    mock.addPending({ name: 'Moonlight', address: '127.0.0.1', expectedPin: '4821' });
+    await call(port, 'POST', '/v1/pair', pairBody('4821', 'Slow Mac'), JSON_CT);
+    await new Promise((x) => setTimeout(x, 300));
+    for (let i = 0; i < 50 && mock.pending.length > 1; i++) await new Promise((x) => setTimeout(x, 10));
+    expect(mock.pending.map((p) => p.address)).toEqual(['192.168.1.77']);
+  });
+
   it('persists the auto-approve switch (default ON)', async () => {
     const { agent, settings } = await setup();
     expect(agent.getState().autoApprove).toBe(true);

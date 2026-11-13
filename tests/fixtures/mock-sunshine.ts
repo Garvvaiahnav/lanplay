@@ -35,6 +35,12 @@ export interface MockPending {
   address: string;
   /** PIN the "Moonlight" side entered; POST /api/pin succeeds only if it matches. */
   expectedPin: string;
+  /**
+   * Moonlight client id. Sunshine keeps ONE pending session per uniqueid ("map_id_sess.emplace(sess.client.uniqueID, ...)")
+   * and answers a second getservercert with HTTP 409 "A pairing session with this uniqueid already exists"
+   * (nvhttp.cpp insert_pair_session / start_pairing_session, tag v2026.914.233613).
+   */
+  uniqueId?: string;
 }
 
 export interface RecordedRequest {
@@ -100,6 +106,7 @@ export async function startMockSunshine(opts: MockSunshineOptions = {}): Promise
 
   const addPending = (p: Omit<MockPending, 'id'> & { id?: string }): MockPending => {
     const full: MockPending = { id: p.id ?? randomBytes(16).toString('hex'), name: p.name, address: p.address, expectedPin: p.expectedPin };
+    if (p.uniqueId !== undefined) full.uniqueId = p.uniqueId;
     pending.push(full);
     return full;
   };
@@ -191,8 +198,10 @@ export async function startMockSunshine(opts: MockSunshineOptions = {}): Promise
   const hook = http.createServer((req, res) => {
     void readBody(req).then((b) => {
       if (req.method === 'POST' && req.url === '/hook/pair') {
-        const p = JSON.parse(b) as { address: string; name: string; pin: string };
-        const added = addPending({ address: p.address, name: p.name, expectedPin: p.pin });
+        const p = JSON.parse(b) as { address: string; name: string; pin: string; uniqueId?: string };
+        const uniqueId = p.uniqueId ?? '0123456789ABCDEF';
+        if (pending.some((x) => x.uniqueId === uniqueId)) return json(res, 409, { status_code: 409, status_message: 'A pairing session with this uniqueid already exists' });
+        const added = addPending({ address: p.address, name: p.name, expectedPin: p.pin, uniqueId });
         return json(res, 200, { id: added.id });
       }
       if (req.method === 'GET' && req.url === '/hook/state') return json(res, 200, { pending, clients });

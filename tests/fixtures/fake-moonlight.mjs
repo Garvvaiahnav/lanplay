@@ -8,7 +8,7 @@
 //  - `list <host>`: exit 0 when paired, "Computer %1 has not been paired." + exit -1 (255) otherwise (listapps.cpp#L100-L112).
 //  - `stream ...`: records argv and exits 0.
 // Env: FAKE_ML_STATE (JSON state file, required), FAKE_ML_HOOK (mock Sunshine hook base URL),
-//      FAKE_ML_ADDRESS (address Sunshine "sees", default 127.0.0.1), FAKE_ML_MODE (normal|crash|no-register|ignore-term).
+//      FAKE_ML_ADDRESS (address Sunshine "sees", default 127.0.0.1), FAKE_ML_MODE (normal|crash|no-register|ignore-term|exit-on-409).
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const stateFile = process.env.FAKE_ML_STATE;
@@ -56,7 +56,12 @@ if (cmd === 'stream') {
   let pendingId = null;
   if (hook && mode !== 'no-register') {
     const r = await fetch(`${hook}/hook/pair`, { method: 'POST', body: JSON.stringify({ address, name: 'Moonlight', pin }) });
-    pendingId = (await r.json()).id;
+    if (r.status === 409) {
+      // Real Moonlight: the pairing fails ("A pairing session with this uniqueid already exists") and an error dialog
+      // stays open until it is closed (CliPair.qml); FAKE_ML_MODE=exit-on-409 models a build that exits instead.
+      console.error('Pairing failed: A pairing session with this uniqueid already exists');
+      if (mode === 'exit-on-409') process.exit(1);
+    } else pendingId = (await r.json()).id;
   }
   // Watch the host: once our pending pairing is gone and a client exists, the handshake completed.
   const iv = setInterval(async () => {

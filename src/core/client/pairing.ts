@@ -62,7 +62,7 @@ export interface PairingDeps {
   /** Our private IPv4 addresses (multi-homed Macs); see AgentPairRequest.clientAddresses. */
   clientAddresses?: () => string[];
   agentPort: number;
-  timing?: Partial<Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs', number>>;
+  timing?: Partial<Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs' | 'leftoverWaitMs', number>>;
   agentRequest?: typeof agentRequest;
   pin?: () => string;
   sleep?: (ms: number) => Promise<void>;
@@ -99,7 +99,7 @@ export class ClientPairingService implements PairingService {
   constructor(private readonly d: PairingDeps) {}
 
   private get t() {
-    const base: Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs', number> = { ...PAIR_TIMING, approvalPollMs: 1000, listTimeoutMs: 20_000 };
+    const base: Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs' | 'leftoverWaitMs', number> = { ...PAIR_TIMING, approvalPollMs: 1000, listTimeoutMs: 20_000, leftoverWaitMs: 5000 };
     return { ...base, ...(this.d.timing ?? {}) };
   }
 
@@ -125,11 +125,37 @@ export class ClientPairingService implements PairingService {
         progress('done', 'Already paired.');
         return { ok: true, hostId: host.id, alreadyPaired: true, durationMs: now() - t0 };
       }
+      /**
+       * Sunshine keeps at most ONE pending pairing per Moonlight client id ("map_id_sess.emplace(sess.client.uniqueID, ...)",
+       * a second getservercert gets HTTP 409 "A pairing session with this uniqueid already exists") for up to 5 minutes
+       * (PAIRING_SESSION_TIMEOUT). A leftover from an interrupted earlier attempt therefore makes the next attempt fail
+       * once; that failure erases the leftover ("complete_pairing(sess, false); map_id_sess.erase(sess_it);"), so a
+       * second try succeeds. Retry once here instead of making the user press the button twice.
+       * https://github.com/LizardByte/Sunshine/blob/v2026.914.233613/src/nvhttp.cpp (insert_pair_session, pin)
+       */
+      const maxAttempts = 2;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await attemptOnce(ip);
+        } catch (e) {
+          const retry = e instanceof PairFail && e.code === 'wrong-pin' && attempt < maxAttempts;
+          if (!retry) throw e;
+          log.log('info', 'pair', 'first attempt hit a leftover pairing on the PC; trying once more', { hostId: host.id });
+          const h = handle as MoonlightProcessHandle | null;
+          handle = null;
+          if (h) await h.terminate(this.t.terminateGraceMs).catch(() => undefined);
+          progress('starting-moonlight', 'Clearing an old pairing attempt and trying again…');
+        }
+      }
+    };
+
+    const attemptOnce = async (ip: string): Promise<PairResult> => {
       const pin = (this.d.pin ?? generatePin)();
       log.redactor.addSecret(pin);
       progress('starting-moonlight', 'Starting Moonlight pairing…');
-      handle = this.d.moonlight.startPair(ip, pin);
-      const early = handle.exited.then((r) => r);
+      const started = this.d.moonlight.startPair(ip, pin);
+      handle = started;
+      const early = started.exited.then((r) => r);
 
       progress('contacting-agent', `Asking ${host.name} to accept this Mac…`);
       const req: AgentPairRequest = { pin, clientName: this.d.clientName(), clientId: this.d.clientId() };
@@ -141,8 +167,16 @@ export class ClientPairingService implements PairingService {
       let resp: AgentPairResponse;
       if (raced.kind === 'moonlight') {
         const r = raced.r;
+        // The agent call is still running; its late failure must not become an unhandled rejection.
+        if (r.spawnError || r.exitCode !== 0) agentCall.catch(() => undefined);
         if (r.spawnError) throw new PairFail('moonlight-missing', `Moonlight could not start: ${r.spawnError}`, false);
-        if (r.exitCode !== 0) throw new PairFail('moonlight-failed', `Moonlight pair exited with ${r.exitCode}: ${tail(r.stderr || r.stdout, 300).trim()}`, true);
+        if (r.exitCode !== 0) {
+          // A leftover pairing on the PC makes Moonlight fail at once (HTTP 409); give the agent a moment to report
+          // (and thereby clear) it, so the automatic second attempt can run.
+          const late = await Promise.race([agentCall.then((x) => x, () => null), new Promise<null>((res) => setTimeout(() => res(null), this.t.leftoverWaitMs))]);
+          if (late && late.status === 'failed' && late.code === 'wrong-pin') throw new PairFail('wrong-pin', late.message, true);
+          throw new PairFail('moonlight-failed', `Moonlight pair exited with ${r.exitCode}: ${tail(r.stderr || r.stdout, 300).trim()}`, true);
+        }
         resp = await agentCall;
       } else {
         resp = raced.r;
@@ -153,7 +187,7 @@ export class ClientPairingService implements PairingService {
 
       progress('confirming', 'PC accepted. Finishing in Moonlight…');
       await this.sleep(this.t.postSuccessFlushMs);
-      await handle.terminate(this.t.terminateGraceMs);
+      await started.terminate(this.t.terminateGraceMs);
       progress('verifying', 'Checking the pairing…');
       const verify = await this.list(ip);
       if (!verify.paired) throw new PairFail('verify-failed', `Moonlight still says it is not paired (list exit ${verify.exitCode}).`, true);

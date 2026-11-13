@@ -32,8 +32,8 @@ afterEach(async () => {
   for (const c of cleanups.splice(0).reverse()) await c();
 });
 
-async function world(opts: { autoApprove?: boolean; mode?: string; scms?: number } = {}) {
-  const mock: MockSunshine = await startMockSunshine();
+async function world(opts: { autoApprove?: boolean; mode?: string; scms?: number; handshake?: () => Promise<boolean> } = {}) {
+  const mock: MockSunshine = await startMockSunshine(opts.handshake ? { handshake: opts.handshake } : {});
   cleanups.push(() => mock.close());
   const log = new MemoryLogger();
   const hostSettings = new MemoryStore();
@@ -128,6 +128,28 @@ describe('pairing end to end (fake Moonlight + real agent + mock Sunshine)', () 
     const w = await world({ mode: 'no-register' });
     const r = await pairing(w).pair(hostInfo(w.sunshinePort), () => undefined);
     expect(r).toMatchObject({ ok: false, code: 'no-pending-pairing', retryable: true });
+  });
+
+  it.each(['normal', 'exit-on-409'] as const)('recovers by itself from a leftover pairing on the PC (Sunshine allows one pending pairing per Moonlight client), Moonlight %s', async (mode) => {
+    const w = await world({ mode });
+    // An earlier, interrupted attempt from this Mac is still pending inside Sunshine (kept for 5 minutes).
+    w.mock.addPending({ name: 'Moonlight', address: '127.0.0.1', expectedPin: '0000', uniqueId: '0123456789ABCDEF' });
+    const phases: string[] = [];
+    const r = await pairing(w).pair(hostInfo(w.sunshinePort), (p) => phases.push(`${p.phase}:${p.message}`));
+    expect(r, JSON.stringify(r)).toMatchObject({ ok: true, alreadyPaired: false });
+    // first PIN went to the leftover session (rejected, which erases it), the second to the fresh one
+    expect(w.mock.requests.filter((q) => q.method === 'POST' && q.url === '/api/pin')).toHaveLength(2);
+    expect(state(w.stateFile).paired['127.0.0.1']).toBe(true);
+    expect(phases.some((p) => /Clearing an old pairing attempt/.test(p))).toBe(true);
+    expect(w.mock.pending).toHaveLength(0);
+    expect(w.mock.clients.map((c) => c.name)).toEqual(['Mac mini']);
+  });
+
+  it('a genuinely wrong PIN still fails after the one automatic retry (no endless loop)', async () => {
+    const w = await world({ handshake: async () => false });
+    const r = await pairing(w).pair(hostInfo(w.sunshinePort), () => undefined);
+    expect(r).toMatchObject({ ok: false, code: 'wrong-pin' });
+    expect(w.mock.requests.filter((q) => q.method === 'POST' && q.url === '/api/pin')).toHaveLength(2);
   });
 
   it('reports agent-unreachable', async () => {
