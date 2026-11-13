@@ -151,6 +151,16 @@ describe('mergeSunshineConf', () => {
     expect(b).toEqual({ text: a.text, changed: false });
   });
 
+  it('reads sunshine.conf like Sunshine does: first occurrence wins, text after # is a comment; our value always ends up effective', () => {
+    expect(parseSunshineConf('upnp = enabled # router\nupnp = disabled\n#hevc_mode = 3\nsunshine_name = Büro PC\n')).toEqual({ upnp: 'enabled', sunshine_name: 'Büro PC' });
+    // a user file where an EARLIER duplicate and an inline comment would beat a naive "append our keys" merge
+    const user = 'origin_web_ui_allowed = wan # I like danger\r\nupnp = on\r\nupnp = disabled\r\nav1_mode = 0\r\n';
+    const m = mergeSunshineConf(user, SUNSHINE_MANAGED_CONFIG);
+    expect(m.changed).toBe(true);
+    expect(parseSunshineConf(m.text)).toMatchObject({ ...SUNSHINE_MANAGED_CONFIG });
+    expect(mergeSunshineConf(m.text, SUNSHINE_MANAGED_CONFIG).changed).toBe(false);
+  });
+
   it('keeps unknown keys, comments, order and CRLF; replaces + dedupes managed keys', () => {
     const src = '# my config\r\nsunshine_name = Gaming PC\r\norigin_web_ui_allowed = wan\r\nencoder = nvenc\r\nupnp = enabled\r\nupnp = enabled\r\n';
     const r = mergeSunshineConf(src, SUNSHINE_MANAGED_CONFIG);

@@ -47,12 +47,12 @@ afterEach(() => {
 const ready = async (): Promise<void> => flush(12);
 
 describe('host screen', () => {
-  it('shows host name, Sunshine installed/running and admin chips', async () => {
+  it('shows host name and Sunshine installed/running chips', async () => {
     setup();
     await ready();
     expect(q(root, '.copyable').textContent).toBe('GARV-PC');
     const chips = [...root.querySelectorAll('.chip')].map((c) => c.textContent);
-    expect(chips).toEqual(['Installed: yes', 'Running: yes', 'Administrator rights: yes']);
+    expect(chips).toEqual(['Installed: yes', 'Running: yes']);
     expect(buttonByText(root, 'Set up / Repair')).toBeTruthy();
   });
 
@@ -60,8 +60,18 @@ describe('host screen', () => {
     setup({ 'host:setup-status': () => ({ lastRunAt: null, ok: false, steps: [], install: null, isAdmin: false }) });
     await ready();
     const chips = [...root.querySelectorAll('.chip')].map((c) => c.textContent);
-    expect(chips).toEqual(['Installed: no', 'Running: unknown', 'Administrator rights: no']);
+    expect(chips).toEqual(['Installed: no', 'Running: unknown']);
     expect(buttonByText(root, 'Install and set up')).toBeTruthy();
+    // not elevated (the normal case): no admin warning
+    expect([...root.querySelectorAll('p.hint.err')].every((p) => (p as HTMLElement).hidden || p.textContent === '')).toBe(true);
+  });
+
+  it('started with "Run as administrator": says to start it normally instead', async () => {
+    setup({ 'host:setup-status': () => ({ lastRunAt: null, ok: false, steps: [], install: null, isAdmin: true }) });
+    await ready();
+    const warn = [...root.querySelectorAll('p.hint.err')].find((p) => /Run as administrator/.test(p.textContent ?? '')) as HTMLElement;
+    expect(warn.hidden).toBe(false);
+    expect(warn.textContent).toMatch(/start it normally/);
   });
 
   it('copies the host name', async () => {

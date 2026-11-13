@@ -141,8 +141,8 @@ Sunshine version/service state/`sunshine.log` tail, every `RestCallRecord` (reda
 "Run self-check" / `--self-check` runs every step's `probe()` independently (a failed probe never stops the next one).
 
 ## 6. Packaging
-- macOS: `electron-builder --mac dir --arm64`; `extraResources`: `vendor/moonlight-macos/Moonlight.app` (copy with
-  `ditto`-equivalent, keep its notarized signature). Our own app is unsigned (local build, not quarantined).
+- macOS: `npm run pack:mac` (= `electron-builder --config scripts/electron-builder.config.cjs --mac dir --arm64`);
+  `scripts/after-pack.cjs` copies `vendor/moonlight-macos/Moonlight.app` with `ditto` (keeps its notarized signature). Our own app is unsigned (local build, not quarantined).
 - Windows: portable `dir`/zip only (no NSIS). On the Mac, `win.signAndEditExecutable: false` avoids rcedit/wine; the
   full build is `scripts/build-windows.ps1` on the PC (fetch + verify MSI, `npm ci`, `electron-builder --win dir --x64`, zip).
   `extraResources`: MSI → `vendor/`, `src/host/ps/*.ps1` → `ps/`, `LICENSE`, `SOURCE-OFFER.md`.
@@ -169,6 +169,21 @@ Sunshine version/service state/`sunshine.log` tail, every `RestCallRecord` (reda
 
 ## 8. Contract changes
 Append here: date, what changed, why. Both builders re-run `npm run typecheck && npm test` after any change.
+
+- 2026-11-13 (review): no contract type changed. Behaviour changes, all with tests:
+  - Agent: flood guard on every request (120/min per IP, 600/min total) before any work; `/v1/info` cached 3 s; rejection
+    logs capped at 20/min; max 2 pending approvals per address; `maxConnections` 64; deny/timeout cancels the pending
+    pairing in Sunshine (`DELETE /api/pin`).
+  - Host: `.bat` scripts run as `cmd /d /c <name.bat>` with cwd = their folder (cmd drops the quotes of a quoted path
+    containing `( ) &`, e.g. `Program Files (x86)`); setup removes inbound Block rules bound to LanPlay.exe; the agent
+    does not listen at app start until setup ran for this exe path (no Windows firewall prompt to dismiss); api-auth
+    retries 5x2 s during setup and warns when sunshine.log reports no encoder; older installed Sunshine => warning with
+    the fix; upstream installer logs are copied from SYSTEM temp to the LanPlay log folder.
+  - Client: one automatic retry on `wrong-pin` (leftover pairing, see section 9); manual and mDNS hosts must be private
+    addresses; the screen for this computer's role opens directly (no first-run question).
+  - Diagnostics: the stored Sunshine password (and its Basic-auth forms) is registered with the Redactor before
+    collecting; logs are read from `%ProgramData%\LanPlay\logs` too when the app fell back to `%LOCALAPPDATA%`.
+  - Packaging: `npm run pack:*` pass `--config scripts/electron-builder.config.cjs`; mac target is `dir` only.
 
 ## 9. Verified facts (exact quotes)
 
@@ -208,6 +223,21 @@ Append here: date, what changed, why. Both builders re-run `npm run typecheck &&
 - mDNS — [platform/common.h#L1286-L1287](https://github.com/LizardByte/Sunshine/blob/v2026.914.233613/src/platform/common.h#L1286-L1287):
   `SERVICE_NAME = "Sunshine"`, `SERVICE_TYPE = "_nvstream._tcp"`.
 - Ports: nvhttp.h `PORT_HTTPS = -5`, confighttp.h `PORT_HTTPS = 1`, rtsp.h `RTSP_SETUP_PORT = 21`, stream.h 9/10/11.
+- One pending pairing per Moonlight client id (re-checked in review) — nvhttp.cpp `insert_pair_session`:
+  `map_id_sess.emplace(sess.client.uniqueID, std::move(sess));`, a second request gets HTTP 409 "A pairing session with
+  this uniqueid already exists"; `PAIRING_SESSION_TIMEOUT = std::chrono::minutes {5}` (nvhttp.h); a failed or timed-out
+  `pin()` does `complete_pairing(sess, false); map_id_sess.erase(sess_it);`. `get_pending_pairings()` sorts ascending by
+  `expires_at` (newest last).
+- Config parsing (config.cpp): text after `#` is stripped; `parse_config` uses `emplace` => the FIRST duplicate key wins;
+  `upnp` is a bool (`true/yes/enable/enabled/on/1`), `origin_web_ui_allowed` in `{pc, lan, wan}`, `hevc_mode`/`av1_mode` 0..3.
+- Silent MSI action runs as LocalSystem (`Execute="deferred" Impersonate="no" Return="ignore"`), so `sunshine-setup.ps1`
+  logs to SYSTEM's `%TEMP%\Sunshine\logs\install`; it runs `migrate-config.bat`, which makes `config\credentials`
+  admin-only (`icacls ... /inheritance:r`, Administrators full, Users read on the folder only): a normal user cannot
+  read `cacert.pem`, hence the pinned copy. Checked in the shipped `scripts\*.bat` / `sunshine-setup.ps1` (lite zip).
+- `--creds` — entry_handler.cpp: `http::save_user_creds(config::sunshine.credentials_file, argv[0], argv[1]); return 0;`
+  (no server is started; runs after `config::parse` and `logging::init`).
+- No-encoder log lines — video.cpp `BOOST_LOG(fatal) << "Unable to find display or encoder during startup."`, main.cpp
+  `BOOST_LOG(error) << "Video failed to find working encoder"`.
 - Release assets (GitHub API digest = local `shasum`): `Sunshine-Windows-AMD64-installer.msi` sha256 `1d7fed8b…0ccf`.
 
 **moonlight-qt** (tag v6.2.0)

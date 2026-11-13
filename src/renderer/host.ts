@@ -35,6 +35,7 @@ namespace LP.Host {
     const sunshineEl = h('ul', { class: 'chips', 'aria-label': 'Sunshine status' });
     const setupBtn = h('button', { type: 'button', class: 'btn primary' }, 'Set up / Repair');
     const stepsEl = h('ol', { class: 'steps', 'aria-label': 'Setup steps' });
+    const adminWarn = h('p', { class: 'hint err', role: 'status', hidden: true }, 'LanPlay was started with "Run as administrator". That is not needed and can lock its settings files for normal starts. Close LanPlay and start it normally (double-click); setup asks Windows for permission by itself.');
     const autoSwitch = Dom.toggle('Auto-approve devices on my network', (on) => {
       api.invoke('host:agent-set-auto-approve', { on }).then(setAgent, (e: unknown) => {
         autoSwitch.set(!on);
@@ -56,7 +57,7 @@ namespace LP.Host {
       h('header', { class: 'top' }, h('h1', null, 'LanPlay host'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, 'Change mode') : null),
       noteEl,
       card('h-name', 'This PC is called', h('div', { class: 'row' }, hostNameEl, copyNameBtn), h('p', { class: 'hint' }, 'The other computer finds this PC by itself. If it cannot, type this name or the IP address there.')),
-      card('h-sun', 'Sunshine', sunshineEl, h('div', { class: 'row' }, setupBtn), h('p', { class: 'hint' }, 'Windows will ask for permission once. This installs Sunshine, opens the firewall for your home network and starts it at login. If Sunshine was already installed, its web page login is replaced by one only LanPlay knows.'), stepsEl),
+      card('h-sun', 'Sunshine', sunshineEl, h('div', { class: 'row' }, setupBtn), h('p', { class: 'hint' }, 'Windows will ask for permission once. This installs Sunshine, opens the firewall for your home network and starts it at login. If Sunshine was already installed, its web page login is replaced by one only LanPlay knows.'), adminWarn, stepsEl),
       card('h-pair', 'Pairing', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Auto-approve devices on my network'), autoSwitch.el),
         h('p', { class: 'hint' }, 'On: any computer on your home network can pair without a code. Off: you approve each one here.'), agentLine,
         h('p', { class: 'hint' }, 'You can close this window: LanPlay keeps running in the background so the other computer can connect. To stop it completely, use File > Exit.'), pendingEl),
@@ -84,7 +85,10 @@ namespace LP.Host {
       hostNameEl.textContent = info?.hostName ?? '(unknown)';
       copyNameBtn.disabled = !info?.hostName;
       const sum = Model.sunshineSummary(status);
-      Dom.setChildren(sunshineEl, [chip('Installed', sum.installed), chip('Running', sum.running), chip('Administrator rights', status ? status.isAdmin : null)]);
+      // No "Administrator rights" chip: LanPlay should NOT be run as administrator (setup asks Windows once); a yellow
+      // "no" there only invites people to do exactly that. Admin status is still recorded in self-check and diagnostics.
+      Dom.setChildren(sunshineEl, [chip('Installed', sum.installed), chip('Running', sum.running)]);
+      adminWarn.hidden = status?.isAdmin !== true;
       setupBtn.disabled = setupBusy;
       setupBtn.textContent = setupBusy ? 'Working...' : sum.installed ? 'Set up / Repair' : 'Install and set up';
       Dom.setChildren(stepsEl, (setupBusy || live.length > 0 ? live : []).map(stepRow));

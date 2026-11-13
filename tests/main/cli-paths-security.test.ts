@@ -73,6 +73,20 @@ describe('security policy', () => {
     expect(isAllowedAppUrl('https://example.com/', dir)).toBe(false);
     expect(isAllowedAppUrl('javascript:alert(1)', dir)).toBe(false);
   });
+  it('Windows: drive-letter / path case never blocks the app\'s own page, and traversal is still refused', () => {
+    const winDir = 'c:\\Users\\Jörg Müller\\Downloads\\LanPlay-win32-x64\\resources\\app.asar\\dist\\renderer';
+    // what Chromium asks for after canonicalising the drive letter and percent-encoding
+    const page = 'file:///C:/Users/J%C3%B6rg%20M%C3%BCller/Downloads/LanPlay-win32-x64/resources/app.asar/dist/renderer/index.html';
+    expect(isAllowedAppUrl(page, winDir, true)).toBe(true);
+    expect(isAllowedAppUrl(page.replace('/renderer/index.html', '/RENDERER/styles.css'), winDir, true)).toBe(true);
+    expect(isAllowedAppUrl('file:///C:/Users/J%C3%B6rg%20M%C3%BCller/Downloads/LanPlay-win32-x64/resources/app.asar/dist/renderer/../main/main.js', winDir, true)).toBe(false);
+    expect(isAllowedAppUrl('file:///C:/Windows/System32/drivers/etc/hosts', winDir, true)).toBe(false);
+    expect(isAllowedAppUrl('file:///D:/Users/J%C3%B6rg%20M%C3%BCller/Downloads/LanPlay-win32-x64/resources/app.asar/dist/renderer/index.html', winDir, true)).toBe(false);
+    // UNC / remote hosts are never the app
+    expect(isAllowedAppUrl('file://fileserver/share/app.asar/dist/renderer/index.html', winDir, true)).toBe(false);
+    // POSIX stays case-sensitive
+    expect(isAllowedAppUrl(pathToFileURL(path.posix.join(dir.toUpperCase(), 'index.html')).toString(), dir, false)).toBe(false);
+  });
   it('external URLs: exact allow-list only', () => {
     expect(isAllowedExternalUrl('https://www.gnu.org/licenses/gpl-3.0.html')).toBe(true);
     expect(isAllowedExternalUrl('https://www.gnu.org/licenses/gpl-3.0.html?x')).toBe(false);

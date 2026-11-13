@@ -4,14 +4,20 @@ import { fileURLToPath } from 'node:url';
 import { SECURITY } from '../contracts.js';
 import type { App, Session } from 'electron';
 
-/** Only file:// URLs inside the renderer folder may be loaded or navigated to. */
-export function isAllowedAppUrl(url: string, rendererDir: string): boolean {
+/**
+ * Only file:// URLs inside the renderer folder may be loaded or navigated to.
+ * Windows paths are case-insensitive and Chromium canonicalises the drive letter of file: URLs ("file:///c:/" becomes
+ * "file:///C:/"), so the comparison ignores case there; otherwise starting LanPlay from "c:\..." would block its own page.
+ */
+export function isAllowedAppUrl(url: string, rendererDir: string, windows: boolean = process.platform === 'win32'): boolean {
   if (!SECURITY.allowedNavigationPrefixes.some((p) => url.startsWith(p))) return false;
   try {
     const u = new URL(url);
     if (u.protocol !== 'file:' || (u.host !== '' && u.host !== 'localhost')) return false;
-    const p = path.resolve(fileURLToPath(u));
-    const root = path.resolve(rendererDir) + path.sep;
+    const pp = windows ? path.win32 : path.posix;
+    const fold = (s: string) => (windows ? s.toLowerCase() : s);
+    const p = fold(pp.resolve(fileURLToPath(u, { windows })));
+    const root = fold(pp.resolve(rendererDir)) + pp.sep;
     return p.startsWith(root);
   } catch {
     return false;
