@@ -46,7 +46,13 @@ class FileSink implements Sink {
         mkdirSync(this.o.dir, { recursive: true });
         this.dirReady = true;
       }
-      appendFileSync(this.file(), line + '\n', { encoding: 'utf8' });
+      try {
+        appendFileSync(this.file(), line + '\n', { encoding: 'utf8' });
+      } catch {
+        // Windows: today's file may belong to an elevated run (owner Administrators) and refuse appends from a normal
+        // start, while new files in the folder are still allowed. Never lose the line silently: use a sibling file.
+        appendFileSync(this.file().replace(/\.log$/, '.user.log'), line + '\n', { encoding: 'utf8' });
+      }
     } catch {
       // Logging must never break the app. Diagnostics reports the log dir state separately.
     }

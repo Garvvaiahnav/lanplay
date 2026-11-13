@@ -1,5 +1,5 @@
 // Electron main process: CLI dispatch, security policy, window, IPC. Logic lives in src/core (tested without Electron).
-import { accessSync, constants, existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { app, BrowserWindow, ipcMain, net, protocol, safeStorage, session, shell } from 'electron';
@@ -20,10 +20,13 @@ const APP_ROOT = path.resolve(__dirname, '..', '..');
 const RENDERER_DIR = path.join(APP_ROOT, 'dist', 'renderer');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'preload.js');
 
+/** Real write test: on Windows accessSync(W_OK) only looks at the read-only attribute, not at the folder's ACL. */
 function canWrite(dir: string): boolean {
   try {
     mkdirSync(dir, { recursive: true });
-    accessSync(dir, constants.W_OK);
+    const probe = path.join(dir, `.write-test-${process.pid}`);
+    writeFileSync(probe, '');
+    rmSync(probe, { force: true });
     return true;
   } catch {
     return false;

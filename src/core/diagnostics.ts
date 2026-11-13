@@ -89,7 +89,7 @@ function stamp(d: Date): string {
 /** LanPlay logs of the last 3 days (normal + elevated). */
 export function recentLogFiles(logDir: string, now: Date): string[] {
   const cutoff = now.getTime() - 3 * 24 * 3600_000;
-  return newestFiles(logDir, (n) => /^lanplay-\d{4}-\d{2}-\d{2}(\.elevated)?\.log$/.test(n), 20).filter((p) => {
+  return newestFiles(logDir, (n) => /^lanplay-\d{4}-\d{2}-\d{2}(\.elevated)?(\.user)?\.log$/.test(n), 20).filter((p) => {
     try {
       return statSync(p).mtimeMs >= cutoff;
     } catch {

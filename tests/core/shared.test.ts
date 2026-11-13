@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -59,6 +59,19 @@ describe('JSONL logger', () => {
     expect(lines[1].scope).toBe('host.step');
     expect(lines[1].step.commands[0].argv[2]).toBe(REDACTED);
     expect(lines[0].data.password).toBe(REDACTED);
+  });
+
+  it('when today\'s file cannot be appended to (owned by an elevated run on Windows), lines go to a sibling .user.log that diagnostics also collects', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'lanplay-log-ro-'));
+    const now = new Date(2026, 10, 13, 9, 0, 0);
+    const locked = path.join(dir, 'lanplay-2026-11-13.log');
+    mkdirSync(locked); // appendFileSync on a directory fails like an access-denied file does
+    const log = createJsonlLogger({ dir, filePattern: 'lanplay-<date>.log', now: () => now });
+    log.log('info', 'main', 'not lost');
+    expect(readFileSync(path.join(dir, 'lanplay-2026-11-13.user.log'), 'utf8')).toContain('"msg":"not lost"');
+    const { recentLogFiles } = await import('../../src/core/diagnostics.js');
+    writeFileSync(path.join(dir, 'lanplay-2026-11-13.elevated.log'), '{}\n');
+    expect(recentLogFiles(dir, new Date()).map((f) => path.basename(f))).toEqual(expect.arrayContaining(['lanplay-2026-11-13.elevated.log', 'lanplay-2026-11-13.user.log']));
   });
 
   it('never throws when the directory is unwritable', () => {
