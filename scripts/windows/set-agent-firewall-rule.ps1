@@ -3,6 +3,7 @@
 # Two port rules (TCP for the HTTP API, UDP for discovery), RemoteAddress LocalSubnet, all profiles, enabled.
 # With -Program: two more rules bound to LanPlay.exe (same port/scope) so Windows does not show its
 # "allow access?" prompt when the app starts listening (dismissing it would create a Block rule).
+# Also removes inbound Block rules bound to -Program (left behind when the Windows firewall prompt was dismissed).
 # Stable rule ids (-Name) make re-runs update instead of duplicating.
 # Prints ONE JSON object. Exit 0 ok / 1 failed / 2 bad arguments.
 # Runs on Windows PowerShell 5.1 (no ternary, no ??, no && / ||).
@@ -60,7 +61,28 @@ try {
             }
         }
     }
-    Write-JsonResult ([ordered]@{ rules = @($results.ToArray()) })
+    # Windows creates inbound BLOCK rules bound to the program when its "allow access?" prompt is dismissed, and Block
+    # beats Allow. Setup was asked to open the firewall for this exact LanPlay.exe, so remove those (and only those).
+    # Best effort: a failure here is reported in blockRuleError but does not fail the step (TypeScript re-checks).
+    $removed = New-Object System.Collections.ArrayList
+    $blockRuleError = ''
+    if ($Program -ne '') {
+        try {
+            foreach ($f in @(Get-NetFirewallApplicationFilter -Program $Program -ErrorAction SilentlyContinue)) {
+                foreach ($r in @($f | Get-NetFirewallRule -ErrorAction SilentlyContinue)) {
+                    if (([string]$r.Direction -eq 'Inbound') -and ([string]$r.Action -eq 'Block')) {
+                        $ruleId = [string]$r.Name
+                        Remove-NetFirewallRule -Name $ruleId
+                        [void]$removed.Add($ruleId)
+                    }
+                }
+            }
+        }
+        catch {
+            $blockRuleError = $_.Exception.Message
+        }
+    }
+    Write-JsonResult ([ordered]@{ rules = @($results.ToArray()); removedBlockRules = @($removed.ToArray()); blockRuleError = $blockRuleError })
     exit 0
 }
 catch {

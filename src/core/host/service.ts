@@ -1,6 +1,6 @@
 // HostService: setup (non-elevated parent + elevated child), pair agent, self-check.
 import { randomBytes } from 'node:crypto';
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { HOST_STEP_ORDER, LANPLAY, SUNSHINE, SunshineApiError } from '../../contracts.js';
@@ -34,6 +34,8 @@ import { quoteWindowsArg } from './winargs.js';
 import { sha256File, SUNSHINE_MSI_NAME } from './vendor.js';
 
 export const LAST_SETUP_KEY = 'host.lastSetup';
+/** LanPlay.exe path the firewall rules were created for (the program-bound rules stop matching when the folder moves). */
+export const SETUP_EXE_KEY = 'host.setupExe';
 export const PINNED_CERT_NAME = 'sunshine-cert.pem';
 
 export interface HostServiceExtras {
@@ -139,11 +141,50 @@ export function validateHandoff(v: unknown): HostSetupHandoff {
 }
 
 export function generateAdminPassword(): string {
-  return randomBytes(32).toString('base64url');
+  // base64url may start with "-" or "_"; an argv value that looks like an option is asking for trouble, so re-roll.
+  for (;;) {
+    const pw = randomBytes(32).toString('base64url');
+    if (/^[A-Za-z0-9]/.test(pw)) return pw;
+  }
+}
+
+/**
+ * The silent MSI custom action runs sunshine-setup.ps1 as LocalSystem (wxs: Execute="deferred" Impersonate="no"), so
+ * its log ("$env:TEMP\Sunshine\logs\install", sunshine-setup.ps1) lands in SYSTEM's temp folder, which a normal
+ * user cannot list. The elevated child copies the newest ones next to LanPlay's logs so diagnostics can include them.
+ * https://github.com/LizardByte/Sunshine/blob/v2026.914.233613/cmake/packaging/wix_resources/sunshine-installer.wxs#L55-L67
+ */
+export function collectSunshineInstallerLogs(systemRoot: string, userTemp: string | undefined, destDir: string, max = 3): string[] {
+  const candidates = [path.join(systemRoot, 'SystemTemp'), path.join(systemRoot, 'Temp'), ...(userTemp ? [userTemp] : [])].map((t) => path.join(t, 'Sunshine', 'logs', 'install'));
+  const found: Array<{ p: string; m: number }> = [];
+  for (const dir of candidates) {
+    try {
+      for (const n of readdirSync(dir)) {
+        const p = path.join(dir, n);
+        const st = statSync(p);
+        if (st.isFile()) found.push({ p, m: st.mtimeMs });
+      }
+    } catch {
+      /* folder absent or unreadable */
+    }
+  }
+  const out: string[] = [];
+  for (const f of found.sort((a, b) => b.m - a.m).slice(0, max)) {
+    try {
+      mkdirSync(destDir, { recursive: true });
+      const dest = path.join(destDir, `sunshine-install-${path.basename(f.p).replace(/[^A-Za-z0-9._-]/g, '_')}`);
+      copyFileSync(f.p, dest);
+      out.push(dest);
+    } catch {
+      /* best effort */
+    }
+  }
+  return out;
 }
 
 export class WindowsHostService implements HostService {
   readonly agent: PairAgent;
+  private readonly lanAgent: LanPairAgent;
   private readonly certPath: string;
   private readonly status: KeyValueStore;
   private readonly now: () => number;
@@ -157,7 +198,7 @@ export class WindowsHostService implements HostService {
     this.certPath = path.join(deps.paths.sharedData, PINNED_CERT_NAME);
     this.status = deps.settings;
     const sunshine = new LazySunshineClient(this.certPath, () => deps.secrets.get('sunshine-admin-password'), (r) => deps.log.rest(r));
-    this.agent = new LanPairAgent(
+    this.lanAgent = new LanPairAgent(
       {
         port: x.agentPort ?? LANPLAY.agentPort,
         sunshine,
@@ -167,6 +208,12 @@ export class WindowsHostService implements HostService {
       },
       { ledger: new JsonFileStore(path.join(deps.paths.sharedData, 'paired-devices.json')), ...(x.agentExtra ?? {}) },
     );
+    this.agent = this.lanAgent;
+  }
+
+  /** Tell the UI why the agent is deliberately not listening yet (see agentAutoStart). */
+  agentIdle(reason: string | undefined): void {
+    this.lanAgent.setIdleReason(reason);
   }
 
   /* ---------- plumbing ---------- */
@@ -180,7 +227,12 @@ export class WindowsHostService implements HostService {
           return null;
         }
       },
-      writeText: (p, t) => writeFileSync(p, t, 'utf8'),
+      writeText: (p, t) => {
+        // The config folder is created by upstream's migrate-config.bat; that custom action has Return="ignore".
+        mkdirSync(path.dirname(p), { recursive: true });
+        writeFileSync(p, t, 'utf8');
+      },
+      collectInstallerLogs: () => collectSunshineInstallerLogs(this.x.systemRoot, process.env.TEMP, this.deps.paths.logDir),
       copyFile: (a, b) => {
         mkdirSync(path.dirname(b), { recursive: true });
         copyFileSync(a, b);
@@ -243,7 +295,24 @@ export class WindowsHostService implements HostService {
 
   private save(st: HostSetupStatus): HostSetupStatus {
     this.status.set(LAST_SETUP_KEY, st);
+    this.status.set(SETUP_EXE_KEY, this.x.selfExe);
     return st;
+  }
+
+  /**
+   * Should the pair agent start listening when the app launches?
+   * Not before setup ran for THIS LanPlay.exe: listening without the program-bound allow rule makes Windows show its
+   * "allow access?" firewall prompt, and dismissing that prompt creates a Block rule that silently breaks pairing.
+   * Setup itself always starts the agent after the firewall step.
+   */
+  agentAutoStart(): { start: boolean; reason?: string } {
+    const last = this.status.get<HostSetupStatus | null>(LAST_SETUP_KEY, null);
+    if (!last || !last.lastRunAt) return { start: false, reason: 'It starts after setup: press the setup button above first (it opens the Windows firewall for LanPlay).' };
+    const exe = this.status.get<string | null>(SETUP_EXE_KEY, null);
+    if (typeof exe === 'string' && exe.toLowerCase() !== this.x.selfExe.toLowerCase()) {
+      return { start: false, reason: 'LanPlay was moved to another folder since setup. Press "Set up / Repair" so the firewall rule matches the new location.' };
+    }
+    return { start: true };
   }
 
   /* ---------- HostService ---------- */

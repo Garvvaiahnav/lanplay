@@ -66,6 +66,8 @@ export interface HostStepsEnv {
   loginItem: { get(): boolean; set(on: boolean): void } | null;
   /** null inside the elevated child. */
   agentProbe: (() => Promise<{ http: boolean; udp: boolean; detail: string }>) | null;
+  /** Copies upstream's installer logs (written under SYSTEM's temp by the silent MSI action) next to LanPlay's logs. Best effort. */
+  collectInstallerLogs?: () => string[];
   now(): number;
   sleep(ms: number): Promise<void>;
   /** Timing knobs (tests shrink them). */
@@ -78,6 +80,9 @@ export const DEFAULT_TIMING = {
   pollMs: 1000,
   msiTimeoutMs: 15 * 60_000,
   psTimeoutMs: 60_000,
+  /** api-auth during setup: Sunshine may accept TCP a moment before its API answers. */
+  apiRetries: 5,
+  apiRetryMs: 2000,
 };
 
 type T = typeof DEFAULT_TIMING;
@@ -217,6 +222,31 @@ export function certSummary(pem: string): Record<string, unknown> {
   }
 }
 
+/** Compare dotted numeric versions ("2026.914.233613", "v2025.628.4510"). null when either side has no number. */
+export function compareVersions(a: string | undefined, b: string | undefined): number | null {
+  const parts = (v: string | undefined) => (String(v ?? '').match(/\d+/g) ?? []).map(Number);
+  const x = parts(a);
+  const y = parts(b);
+  if (x.length === 0 || y.length === 0) return null;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] ?? 0) - (y[i] ?? 0);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Sunshine log lines that mean "no usable video encoder or display" (the web API still answers, so only the log shows it):
+ *  - video.cpp probe_encoders: BOOST_LOG(fatal) "Unable to find display or encoder during startup."
+ *    and BOOST_LOG(error) "Couldn't find any working encoder matching [<name>]"
+ *    https://github.com/LizardByte/Sunshine/blob/v2026.914.233613/src/video.cpp
+ *  - main.cpp: BOOST_LOG(error) "Video failed to find working encoder"
+ *    https://github.com/LizardByte/Sunshine/blob/v2026.914.233613/src/main.cpp
+ * (The line "Testing for available encoders, this may generate errors. You can safely ignore those errors." and the
+ * per-encoder "Encoder [x] failed" lines are normal and are NOT matched.)
+ */
+export const NO_ENCODER_RE = /Unable to find display or encoder during startup|Video failed to find working encoder|Couldn't find any working encoder matching/;
+
 /* ------------------------------------------------------------------ steps */
 
 export function createHostSteps(env: HostStepsEnv): HostStep[] {
@@ -257,7 +287,16 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
     }
     ctx.install = locate(ctx, env, facts);
     Object.assign(s.data, installData(ctx.install));
-    if (ctx.install) return { status: 'pass', message: `Found at ${ctx.install.root} (via ${ctx.install.foundVia}${ctx.install.version ? `, version ${ctx.install.version}` : ''}).` };
+    if (ctx.install) {
+      const where = `Found at ${ctx.install.root} (via ${ctx.install.foundVia}${ctx.install.version ? `, version ${ctx.install.version}` : ''}).`;
+      if (compareVersions(ctx.install.version, SUNSHINE.version) === -1) {
+        return {
+          status: 'warn',
+          message: `${where} This Sunshine is older than the ${SUNSHINE.version} LanPlay was built for and is kept as it is. If pairing fails: Windows Settings > Apps > Sunshine > Uninstall, then run setup again so LanPlay installs ${SUNSHINE.version}.`,
+        };
+      }
+      return { status: 'pass', message: where };
+    }
     return forApply ? { status: 'pass', message: 'Sunshine is not installed yet; the next step installs it.' } : { status: 'warn', message: 'Sunshine is not installed. Click "Set up this PC".' };
   };
 
@@ -287,6 +326,11 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
         const { file, args } = buildMsiexecArgs(ctx.systemRoot, ctx.bundledMsiPath, logPath);
         const res = await runRecorded(ctx.runner, { file, args, timeoutMs: timing(env).msiTimeoutMs }, ctx.log.redactor, s.commands);
         s.data.msiExitCode = res.exitCode;
+        try {
+          s.data.installerLogs = env.collectInstallerLogs?.() ?? [];
+        } catch (e) {
+          s.data.installerLogs = `not copied: ${(e as Error).message}`;
+        }
         if (res.exitCode === 1618) return { status: 'fail', message: 'Another installation is running (msiexec 1618). Wait for it to finish, then run setup again.' };
         if (res.exitCode !== 0 && res.exitCode !== 3010) {
           return { status: 'fail', message: `msiexec failed with exit code ${res.exitCode ?? res.spawnError ?? 'none'}${res.timedOut ? ' (timed out)' : ''}. The installer log is ${logPath} (included in diagnostics).` };
@@ -321,8 +365,8 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
           for (const bat of ['install-service.bat', 'autostart-service.bat']) {
             const p = w.join(inst.root, 'scripts', bat);
             if (!env.fileExists(p)) return { status: 'fail', message: `Service missing and upstream script not found: ${p}.` };
-            const { file, args } = buildBatArgv(ctx.systemRoot, p);
-            await runRecorded(ctx.runner, { file, args, timeoutMs: 120_000, cwd: w.join(inst.root, 'scripts') }, ctx.log.redactor, s.commands);
+            const { file, args, cwd } = buildBatArgv(ctx.systemRoot, p);
+            await runRecorded(ctx.runner, { file, args, timeoutMs: 120_000, cwd }, ctx.log.redactor, s.commands);
           }
           svc = await serviceState(ctx, env, s);
           if (!svc) return { status: 'fail', message: 'install-service.bat ran but the SunshineService service still does not exist (see command output).' };
@@ -391,7 +435,10 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
         if (res.spawnError) return { status: 'fail', message: `Could not run sunshine.exe: ${ctx.log.redactor.redact(res.spawnError)}` };
         if (res.timedOut) return { status: 'fail', message: 'sunshine.exe --creds did not exit within 60 s (it may have started a server instead).' };
         if (res.exitCode !== 0) return { status: 'fail', message: `sunshine.exe --creds exited with ${res.exitCode}.` };
-        return { status: 'pass', message: `Admin user "${LANPLAY.sunshineAdminUser}" set (password stored only in Windows DPAPI).` };
+        return {
+          status: 'pass',
+          message: `Sunshine's web login is now user "${LANPLAY.sunshineAdminUser}" with a random password that only LanPlay knows (kept by Windows for your account). Any earlier Sunshine web login was replaced.`,
+        };
       },
     ),
 
@@ -465,7 +512,7 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
       },
     ),
 
-    mk('api-auth', false, apiAuth, apiAuth),
+    mk('api-auth', false, (ctx, s) => apiAuth(ctx, s, 0), (ctx, s) => apiAuth(ctx, s, timing(env).apiRetries)),
 
     mk(
       'firewall-sunshine',
@@ -486,8 +533,8 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
         }
         const bat = w.join(ctx.install!.root, 'scripts', 'add-firewall-rule.bat');
         if (!env.fileExists(bat)) return { status: 'fail', message: `Rule missing and upstream script not found: ${bat}.` };
-        const { file, args } = buildBatArgv(ctx.systemRoot, bat);
-        await runRecorded(ctx.runner, { file, args, timeoutMs: 60_000, cwd: w.join(ctx.install!.root, 'scripts') }, ctx.log.redactor, s.commands);
+        const { file, args, cwd } = buildBatArgv(ctx.systemRoot, bat);
+        await runRecorded(ctx.runner, { file, args, timeoutMs: 60_000, cwd }, ctx.log.redactor, s.commands);
         rules = await firewallRules(ctx, env, s, [SUNSHINE.firewallRuleName]);
         s.data.rules = rules;
         const ev = evaluateSunshineFirewall(rules);
@@ -519,7 +566,7 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
     mk('agent-listening', false, agentListening, agentListening),
   ];
 
-  async function apiAuth(ctx: HostStepContext, s: StepScratch): Promise<StepOutcome> {
+  async function apiAuth(ctx: HostStepContext, s: StepScratch, retries: number): Promise<StepOutcome> {
     const { pem, from } = await readPinnedPem(env, ctx);
     s.data.pinnedFrom = from;
     if (!pem) return { status: 'fail', message: 'No pinned Sunshine certificate yet (the "web API" step must pass first).' };
@@ -533,20 +580,45 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
       timeoutMs: 10_000,
       onCall: (r) => ctx.log.rest(r),
     });
-    try {
-      const clients = await client.listClients();
-      s.data.pairedClients = clients.length;
+    let clients;
+    for (let attempt = 0; ; attempt++) {
       try {
-        s.data.sunshineVersion = await client.getVersion();
-        if (ctx.install && typeof s.data.sunshineVersion === 'string') ctx.install.version = s.data.sunshineVersion;
-      } catch {
-        /* version is informational */
+        clients = await client.listClients();
+        break;
+      } catch (e) {
+        const kind = e instanceof SunshineApiError ? e.kind : 'unknown';
+        // Right after a service restart the port can accept before the API is ready: retry only those cases.
+        if (attempt < retries && (kind === 'network' || kind === 'timeout')) {
+          s.data.retries = attempt + 1;
+          await env.sleep(timing(env).apiRetryMs);
+          continue;
+        }
+        s.data.errorKind = kind;
+        return { status: 'fail', message: explainApiError(e) };
       }
-      return { status: 'pass', message: `Logged in to Sunshine's API (${clients.length} paired device(s)).` };
-    } catch (e) {
-      s.data.errorKind = e instanceof SunshineApiError ? e.kind : 'unknown';
-      return { status: 'fail', message: explainApiError(e) };
     }
+    s.data.pairedClients = clients.length;
+    try {
+      s.data.sunshineVersion = await client.getVersion();
+      if (ctx.install && typeof s.data.sunshineVersion === 'string') ctx.install.version = s.data.sunshineVersion;
+    } catch {
+      /* version is informational */
+    }
+    // The API answers even when Sunshine found no usable video encoder; only its log says so.
+    try {
+      const logTail = await client.getLogsTail(128 * 1024);
+      const line = logTail.split(/\r?\n/).reverse().find((l) => NO_ENCODER_RE.test(l));
+      if (line) {
+        s.data.encoderProblem = ctx.log.redactor.redact(line.trim().slice(0, 300));
+        return {
+          status: 'warn',
+          message: `Logged in to Sunshine's API, but Sunshine reports it found no working video encoder or display ("${String(s.data.encoderProblem).slice(0, 120)}"). Streaming will fail until that is fixed: update the graphics driver, keep a monitor (or dummy plug) connected and switched on, and do not use Remote Desktop on this PC while streaming.`,
+        };
+      }
+    } catch {
+      /* log check is informational */
+    }
+    return { status: 'pass', message: `Logged in to Sunshine's API (${clients.length} paired device(s)).` };
   }
 
   async function agentFirewall(ctx: HostStepContext, s: StepScratch, apply: boolean): Promise<StepOutcome> {
@@ -556,10 +628,10 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
       return evaluateAgentFirewall(rules, LANPLAY.agentPort);
     };
     let ev = await check();
-    if (apply && !ev.ok) {
+    if (apply && (!ev.ok || ev.blockRules.length > 0)) {
       const a = needAdmin(ctx);
       if (a) return a;
-      const r = await runPs<{ rules: unknown }>(
+      const r = await runPs<{ rules: unknown; removedBlockRules?: string[] | string; blockRuleError?: string }>(
         { runner: ctx.runner, systemRoot: ctx.systemRoot, psDir: ctx.psDir, redactor: ctx.log.redactor },
         'set-agent-firewall-rule',
         // -Program also adds allow rules bound to LanPlay.exe so Windows never shows its "allow access?" prompt
@@ -569,16 +641,25 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
         s.commands,
       );
       if (!r.ok) return { status: 'fail', message: `set-agent-firewall-rule.ps1 failed: ${r.error}` };
+      const removed = r.json?.removedBlockRules;
+      s.data.removedBlockRules = Array.isArray(removed) ? removed : removed ? [removed] : [];
+      if (r.json?.blockRuleError) s.data.blockRuleError = r.json.blockRuleError;
       ev = await check();
     }
     if (!ev.ok) return { status: 'fail', message: `Agent firewall rule: ${ev.problems.join('; ')}.` };
     if (ev.blockRules.length) {
       return {
         status: 'warn',
-        message: `Rules OK, but Windows Firewall also has ${ev.blockRules.length} enabled Block rule(s) for LanPlay.exe (created when the firewall prompt was dismissed). Block wins over Allow: open "Windows Defender Firewall with Advanced Security" > Inbound Rules and delete the Block rules named "${ev.blockRules[0]!.name}".`,
+        message: apply
+          ? `Rules OK, but ${ev.blockRules.length} enabled Block rule(s) for LanPlay.exe could not be removed${s.data.blockRuleError ? ` (${String(s.data.blockRuleError)})` : ''}. Block wins over Allow: open "Windows Defender Firewall with Advanced Security" > Inbound Rules and delete the Block rules named "${ev.blockRules[0]!.name}".`
+          : `Rules OK, but Windows Firewall also has ${ev.blockRules.length} enabled Block rule(s) for LanPlay.exe (created when its firewall prompt was dismissed). Block wins over Allow, so the Mac cannot reach this PC: press "Set up / Repair" to remove them.`,
       };
     }
-    return { status: 'pass', message: `Inbound TCP+UDP ${LANPLAY.agentPort} allowed from the local subnet.` };
+    const removedCount = Array.isArray(s.data.removedBlockRules) ? s.data.removedBlockRules.length : 0;
+    return {
+      status: 'pass',
+      message: `Inbound TCP+UDP ${LANPLAY.agentPort} allowed from the local subnet.${removedCount ? ` Removed ${removedCount} Block rule(s) Windows had created for LanPlay.exe when its firewall prompt was dismissed.` : ''}`,
+    };
   }
 
   async function agentListening(_ctx: HostStepContext, s: StepScratch): Promise<StepOutcome> {

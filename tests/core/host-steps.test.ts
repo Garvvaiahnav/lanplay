@@ -3,7 +3,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HOST_STEP_ORDER, LANPLAY, SUNSHINE_MANAGED_CONFIG } from '../../src/contracts.js';
 import type { AppPaths, HostStepContext, StepRecord } from '../../src/contracts.js';
-import { createHostSteps, ELEVATED_STEP_IDS, evaluateAgentFirewall } from '../../src/core/host/steps.js';
+import { compareVersions, createHostSteps, ELEVATED_STEP_IDS, evaluateAgentFirewall } from '../../src/core/host/steps.js';
 import type { HostStepsEnv } from '../../src/core/host/steps.js';
 import { certFingerprint256, createSunshineClient } from '../../src/core/host/sunshine-client.js';
 import { SUNSHINE_MSI_SHA256 } from '../../src/core/host/vendor.js';
@@ -135,12 +135,13 @@ describe('host steps: full setup on a clean PC', () => {
     const s = setup(m);
     const r = await applyAll(s);
     expect(r.service!.status).toBe('pass');
-    const bats = s.runner.calls.filter((c) => c.file === 'C:\\Windows\\System32\\cmd.exe').map((c) => c.args[2]);
-    expect(bats).toEqual([
-      'C:\\Program Files\\Sunshine\\scripts\\install-service.bat',
-      'C:\\Program Files\\Sunshine\\scripts\\autostart-service.bat',
-      'C:\\Program Files\\Sunshine\\scripts\\add-firewall-rule.bat',
+    const bats = s.runner.calls.filter((c) => c.file === 'C:\\Windows\\System32\\cmd.exe');
+    expect(bats.map((c) => c.args)).toEqual([
+      ['/d', '/c', 'install-service.bat'],
+      ['/d', '/c', 'autostart-service.bat'],
+      ['/d', '/c', 'add-firewall-rule.bat'],
     ]);
+    expect(bats.every((c) => c.cwd === 'C:\\Program Files\\Sunshine\\scripts')).toBe(true);
   });
 });
 
@@ -216,16 +217,102 @@ describe('host steps: failure paths give an actionable message', () => {
     expect((await auth.probe(s.ctx)).message).toMatch(/certificate is not the one LanPlay pinned/);
   });
 
-  it('firewall: warns about Block rules bound to LanPlay.exe', async () => {
+  const blockRule = (program: string) => ({ id: 'x', name: 'lanplay.exe', enabled: true, direction: 'Inbound', action: 'Block', profile: 'Public', protocol: 'TCP', localPort: 'Any', remoteAddress: 'Any', program });
+
+  it('firewall: setup removes Block rules bound to LanPlay.exe (dismissed Windows prompt), even when the Allow rules are already fine', async () => {
     const m = freshMachine();
     const s = setup(m);
-    m.firewall.push({ id: 'x', name: 'lanplay.exe', enabled: true, direction: 'Inbound', action: 'Block', profile: 'Public', protocol: 'TCP', localPort: 'Any', remoteAddress: 'Any', program: s.env.selfExe });
     s.ctx.isAdmin = true;
-    const r = await s.steps.find((x) => x.id === 'firewall-agent')!.apply(s.ctx);
-    expect(r.status).toBe('warn');
-    expect(r.message).toMatch(/Block rule/);
+    const step = s.steps.find((x) => x.id === 'firewall-agent')!;
+    expect((await step.apply(s.ctx)).status).toBe('pass'); // allow rules now exist
+    m.firewall.push(blockRule(s.env.selfExe));
+    // self-check (read-only) reports it and says how to fix it
+    const probe = await step.probe(s.ctx);
+    expect(probe.status).toBe('warn');
+    expect(probe.message).toMatch(/Block rule.*press "Set up \/ Repair"/);
+    expect(m.firewall.some((r) => r.action === 'Block')).toBe(true);
+    // setup removes it
+    const r = await step.apply(s.ctx);
+    expect(r.status).toBe('pass');
+    expect(r.message).toMatch(/Removed 1 Block rule/);
+    expect(m.firewall.some((r) => r.action === 'Block')).toBe(false);
     const fw = s.runner.calls.find((c) => c.args[6]?.endsWith('get-firewall-rules.ps1'))!;
     expect(fw.args).toContain('-Program');
+  });
+
+  it('firewall: if Windows refuses to remove the Block rule, the step says exactly which rule to delete by hand', async () => {
+    const m = freshMachine({ blockRulesStick: true });
+    const s = setup(m);
+    s.ctx.isAdmin = true;
+    m.firewall.push(blockRule(s.env.selfExe));
+    const r = await s.steps.find((x) => x.id === 'firewall-agent')!.apply(s.ctx);
+    expect(r.status).toBe('warn');
+    expect(r.message).toMatch(/could not be removed \(Access is denied\.\).*delete the Block rules named "lanplay\.exe"/);
+  });
+
+  it('api-auth during setup retries while Sunshine is still coming up, self-check does not', async () => {
+    mock = await startMockSunshine({ password: PW });
+    const m = freshMachine();
+    installSunshineFiles(m, 'C:\\Program Files\\Sunshine', SUNSHINE_TEST_CERT);
+    m.files.set('C:\\ProgramData\\LanPlay\\sunshine-cert.pem', SUNSHINE_TEST_CERT);
+    let calls = 0;
+    const s = setup(m, {
+      createSunshineClient: (o) => {
+        // first two attempts hit a closed port, then the real mock
+        const real = createSunshineClient({ ...o, baseUrl: mock!.url });
+        const dead = createSunshineClient({ ...o, baseUrl: 'https://127.0.0.1:1' });
+        return new Proxy(real, { get: (t, k) => (k === 'listClients' ? () => (++calls <= 2 ? dead.listClients() : t.listClients()) : Reflect.get(t, k)) });
+      },
+    });
+    await s.steps.find((x) => x.id === 'locate-sunshine')!.probe(s.ctx);
+    const auth = s.steps.find((x) => x.id === 'api-auth')!;
+    const applied = await auth.apply(s.ctx);
+    expect(applied.status).toBe('pass');
+    expect(applied.data?.retries).toBe(2);
+    calls = 0;
+    const probed = await auth.probe(s.ctx);
+    expect(probed.status).toBe('fail');
+    expect(probed.message).toMatch(/Cannot reach Sunshine/);
+  });
+
+  it('api-auth warns in plain words when Sunshine logged that it has no working encoder', async () => {
+    mock = await startMockSunshine({ password: PW });
+    const m = freshMachine();
+    installSunshineFiles(m, 'C:\\Program Files\\Sunshine', SUNSHINE_TEST_CERT);
+    m.files.set('C:\\ProgramData\\LanPlay\\sunshine-cert.pem', SUNSHINE_TEST_CERT);
+    const s = setup(m);
+    await s.steps.find((x) => x.id === 'locate-sunshine')!.probe(s.ctx);
+    const auth = s.steps.find((x) => x.id === 'api-auth')!;
+    // normal probing noise must NOT trigger the warning
+    mock.logText = '[2026-11-13 10:00:00]: Info: // Testing for available encoders, this may generate errors. You can safely ignore those errors. //\n[2026-11-13 10:00:01]: Info: Encoder [nvenc] failed\n[2026-11-13 10:00:02]: Info: Found H.264 encoder: h264_qsv [quicksync]\n';
+    expect((await auth.probe(s.ctx)).status).toBe('pass');
+    mock.logText += '[2026-11-13 10:00:03]: Fatal: Unable to find display or encoder during startup.\n[2026-11-13 10:00:03]: Fatal: Please check that a display is connected and powered on.\n';
+    const r = await auth.probe(s.ctx);
+    expect(r.status).toBe('warn');
+    expect(r.message).toMatch(/no working video encoder or display.*graphics driver/);
+    expect(String(r.data?.encoderProblem)).toMatch(/Unable to find display or encoder/);
+  });
+
+  it('an older Sunshine that is already installed is kept, with a warning that says what to do if pairing fails', async () => {
+    const m = freshMachine();
+    installSunshineFiles(m, 'C:\\Program Files\\Sunshine', SUNSHINE_TEST_CERT);
+    m.uninstallEntries = [{ displayName: 'Sunshine', displayVersion: '2026.301.12345', installLocation: 'C:\\Program Files\\Sunshine\\' }];
+    const s = setup(m);
+    const r = await applyAll(s, ['admin', 'locate-sunshine', 'install-sunshine']);
+    expect(r['locate-sunshine']!.status).toBe('warn');
+    expect(r['locate-sunshine']!.message).toMatch(/older than the 2026\.914\.233613.*Uninstall, then run setup again/);
+    expect(r['install-sunshine']!.status).toBe('skip');
+    expect(compareVersions('2026.914.233613', '2026.914.233613')).toBe(0);
+    expect(compareVersions('v2027.1.1', '2026.914.233613')).toBe(1);
+    expect(compareVersions(undefined, '2026.914.233613')).toBeNull();
+  });
+
+  it('install step copies upstream installer logs next to LanPlay logs (also when msiexec fails)', async () => {
+    let n = 0;
+    const s = setup(freshMachine({ msiExit: 1603 }), { collectInstallerLogs: () => (n++, ['C:\\ProgramData\\LanPlay\\logs\\sunshine-install-20261113_101500.log']) });
+    const r = await applyAll(s, ['admin', 'locate-sunshine', 'install-sunshine']);
+    expect(n).toBe(1);
+    expect(r['install-sunshine']!.data?.installerLogs).toEqual(['C:\\ProgramData\\LanPlay\\logs\\sunshine-install-20261113_101500.log']);
   });
 
   it('evaluateAgentFirewall reports wrong port and scope', () => {

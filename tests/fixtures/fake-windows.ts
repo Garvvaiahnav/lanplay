@@ -21,6 +21,8 @@ export interface FakeMachineState {
   msiCreatesFirewall: boolean;
   installRoot: string;
   scStartFails?: boolean;
+  /** Remove-NetFirewallRule fails (Block rules stay). */
+  blockRulesStick?: boolean;
   env: SunshineFactsPs['env'];
 }
 
@@ -113,7 +115,17 @@ export class FakeWindowsRunner implements ProcessRunner {
           this.m.firewall = this.m.firewall.filter((r) => r.id !== id);
           this.m.firewall.push({ id, name, enabled: true, direction: 'Inbound', action: 'Allow', profile: 'Any', protocol: proto, localPort: port, remoteAddress: 'LocalSubnet', program: 'Any' });
         }
-        return ok(JSON.stringify({ rules: [{ id: 'LanPlay-PairAgent-TCP', action: 'created' }] }));
+        // Like the real script: inbound Block rules bound to -Program are removed (unless the machine refuses).
+        const program = this.param(a, 'Program');
+        const removed: string[] = [];
+        if (program && !this.m.blockRulesStick) {
+          this.m.firewall = this.m.firewall.filter((r) => {
+            const hit = r.program.toLowerCase() === program.toLowerCase() && r.direction === 'Inbound' && r.action === 'Block';
+            if (hit) removed.push(r.id);
+            return !hit;
+          });
+        }
+        return ok(JSON.stringify({ rules: [{ id: 'LanPlay-PairAgent-TCP', action: 'created' }], removedBlockRules: removed, blockRuleError: this.m.blockRulesStick ? 'Access is denied.' : '' }));
       }
       case 'get-listeners':
         return ok(JSON.stringify({ listeners: [{ port: 47989, protocol: 'tcp', address: '0.0.0.0', pid: 1234, process: 'sunshine' }] }));

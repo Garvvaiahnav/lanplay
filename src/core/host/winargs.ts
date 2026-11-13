@@ -113,8 +113,18 @@ export function parseWindowsCommandLine(cmd: string): string[] {
   return out;
 }
 
-/** cmd.exe /d /c <bat>: .bat files cannot be spawned directly with shell:false (Node CVE-2024-27980 hardening). */
-export function buildBatArgv(systemRoot: string, batPath: string): { file: string; args: string[] } {
-  if (/["&|<>^%!]/.test(batPath)) throw new Error(`refusing to run a .bat path with cmd metacharacters: ${batPath}`);
-  return { file: system32Exe(systemRoot, 'cmd.exe'), args: ['/d', '/c', batPath] };
+/**
+ * Run an upstream .bat: cmd.exe /d /c <name.bat> with cwd = the script's folder.
+ * .bat files cannot be spawned directly with shell:false (Node CVE-2024-27980 hardening), so cmd.exe runs them.
+ * The FULL path is never put on cmd's command line: `cmd /c "C:\Program Files (x86)\x\y.bat"` breaks because cmd
+ * strips the quotes when the quoted text contains ( ) & or other special characters ("cmd /?": the quote rules for /C).
+ * A bare file name without spaces needs no quoting at all; cmd looks in the current directory first, and the upstream
+ * scripts find their own location with %~dp0, so cwd does not change their behaviour.
+ */
+export function buildBatArgv(systemRoot: string, batPath: string): { file: string; args: string[]; cwd: string } {
+  const name = w.basename(batPath);
+  const dir = w.dirname(batPath);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.bat$/i.test(name)) throw new Error(`refusing to run a .bat with an unexpected file name: ${name}`);
+  if (!w.isAbsolute(dir)) throw new Error(`.bat path must be absolute: ${batPath}`);
+  return { file: system32Exe(systemRoot, 'cmd.exe'), args: ['/d', '/c', name], cwd: dir };
 }

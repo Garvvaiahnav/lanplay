@@ -35,6 +35,7 @@ try {
     }
 
     $entries = New-Object System.Collections.ArrayList
+    $skippedKeys = 0
     $roots = @(
         'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
         'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
@@ -42,7 +43,16 @@ try {
     foreach ($root in $roots) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
         foreach ($key in @(Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
-            $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            # One broken Uninstall key (Windows PowerShell 5.1 throws "Specified cast is not valid" on a malformed
+            # registry value, even with -ErrorAction SilentlyContinue) must not fail the whole report: skip that key.
+            $props = $null
+            try {
+                $props = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction Stop
+            }
+            catch {
+                $skippedKeys++
+                continue
+            }
             $displayName = Get-Prop $props 'DisplayName'
             if ($null -eq $displayName) { continue }
             if (-not ($displayName -like 'Sunshine*')) { continue }
@@ -63,7 +73,7 @@ try {
         if ($null -ne $value) { $envOut[$name] = $value }
     }
 
-    Write-JsonResult ([ordered]@{ service = $service; uninstallEntries = @($entries.ToArray()); env = $envOut })
+    Write-JsonResult ([ordered]@{ service = $service; uninstallEntries = @($entries.ToArray()); env = $envOut; skippedUninstallKeys = $skippedKeys })
     exit 0
 }
 catch {

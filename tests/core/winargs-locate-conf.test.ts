@@ -61,12 +61,23 @@ describe('buildPsArgv / msiexec / bat', () => {
     expect(r.args).toEqual(['/i', 'C:\\Program Files\\LanPlay\\resources\\vendor\\Sunshine-Windows-AMD64-installer.msi', '/qn', '/norestart', '/l*v', 'C:\\ProgramData\\LanPlay\\logs\\msiexec-1.log']);
   });
 
-  it('runs .bat through cmd.exe and refuses metacharacters', () => {
+  it('runs .bat through cmd.exe by bare name with cwd = its folder (no path on the cmd line to mis-quote)', () => {
     expect(buildBatArgv('C:\\Windows', 'C:\\Program Files\\Sunshine\\scripts\\install-service.bat')).toEqual({
       file: 'C:\\Windows\\System32\\cmd.exe',
-      args: ['/d', '/c', 'C:\\Program Files\\Sunshine\\scripts\\install-service.bat'],
+      args: ['/d', '/c', 'install-service.bat'],
+      cwd: 'C:\\Program Files\\Sunshine\\scripts',
     });
-    expect(() => buildBatArgv('C:\\Windows', 'C:\\a&b\\x.bat')).toThrow();
+    // cmd.exe drops the quotes around a path that contains ( ) & etc: those paths must still work.
+    for (const dir of ['C:\\Program Files (x86)\\Sunshine\\scripts', 'D:\\Spiele & Tools\\Sunshine\\scripts', 'C:\\Users\\山田\\Sunshine 100%\\scripts']) {
+      const r = buildBatArgv('C:\\Windows', `${dir}\\add-firewall-rule.bat`);
+      expect(r.args).toEqual(['/d', '/c', 'add-firewall-rule.bat']);
+      expect(r.cwd).toBe(dir);
+      expect(r.args.join('')).not.toMatch(/[\s"&()%^]/);
+    }
+    expect(() => buildBatArgv('C:\\Windows', 'C:\\x\\evil & calc.bat')).toThrow();
+    expect(() => buildBatArgv('C:\\Windows', 'C:\\x\\a b.bat')).toThrow();
+    expect(() => buildBatArgv('C:\\Windows', 'C:\\x\\tool.exe')).toThrow();
+    expect(() => buildBatArgv('C:\\Windows', 'install-service.bat')).toThrow();
   });
 });
 

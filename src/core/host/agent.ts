@@ -137,7 +137,16 @@ export interface PairAgentExtraOptions {
   approvalTimeoutMs?: number;
   /** Disable the UDP discovery responder (tests that only need HTTP). */
   udp?: boolean;
+  /** Flood guard for all requests (default 120 per IP / 600 total per minute). */
+  floodPerIpPerMinute?: number;
+  floodGlobalPerMinute?: number;
+  /** How long GET /v1/info reuses its last answer (default 3000 ms): one Sunshine API call per window at most. */
+  infoCacheMs?: number;
 }
+
+/** Max requests waiting for manual approval: in total, and from one address. */
+export const MAX_PENDING_TOTAL = 8;
+export const MAX_PENDING_PER_ADDRESS = 2;
 
 class Mutex {
   private p: Promise<void> = Promise.resolve();
@@ -160,6 +169,13 @@ export class LanPairAgent implements PairAgent {
   private readonly listeners = new Set<(s: AgentState) => void>();
   private readonly limiter: RateLimiter;
   private readonly udpLimiter: RateLimiter;
+  /** Cheap flood guard for EVERY request (GET polls, /v1/info, rejected requests), checked before any other work. */
+  private readonly floodLimiter: RateLimiter;
+  /** Rejections are logged at most this often so a LAN device cannot fill the disk with warn lines. */
+  private readonly rejectLogLimiter: TokenBucket;
+  private suppressedRejects = 0;
+  private infoCache: { at: number; value: AgentInfoResponse } | null = null;
+  private idleReason: string | undefined;
   private readonly now: () => number;
   private readonly pairMutex = new Mutex();
   private readonly ledger: KeyValueStore;
@@ -172,6 +188,8 @@ export class LanPairAgent implements PairAgent {
     this.now = o.now ?? Date.now;
     this.limiter = new RateLimiter(LANPLAY.agentRateLimit.perIpPerMinute, LANPLAY.agentRateLimit.globalPerMinute, this.now);
     this.udpLimiter = new RateLimiter(30, 120, this.now);
+    this.floodLimiter = new RateLimiter(x.floodPerIpPerMinute ?? 120, x.floodGlobalPerMinute ?? 600, this.now);
+    this.rejectLogLimiter = new TokenBucket(20, 20 / 60_000, this.now);
     this.ledger = x.ledger ?? o.settings;
   }
 
@@ -186,6 +204,9 @@ export class LanPairAgent implements PairAgent {
     server.headersTimeout = 10_000;
     server.requestTimeout = 120_000; // pair requests are held while Sunshine completes the handshake
     server.maxHeadersCount = 50;
+    server.maxConnections = 64; // a LAN device cannot hold the agent open with idle sockets
+    server.keepAliveTimeout = 5_000;
+    this.idleReason = undefined;
     try {
       await new Promise<void>((resolve, reject) => {
         server.once('error', reject);
@@ -195,7 +216,11 @@ export class LanPairAgent implements PairAgent {
         });
       });
     } catch (err) {
-      this.lastError = `Cannot listen on TCP ${this.o.port}: ${(err as Error).message}`;
+      const code = (err as NodeJS.ErrnoException).code;
+      this.lastError =
+        code === 'EADDRINUSE'
+          ? `Port ${this.o.port} is already used by another program (or a second LanPlay). Close it, then press Set up / Repair. (${(err as Error).message})`
+          : `Cannot listen on TCP ${this.o.port}: ${(err as Error).message}`;
       this.log.log('error', 'agent', this.lastError);
       this.emit();
       throw err;
@@ -284,8 +309,15 @@ export class LanPairAgent implements PairAgent {
         .filter((p) => p.status === 'waiting')
         .map(({ requestId, clientName, remoteAddress, requestedAt, expiresAt }) => ({ requestId, clientName, remoteAddress, requestedAt, expiresAt })),
     };
-    if (this.lastError !== undefined) st.lastError = this.lastError;
+    const err = this.server === null ? (this.lastError ?? this.idleReason) : this.lastError;
+    if (err !== undefined) st.lastError = err;
     return st;
+  }
+
+  /** Why the agent was deliberately not started (shown next to "Pair agent is not running"). */
+  setIdleReason(reason: string | undefined): void {
+    this.idleReason = reason;
+    this.emit();
   }
 
   onChange(cb: (s: AgentState) => void): () => void {
@@ -384,13 +416,21 @@ export class LanPairAgent implements PairAgent {
     const method = req.method ?? 'GET';
     const url = (req.url ?? '/').split('?')[0]!;
     const deny = (status: number, error: string, extra: Record<string, string> = {}) => {
-      this.log.log('warn', 'agent', `rejected ${method} ${url}: ${error}`, { remote, status, host: req.headers.host ?? null });
-      this.send(res, status, { error }, extra);
+      if (this.rejectLogLimiter.take().ok) {
+        const data: Record<string, unknown> = { remote, status, host: String(req.headers.host ?? '').slice(0, 100) || null };
+        if (this.suppressedRejects > 0) data.suppressedSinceLastLog = this.suppressedRejects;
+        this.suppressedRejects = 0;
+        this.log.log('warn', 'agent', `rejected ${method.slice(0, 16)} ${url.slice(0, 100)}: ${error}`, data);
+      } else this.suppressedRejects++;
+      this.send(res, status, { error }, { Connection: 'close', ...extra });
       req.resume();
     };
     try {
       // 1. private source
       if (!isPrivateAddress(remote)) return deny(403, 'forbidden-source');
+      // 1b. flood guard for every request, before any parsing, Sunshine call or per-request logging
+      const flood = this.floodLimiter.take(remote);
+      if (!flood.ok) return deny(429, 'rate-limited', { 'Retry-After': String(flood.retryAfterSec) });
       // 2. Host header (DNS rebinding)
       if (!isAllowedHost(req.headers.host, this.port, this.o.localIdentity())) return deny(421, 'bad-host');
       // 3. browsers (CSRF): any Origin or Referer, including "null"
@@ -428,6 +468,16 @@ export class LanPairAgent implements PairAgent {
   }
 
   private async info(): Promise<AgentInfoResponse> {
+    // Unauthenticated callers must not be able to make the agent hammer Sunshine's API: reuse the answer briefly.
+    const ttl = this.x.infoCacheMs ?? 3000;
+    const t = this.now();
+    if (this.infoCache && t - this.infoCache.at < ttl) return { ...this.infoCache.value, autoApprove: this.autoApprove() };
+    const value = await this.infoFresh();
+    this.infoCache = { at: t, value };
+    return value;
+  }
+
+  private async infoFresh(): Promise<AgentInfoResponse> {
     let sunshineVersion: string | null = null;
     let ready = false;
     try {
@@ -452,7 +502,9 @@ export class LanPairAgent implements PairAgent {
 
     if (!this.autoApprove()) {
       const waiting = [...this.pending.values()].filter((p) => p.status === 'waiting');
-      if (waiting.length >= 8) return this.send(res, 429, { error: 'too-many-pending' }, { 'Retry-After': '30' });
+      if (waiting.length >= MAX_PENDING_TOTAL || waiting.filter((p) => p.remote === remote).length >= MAX_PENDING_PER_ADDRESS) {
+        return this.send(res, 429, { error: 'too-many-pending' }, { 'Retry-After': '30' });
+      }
       const ttl = this.x.approvalTimeoutMs ?? LANPLAY.manualApprovalTimeoutMs;
       const t = this.now();
       const entry: PendingEntry = {
@@ -553,6 +605,13 @@ export class LanPairAgent implements PairAgent {
 
   private sunshineFail(e: unknown, fail: (c: PairErrorCode, m: string) => AgentPairResponse): AgentPairResponse {
     if (e instanceof SunshineApiError) {
+      // GET/POST /api/pin with a pairing_id exists only in recent Sunshine (confighttp.cpp route table of v2026.914.233613).
+      if (e.status === 404 || e.status === 405) {
+        return fail(
+          'sunshine-api-error',
+          `The Sunshine installed on the PC is too old for LanPlay (its API has no pairing list: ${e.message}). On the PC: Windows Settings > Apps > Sunshine > Uninstall, then press "Set up / Repair" in LanPlay so it installs Sunshine ${SUNSHINE.version}.`,
+        );
+      }
       const notReady = e.kind === 'auth' || e.kind === 'redirect-welcome' || e.kind === 'tls-pin-mismatch' || e.kind === 'network' || e.kind === 'forbidden-origin';
       return fail(notReady ? 'sunshine-not-ready' : 'sunshine-api-error', e.message);
     }

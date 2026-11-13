@@ -1,9 +1,10 @@
 import dgram from 'node:dgram';
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
-import { LANPLAY } from '../../src/contracts.js';
+import { LANPLAY, SunshineApiError } from '../../src/contracts.js';
 import type { AgentDiscoveryReply, SunshineClient } from '../../src/contracts.js';
-import { AUTO_APPROVE_KEY, isAllowedHost, LanPairAgent, LEDGER_KEY, parsePairRequest, RateLimiter, sanitizeClientName } from '../../src/core/host/agent.js';
+import { AUTO_APPROVE_KEY, isAllowedHost, LanPairAgent, LEDGER_KEY, MAX_PENDING_PER_ADDRESS, parsePairRequest, RateLimiter, sanitizeClientName } from '../../src/core/host/agent.js';
+import type { PairAgentExtraOptions } from '../../src/core/host/agent.js';
 import { createSunshineClient } from '../../src/core/host/sunshine-client.js';
 import { MemoryLogger } from '../../src/core/shared/logger.js';
 import { MemoryStore } from '../../src/core/shared/stores.js';
@@ -26,7 +27,7 @@ afterEach(async () => {
   ctx = undefined;
 });
 
-async function setup(opts: { autoApprove?: boolean; sunshine?: SunshineClient; approvalTimeoutMs?: number; udp?: boolean } = {}): Promise<Ctx> {
+async function setup(opts: { autoApprove?: boolean; sunshine?: SunshineClient; approvalTimeoutMs?: number; udp?: boolean; extra?: PairAgentExtraOptions } = {}): Promise<Ctx> {
   const mock = await startMockSunshine();
   const settings = new MemoryStore();
   if (opts.autoApprove === false) settings.set(AUTO_APPROVE_KEY, false);
@@ -34,7 +35,7 @@ async function setup(opts: { autoApprove?: boolean; sunshine?: SunshineClient; a
   const sunshine = opts.sunshine ?? createSunshineClient({ baseUrl: mock.url, username: 'lanplay', getPassword: async () => 'test-password-0123456789', pinnedCertPem: SUNSHINE_TEST_CERT, timeoutMs: 5000 });
   const agent = new LanPairAgent(
     { port: 0, sunshine, log, settings, localIdentity: identity },
-    { bindAddress: '127.0.0.1', pendingPollMs: 20, pendingWaitMs: 400, udp: opts.udp ?? false, ...(opts.approvalTimeoutMs ? { approvalTimeoutMs: opts.approvalTimeoutMs } : {}) },
+    { bindAddress: '127.0.0.1', pendingPollMs: 20, pendingWaitMs: 400, udp: opts.udp ?? false, ...(opts.approvalTimeoutMs ? { approvalTimeoutMs: opts.approvalTimeoutMs } : {}), ...(opts.extra ?? {}) },
   );
   await agent.start();
   ctx = { agent, mock, settings, log, port: agent.getState().port };
@@ -144,6 +145,86 @@ describe('agent HTTP guards', () => {
     expect(statuses.slice(0, LANPLAY.agentRateLimit.perIpPerMinute).every((s) => s === 400)).toBe(true);
     expect(statuses.at(-1)).toBe(429);
     expect(Number(retry)).toBeGreaterThan(0);
+  });
+});
+
+describe('agent abuse limits (any LAN device can reach this port)', () => {
+  it('flood guard: GETs and rejected requests are limited too, before any Sunshine call', async () => {
+    const { port, mock } = await setup({ extra: { floodPerIpPerMinute: 5, floodGlobalPerMinute: 100, infoCacheMs: 0 } });
+    const before = mock.requests.length;
+    const statuses: number[] = [];
+    for (let i = 0; i < 8; i++) statuses.push((await call(port, 'GET', '/v1/info')).status);
+    expect(statuses).toEqual([200, 200, 200, 200, 200, 429, 429, 429]);
+    // only the 5 allowed requests reached Sunshine's API
+    expect(mock.requests.length - before).toBe(5);
+    const r = await call(port, 'GET', '/v1/pair/whatever');
+    expect(r.status).toBe(429);
+    expect(Number(r.headers['retry-after'])).toBeGreaterThan(0);
+  });
+
+  it('/v1/info is cached briefly: polling it cannot hammer the Sunshine API', async () => {
+    const { port, mock, agent } = await setup();
+    const before = mock.requests.length;
+    for (let i = 0; i < 10; i++) expect((await call(port, 'GET', '/v1/info')).json.ready).toBe(true);
+    expect(mock.requests.length - before).toBe(1);
+    // the switch is still reported live
+    await agent.setAutoApprove(false);
+    expect((await call(port, 'GET', '/v1/info')).json.autoApprove).toBe(false);
+  });
+
+  it('rejections are logged at a bounded rate (no disk filling), with a count of what was suppressed', async () => {
+    const { port, log } = await setup({ extra: { floodPerIpPerMinute: 1000, floodGlobalPerMinute: 1000 } });
+    for (let i = 0; i < 60; i++) await call(port, 'GET', '/v1/info', undefined, { Host: `evil.example:${port}` });
+    const rejected = log.entries.filter((e) => e.msg.startsWith('rejected '));
+    expect(rejected.length).toBeLessThanOrEqual(21);
+    expect(rejected.length).toBeGreaterThan(0);
+  });
+
+  it('manual approval: one address cannot fill the approval list', async () => {
+    const { port, agent } = await setup({ autoApprove: false, approvalTimeoutMs: 5000 });
+    for (let i = 0; i < MAX_PENDING_PER_ADDRESS; i++) expect((await call(port, 'POST', '/v1/pair', pairBody('1111', `Spam ${i}`), JSON_CT)).status).toBe(202);
+    const r = await call(port, 'POST', '/v1/pair', pairBody('1111', 'Spam more'), JSON_CT);
+    expect(r.status).toBe(429);
+    expect(r.json).toEqual({ error: 'too-many-pending' });
+    expect(agent.getState().pending).toHaveLength(MAX_PENDING_PER_ADDRESS);
+  });
+
+  it('never trusts X-Forwarded-For / Forwarded for the source check or the address match', async () => {
+    const { port, mock } = await setup();
+    // A pending pairing exists for 192.168.1.50, but the request really comes from 127.0.0.1.
+    mock.addPending({ name: 'Victim Mac', address: '192.168.1.50', expectedPin: '4821' });
+    const r = await call(port, 'POST', '/v1/pair', pairBody('4821'), { ...JSON_CT, 'X-Forwarded-For': '192.168.1.50', Forwarded: 'for=192.168.1.50', 'X-Real-IP': '192.168.1.50' });
+    expect(r.json).toMatchObject({ status: 'failed', code: 'no-pending-pairing' });
+  });
+
+  it('an idle agent says why it is not listening', async () => {
+    const agent = new LanPairAgent({ port: 0, sunshine: {} as SunshineClient, log: new MemoryLogger(), settings: new MemoryStore(), localIdentity: identity }, { bindAddress: '127.0.0.1', udp: false });
+    const seen: Array<string | undefined> = [];
+    agent.onChange((st) => seen.push(st.lastError));
+    agent.setIdleReason('It starts after setup.');
+    expect(agent.getState()).toMatchObject({ listening: false, lastError: 'It starts after setup.' });
+    expect(seen).toEqual(['It starts after setup.']);
+    await agent.start();
+    expect(agent.getState().lastError).toBeUndefined();
+    await agent.stop();
+  });
+
+  it('an old Sunshine without the pairing API gets a message that says what to do', async () => {
+    const old: SunshineClient = {
+      getPendingPairings: async () => {
+        throw new SunshineApiError('GET /api/pin: HTTP 404', 404, 'bad-response');
+      },
+      listClients: async () => [],
+      submitPin: async () => false,
+      cancelPairing: async () => false,
+      unpairClient: async () => false,
+      getVersion: async () => '2025.122.141614',
+      getLogsTail: async () => '',
+    };
+    const { port } = await setup({ sunshine: old });
+    const r = await call(port, 'POST', '/v1/pair', pairBody(), JSON_CT);
+    expect(r.json).toMatchObject({ status: 'failed', code: 'sunshine-api-error' });
+    expect(r.json.message).toMatch(/too old for LanPlay.*Uninstall.*Set up \/ Repair/);
   });
 });
 
@@ -275,6 +356,6 @@ describe('agent UDP discovery', () => {
     const { port, log } = await setup();
     const second = new LanPairAgent({ port, sunshine: {} as SunshineClient, log, settings: new MemoryStore(), localIdentity: identity }, { bindAddress: '127.0.0.1', udp: false });
     await expect(second.start()).rejects.toThrow();
-    expect(second.getState().lastError).toMatch(/Cannot listen/);
+    expect(second.getState().lastError).toMatch(/already used by another program.*Set up \/ Repair/);
   });
 });

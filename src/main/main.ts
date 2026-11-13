@@ -145,7 +145,12 @@ async function start(): Promise<void> {
 
   if (services.host) {
     services.host.agent.onChange((s) => push('host:agent-state-changed', s));
-    services.host.agent.start().catch((e: Error) => log.log('error', 'main', 'pair agent did not start', { error: e.message }));
+    const auto = services.host.agentAutoStart();
+    if (auto.start) services.host.agent.start().catch((e: Error) => log.log('error', 'main', 'pair agent did not start', { error: e.message }));
+    else {
+      log.log('info', 'main', 'pair agent not started yet', { reason: auto.reason ?? null });
+      services.host.agentIdle(auto.reason);
+    }
   }
 
   const createWindow = () => {
