@@ -203,6 +203,31 @@ describe('discovery', () => {
     await expect(m.addManual('bad host/name')).rejects.toThrow(/IP address/);
     await expect(m.addManual('10.255.255.1')).rejects.toThrow(/No Sunshine host/);
   }, 20_000);
+
+  it('stays on the home network: public addresses are refused (manual entry) or ignored (mDNS answers)', async () => {
+    const w = await world();
+    const log = new MemoryLogger();
+    const base = (await import('../../src/core/client/discovery.js')).defaultDiscoveryDeps(log);
+    const asked: string[] = [];
+    const d = new LanDiscovery({
+      ...base,
+      ...w.discoveryDeps,
+      udpTargets: () => [],
+      probeDelayMs: 60_000,
+      fetchServerInfo: async (h) => {
+        asked.push(h);
+        throw new Error('nobody home');
+      },
+      mdns: { start: (cb) => setTimeout(() => cb({ name: 'Sunshine', addresses: ['8.8.8.8', '2001:4860:4860::8888', '192.168.77.5'], port: 47989 }), 5), stop: () => undefined },
+    });
+    d.start(() => undefined);
+    await new Promise((r) => setTimeout(r, 100));
+    d.stop();
+    expect(asked).toEqual(['192.168.77.5']);
+    await expect(d.addManual('8.8.8.8')).rejects.toThrow(/not an address on a home network/);
+    await expect(d.addManual('2001:4860:4860::8888')).rejects.toThrow(/home network/);
+    expect(asked).toEqual(['192.168.77.5']);
+  });
 });
 
 describe('MacClientService', () => {

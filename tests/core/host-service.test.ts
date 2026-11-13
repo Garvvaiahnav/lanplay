@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { HOST_STEP_ORDER, LANPLAY } from '../../src/contracts.js';
 import type { AppPaths, ServiceDeps, StepRecord } from '../../src/contracts.js';
-import { generateAdminPassword, validateHandoff, WindowsHostService } from '../../src/core/host/service.js';
+import { collectSunshineInstallerLogs, generateAdminPassword, validateHandoff, WindowsHostService } from '../../src/core/host/service.js';
 import type { HostServiceExtras } from '../../src/core/host/service.js';
 import { certFingerprint256, createSunshineClient } from '../../src/core/host/sunshine-client.js';
 import { SUNSHINE_MSI_SHA256 } from '../../src/core/host/vendor.js';
@@ -155,6 +155,59 @@ describe('WindowsHostService: UAC round trip (parent -> invoke-elevated -> --hos
     expect(() => validateHandoff({ ...good, sunshineAdminPassword: 'a b' })).toThrow();
     expect(() => validateHandoff({ ...good, sunshineAdminUser: 'x"y' })).toThrow();
     expect(generateAdminPassword()).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+
+  it('the pair agent does not listen at launch until setup ran for this exact LanPlay.exe (no Windows firewall prompt to dismiss)', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'lanplay-host-'));
+    const paths = makePaths(root);
+    const m = freshMachine();
+    const a = makeService(m, paths, true);
+    // fresh PC: not yet
+    const first = a.svc.agentAutoStart();
+    expect(first.start).toBe(false);
+    expect(first.reason).toMatch(/after setup/);
+    a.svc.agentIdle(first.reason);
+    expect(a.svc.agent.getState()).toMatchObject({ listening: false, lastError: first.reason });
+    // after setup (already elevated: in-process): yes, and setup itself started it
+    const pw = generateAdminPassword();
+    await a.deps.secrets.set('sunshine-admin-password', pw);
+    mock = await startMockSunshine({ password: pw });
+    const st = await a.svc.runSetup(() => undefined);
+    expect(st.ok, st.steps.filter((x) => x.status === 'fail').map((x) => `${x.stepId}: ${x.message}`).join('; ')).toBe(true);
+    expect(a.svc.agent.getState().listening).toBe(true);
+    expect(a.svc.agent.getState().lastError ?? '').not.toMatch(/after setup/);
+    expect(a.svc.agentAutoStart()).toEqual({ start: true });
+    // same settings, but LanPlay now runs from another folder: the program-bound firewall rule no longer matches
+    const moved = new WindowsHostService(a.deps, { selfExe: 'D:\\Games\\LanPlay\\LanPlay.exe', selfArgsPrefix: [], loginItem: null, systemRoot: 'C:\\Windows', agentPort: 0, agentExtra: { bindAddress: '127.0.0.1', udp: false } });
+    services.push(moved);
+    const again = moved.agentAutoStart();
+    expect(again.start).toBe(false);
+    expect(again.reason).toMatch(/moved.*Set up \/ Repair/);
+    // case differences in the path are not a move
+    const sameCase = new WindowsHostService(a.deps, { selfExe: 'c:\\users\\JÖRG MÜLLER\\downloads\\lanplay\\LANPLAY.EXE'.replace('JÖRG MÜLLER', 'Jörg Müller'), selfArgsPrefix: [], loginItem: null, systemRoot: 'C:\\Windows', agentPort: 0, agentExtra: { bindAddress: '127.0.0.1', udp: false } });
+    services.push(sameCase);
+    expect(sameCase.agentAutoStart()).toEqual({ start: true });
+  });
+
+  it('copies upstream installer logs out of SYSTEM temp folders (newest first, bounded)', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'lanplay-inst-'));
+    const sysRoot = path.join(root, 'Windows');
+    const sysTemp = path.join(sysRoot, 'SystemTemp', 'Sunshine', 'logs', 'install');
+    const oldTemp = path.join(sysRoot, 'Temp', 'Sunshine', 'logs', 'install');
+    mkdirSync(sysTemp, { recursive: true });
+    mkdirSync(oldTemp, { recursive: true });
+    writeFileSync(path.join(sysTemp, '20261113_101500.log'), 'new install log');
+    writeFileSync(path.join(oldTemp, '20250101_000000.log'), 'old install log');
+    const dest = path.join(root, 'ProgramData', 'LanPlay', 'logs');
+    const copied = collectSunshineInstallerLogs(sysRoot, path.join(root, 'no-such-user-temp'), dest);
+    expect(copied.map((p) => path.basename(p)).sort()).toEqual(['sunshine-install-20250101_000000.log', 'sunshine-install-20261113_101500.log']);
+    expect(readFileSync(path.join(dest, 'sunshine-install-20261113_101500.log'), 'utf8')).toBe('new install log');
+    // nothing to copy is not an error
+    expect(collectSunshineInstallerLogs(path.join(root, 'nope'), undefined, dest)).toEqual([]);
+  });
+
+  it('generated admin passwords never look like a command-line option', () => {
+    for (let i = 0; i < 300; i++) expect(generateAdminPassword()).toMatch(/^[A-Za-z0-9][A-Za-z0-9_-]{42}$/);
   });
 
   it('self-check runs every probe independently', async () => {

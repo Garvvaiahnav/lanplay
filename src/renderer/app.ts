@@ -29,15 +29,21 @@ namespace LP.App {
     };
   }
 
-  export function start(root: HTMLElement, api: T.Api, store: Store = browserStore()): { destroy(): void } {
+  /**
+   * fixedRole: what this computer can be in v1 (main decides: Windows = host, macOS = client, see app:info). When set,
+   * the matching screen opens directly: no "what is this computer for?" question whose wrong answer leads to a screen
+   * where nothing works. Without it (tests, or app:info failed) the first-run choice is shown.
+   */
+  export function start(root: HTMLElement, api: T.Api, store: Store = browserStore(), fixedRole: Mode | null = null): { destroy(): void } {
     let current: { destroy(): void } | null = null;
 
     function show(mode: Mode | null): void {
       current?.destroy();
       current = null;
-      store.set(mode);
-      if (mode === 'client') current = Client.mount(root, api, { onSwitchMode: () => show(null) });
-      else if (mode === 'host') current = Host.mount(root, api, { onSwitchMode: () => show(null) });
+      if (!fixedRole) store.set(mode);
+      const opts = fixedRole ? {} : { onSwitchMode: () => show(null) };
+      if (mode === 'client') current = Client.mount(root, api, opts);
+      else if (mode === 'host') current = Host.mount(root, api, opts);
       else firstRun();
     }
 
@@ -52,7 +58,7 @@ namespace LP.App {
       first.focus();
     }
 
-    show(store.get());
+    show(fixedRole ?? store.get());
     return { destroy: () => current?.destroy() };
   }
 
@@ -65,7 +71,12 @@ namespace LP.App {
       root.textContent = 'LanPlay could not start (no bridge to the app). Please restart it.';
       return;
     }
-    start(root, window.lanplay);
+    const api = window.lanplay;
+    root.textContent = 'Starting...';
+    api.invoke('app:info').then(
+      (info) => start(root, api, browserStore(), info.role === 'host' || info.role === 'client' ? info.role : null),
+      () => start(root, api),
+    );
   }
 }
 

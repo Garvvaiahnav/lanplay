@@ -139,7 +139,8 @@ export class LanDiscovery implements DiscoveryService {
     const gen = ++this.generation;
     this.d.log.log('info', 'discovery', 'start');
     this.d.mdns?.start((s) => {
-      for (const a of s.addresses) if (net.isIPv4(a) || net.isIPv6(a)) void this.confirm(a, 'mdns', s.name);
+      // mDNS answers are unauthenticated: never let one point LanPlay at an address outside the home network.
+      for (const a of s.addresses) if ((net.isIPv4(a) || net.isIPv6(a)) && isPrivateAddress(a)) void this.confirm(a, 'mdns', s.name);
     });
     this.startUdp(gen);
     const t = setTimeout(() => {
@@ -285,6 +286,10 @@ export class LanDiscovery implements DiscoveryService {
       } catch {
         throw new Error(`Could not find a computer named "${a}". Try its IP address.`);
       }
+    }
+    // LAN only (v1): the PIN travels to the PC's pair agent over plain HTTP, and the agent refuses non-private sources anyway.
+    if (!isPrivateAddress(ip)) {
+      throw new Error(`${ip} is not an address on a home network. LanPlay only connects inside your own network (addresses like 192.168.x.x or 10.x.x.x).`);
     }
     const h = await this.confirm(ip, 'manual', undefined);
     if (!h) throw new Error(`No Sunshine host answered at ${ip}:${this.d.sunshinePort}. Is LanPlay set up on the PC and is the PC on?`);

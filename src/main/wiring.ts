@@ -63,6 +63,12 @@ export function buildServices(env: WiringEnv): Services {
     app: env.appInfo,
     selfCheck,
     resolvedPaths,
+    secrets: async () => {
+      const pw = await deps.secrets.get('sunshine-admin-password');
+      return pw ? [pw] : [];
+    },
+    // The elevated setup helper always logs under %ProgramData%\LanPlay\logs, even when this session fell back.
+    ...(env.role === 'host' ? { extraLogDirs: [path.join(deps.paths.sharedData, 'logs')] } : {}),
     system: async () => {
       if (env.role === 'host') return hostSystemInfo({ runner: deps.runner, redactor: deps.log.redactor, paths: deps.paths, systemRoot });
       return macSystemInfo(deps.runner);

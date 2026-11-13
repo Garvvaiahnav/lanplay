@@ -73,6 +73,52 @@ describe('first run', () => {
   });
 });
 
+describe('role decided by the app (Windows = host, Mac = client)', () => {
+  it('opens that screen directly: no first-run question, no Change mode, nothing stored', async () => {
+    const root = document.body.appendChild(document.createElement('div'));
+    const store = memStore('host'); // even a stale stored choice does not win over the real role
+    const h = LPG.App.start(root, api(), store, 'client');
+    await flush();
+    expect(root.querySelector('button.big')).toBeNull();
+    expect(root.querySelector('.stream-btn')).toBeTruthy();
+    expect([...root.querySelectorAll('button')].some((b) => b.textContent === 'Change mode')).toBe(false);
+    expect(store.peek()).toBe('host');
+    h.destroy();
+    const root2 = document.body.appendChild(document.createElement('div'));
+    const h2 = LPG.App.start(root2, api(), memStore(), 'host');
+    await flush();
+    expect(root2.textContent).toMatch(/Sunshine/);
+    expect(root2.textContent).toMatch(/keeps running in the background/);
+    expect([...root2.querySelectorAll('button')].some((b) => b.textContent === 'Change mode')).toBe(false);
+    h2.destroy();
+  });
+
+  it('boot() asks the app for its role; if that fails it falls back to the question', async () => {
+    const w = window as unknown as { __LANPLAY_NO_AUTOSTART__?: boolean; lanplay?: unknown };
+    document.body.innerHTML = '<div id="app"></div>';
+    w.__LANPLAY_NO_AUTOSTART__ = false;
+    try {
+      w.lanplay = api();
+      LPG.App.boot();
+      await flush();
+      expect(document.getElementById('app')!.textContent).toMatch(/LanPlay host/);
+      expect(document.querySelector('button.big')).toBeNull();
+
+      document.body.innerHTML = '<div id="app"></div>';
+      const broken = api();
+      broken.handlers['app:info'] = () => { throw new Error('nope'); };
+      w.lanplay = broken;
+      window.localStorage.removeItem('lanplay.mode');
+      LPG.App.boot();
+      await flush();
+      expect(document.querySelectorAll('button.big')).toHaveLength(2);
+    } finally {
+      w.__LANPLAY_NO_AUTOSTART__ = true;
+      delete w.lanplay;
+    }
+  });
+});
+
 describe('storage safety', () => {
   it('browserStore survives a throwing localStorage', () => {
     const spy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('blocked'); });

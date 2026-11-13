@@ -4,7 +4,7 @@ namespace LP.Host {
 
   export interface Handle { destroy(): void }
 
-  export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode: () => void }): Handle {
+  export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode?: () => void } = {}): Handle {
     let info: T.AppInfo | null = null;
     let status: T.HostSetupStatus | null = null;
     let agent: T.AgentState | null = null;
@@ -53,12 +53,13 @@ namespace LP.Host {
       h('section', { class: 'card', 'aria-labelledby': id }, h('h2', { id }, title), ...kids);
 
     const screen = h('main', { class: 'screen' },
-      h('header', { class: 'top' }, h('h1', null, 'LanPlay host'), h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode() }, 'Change mode')),
+      h('header', { class: 'top' }, h('h1', null, 'LanPlay host'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, 'Change mode') : null),
       noteEl,
       card('h-name', 'This PC is called', h('div', { class: 'row' }, hostNameEl, copyNameBtn), h('p', { class: 'hint' }, 'The other computer finds this PC by itself. If it cannot, type this name or the IP address there.')),
-      card('h-sun', 'Sunshine', sunshineEl, h('div', { class: 'row' }, setupBtn), h('p', { class: 'hint' }, 'Windows will ask for permission once. This installs Sunshine, opens the firewall for your home network and starts it at login.'), stepsEl),
+      card('h-sun', 'Sunshine', sunshineEl, h('div', { class: 'row' }, setupBtn), h('p', { class: 'hint' }, 'Windows will ask for permission once. This installs Sunshine, opens the firewall for your home network and starts it at login. If Sunshine was already installed, its web page login is replaced by one only LanPlay knows.'), stepsEl),
       card('h-pair', 'Pairing', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Auto-approve devices on my network'), autoSwitch.el),
-        h('p', { class: 'hint' }, 'On: any computer on your home network can pair without a code. Off: you approve each one here.'), agentLine, pendingEl),
+        h('p', { class: 'hint' }, 'On: any computer on your home network can pair without a code. Off: you approve each one here.'), agentLine,
+        h('p', { class: 'hint' }, 'You can close this window: LanPlay keeps running in the background so the other computer can connect. To stop it completely, use File > Exit.'), pendingEl),
       card('h-dev', 'Paired devices', devicesEl),
       card('h-health', 'Health', h('div', { class: 'row' }, checkBtn, diagBtn), h('p', { class: 'hint' }, 'If something does not work, press Copy diagnostics and send the zip file.'), diagEl, checkEl));
     Dom.setChildren(root, [screen]);

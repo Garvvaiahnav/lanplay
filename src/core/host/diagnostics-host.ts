@@ -86,7 +86,17 @@ export async function hostDiagnosticsFiles(d: HostDiagDeps): Promise<DiagFile[]>
       if (t !== null) files.push({ name: `logs/sunshine-install/${path.basename(f)}`, text: t });
     }
   }
-  const msi = newestFiles(d.paths.logDir, (n) => /^msiexec-.*\.log$/.test(n), 1)[0];
+  // The silent MSI action runs as LocalSystem, so its logs are under SYSTEM's temp; the elevated setup copied them
+  // next to LanPlay's logs as sunshine-install-* (collectSunshineInstallerLogs).
+  const logDirs = [...new Set([d.paths.logDir, path.join(d.paths.sharedData, 'logs')])];
+  for (const dir of logDirs) {
+    for (const f of newestFiles(dir, (n) => n.startsWith('sunshine-install-'), 3)) {
+      const t = readTailText(f, max);
+      const name = `logs/sunshine-install/${path.basename(f).replace(/^sunshine-install-/, 'system-')}`;
+      if (t !== null && !files.some((x) => x.name === name)) files.push({ name, text: t });
+    }
+  }
+  const msi = logDirs.flatMap((dir) => newestFiles(dir, (n) => /^msiexec-.*\.log$/.test(n), 1))[0];
   if (msi) {
     const t = readTailText(msi, max);
     if (t !== null) files.push({ name: 'logs/msiexec.log', text: t });

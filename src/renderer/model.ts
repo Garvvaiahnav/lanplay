@@ -141,8 +141,15 @@ namespace LP.Model {
     timeout: 'Pairing took too long. Try again.',
   };
 
+  /** Codes where the PC's own explanation says what to do next (too-old Sunshine, which address was seen, ...). */
+  const PAIR_DETAIL_CODES = ['no-pending-pairing', 'sunshine-not-ready', 'sunshine-api-error', 'moonlight-failed', 'verify-failed'];
+
   export function pairErrorMessage(r: Extract<T.PairResult, { ok: false }>): string {
-    return PAIR_ERRORS[r.code] ?? r.message;
+    const friendly = PAIR_ERRORS[r.code];
+    if (!friendly) return r.message;
+    const detail = (r.message ?? '').trim();
+    if (detail && detail !== friendly && PAIR_DETAIL_CODES.indexOf(r.code) >= 0) return friendly + ' Details: ' + (detail.length > 400 ? detail.slice(0, 400) + '...' : detail);
+    return friendly;
   }
 
   const PHASES: Record<string, string> = {

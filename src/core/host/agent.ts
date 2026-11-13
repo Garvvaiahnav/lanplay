@@ -483,6 +483,7 @@ export class LanPairAgent implements PairAgent {
     try {
       sunshineVersion = await this.o.sunshine.getVersion();
       ready = true;
+      if (this.lastError?.startsWith('Sunshine API:')) this.lastError = undefined; // recovered
     } catch (e) {
       this.lastError = `Sunshine API: ${(e as Error).message}`;
     }

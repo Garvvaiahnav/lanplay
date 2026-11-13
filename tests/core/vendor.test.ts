@@ -40,5 +40,12 @@ describe('vendor pinning', () => {
     expect(cfg.mac.extendInfo.NSBonjourServices).toEqual(['_nvstream._tcp']);
     expect(cfg.mac.extendInfo.NSLocalNetworkUsageDescription).toBeTruthy();
     expect(cfg.mac.identity).toBeNull();
+    // dmg/nsis targets would pull extra helper binaries from outside the download allow-list
+    expect(cfg.mac.target.map((t: { target: string }) => t.target)).toEqual(['dir']);
+  });
+  it('npm pack scripts actually use that config (without it the Mac app ships without Moonlight and the Local Network keys)', () => {
+    const pkg = JSON.parse(readFileSync(path.join(ROOT, 'package.json'), 'utf8')) as { scripts: Record<string, string> };
+    for (const name of ['pack:mac', 'pack:win']) expect(pkg.scripts[name], name).toContain('--config scripts/electron-builder.config.cjs');
+    expect(pkg.scripts['pack:mac']).toMatch(/--mac dir --arm64/);
   });
 });

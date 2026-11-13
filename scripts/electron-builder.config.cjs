@@ -1,5 +1,5 @@
 // electron-builder config (use: electron-builder --config scripts/electron-builder.config.cjs ...).
-// macOS: unsigned local build (dir + dmg, arm64); Moonlight.app is copied by scripts/after-pack.cjs with `ditto` so its
+// macOS: unsigned local build (dir, arm64); Moonlight.app is copied by scripts/after-pack.cjs with `ditto` so its
 //        notarized signature stays intact (no signing step touches it because identity is null).
 // Windows: portable dir + zip only (no NSIS). signAndEditExecutable:false avoids rcedit/wine when building on a Mac.
 /** @type {import('electron-builder').Configuration} */
@@ -19,10 +19,8 @@ module.exports = {
   ],
   afterPack: './scripts/after-pack.cjs',
   mac: {
-    target: [
-      { target: 'dir', arch: ['arm64'] },
-      { target: 'dmg', arch: ['arm64'] },
-    ],
+    // dir only: a dmg would make electron-builder download extra helper binaries (outside the download allow-list).
+    target: [{ target: 'dir', arch: ['arm64'] }],
     category: 'public.app-category.games',
     identity: null,
     hardenedRuntime: false,
@@ -32,7 +30,6 @@ module.exports = {
       NSBonjourServices: ['_nvstream._tcp'],
     },
   },
-  dmg: { sign: false },
   win: {
     target: [
       { target: 'dir', arch: ['x64'] },

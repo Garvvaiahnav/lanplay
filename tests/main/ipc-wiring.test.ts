@@ -96,6 +96,41 @@ describe('diagnostics zip', () => {
     expect(net.loopbackTcp.map((p: { port: number }) => p.port)).toEqual([47984, 47989, 47990, 48010, 47920]);
   });
 
+  it('masks the STORED Sunshine password even in a fresh session whose redactor never saw it (third-party logs are copied verbatim)', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'lanplay-diag2-'));
+    const shared = path.join(root, 'ProgramData', 'LanPlay');
+    const paths: AppPaths = { logDir: path.join(root, 'LocalAppData', 'LanPlay', 'logs'), userData: root, sharedData: shared, resources: root, vendorDir: root, psDir: root, diagnosticsOutDir: path.join(root, 'Desktop'), logDirFellBack: true };
+    const pw = 'Zm9vYmFyLXN0b3JlZC1wYXNzd29yZC0wMTIzNDU2Nzg5';
+    const basic = Buffer.from(`lanplay:${pw}`).toString('base64');
+    // a brand-new logger/redactor: nobody called addSecret(pw) in this "session"
+    const log = createJsonlLogger({ dir: paths.logDir, filePattern: 'lanplay-<date>.log' });
+    log.log('info', 'main', 'start');
+    // the elevated helper logged under %ProgramData% while this session fell back to %LOCALAPPDATA%
+    const elevated = createJsonlLogger({ dir: path.join(shared, 'logs'), filePattern: 'lanplay-<date>.elevated.log' });
+    elevated.step({ stepId: 'service', title: 'Sunshine service', status: 'pass', startedAt: new Date().toISOString(), durationMs: 1, message: 'ok', commands: [] });
+    const { zipPath } = await collectDiagnostics({
+      role: 'host',
+      paths,
+      redactor: log.redactor,
+      app: { name: 'LanPlay', version: '0.1.0', electron: '45.1.0', node: process.versions.node, chrome: '1' },
+      selfCheck: async () => ({ role: 'host', startedAt: new Date().toISOString(), durationMs: 1, ok: true, steps: [] }),
+      system: async () => ({ os: { platform: 'win32', release: 'Windows 11', arch: 'x64' }, gpus: [], isAdmin: false }),
+      extraFiles: async () => [{ name: 'logs/sunshine.log', text: `Info: cmdline sunshine.exe --creds lanplay ${pw}\nDebug: header X-Thing: ${basic}\nInfo: plain ${pw} again\n` }],
+      resolvedPaths: {},
+      secrets: async () => [pw],
+      extraLogDirs: [path.join(shared, 'logs')],
+      hostName: 'PC',
+    });
+    const all = execFileSync('unzip', ['-p', zipPath], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    expect(all).not.toContain(pw);
+    expect(all).not.toContain(basic);
+    expect(all).toContain('[REDACTED]');
+    const list = execFileSync('unzip', ['-Z1', zipPath], { encoding: 'utf8' }).trim().split('\n');
+    expect(list.some((n) => /^logs\/lanplay-.*\.elevated\.log$/.test(n))).toBe(true); // found in the second log folder
+    const steps = execFileSync('unzip', ['-p', zipPath, 'steps.jsonl'], { encoding: 'utf8' });
+    expect(steps).toContain('"stepId":"service"');
+  });
+
   it('extractRecords skips partial lines', () => {
     const r = extractRecords(['…(truncated)\n{"broken', '{"ts":"t","scope":"s","step":{"stepId":"a"}}\n{"rest":{"url":"u"}}']);
     expect(r.steps).toHaveLength(1);

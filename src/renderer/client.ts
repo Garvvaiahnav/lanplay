@@ -6,7 +6,7 @@ namespace LP.Client {
 
   interface ErrorInfo { message: string }
 
-  export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode: () => void }): Handle {
+  export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode?: () => void } = {}): Handle {
     let hosts: T.HostInfo[] = [];
     let selectedId: string | null = null;
     let settings: T.StreamSettings | null = null;
@@ -70,7 +70,7 @@ namespace LP.Client {
       h('div', { class: 'manual' }, h('label', { for: 'manual-ip', class: 'label' }, 'IP address'), h('div', { class: 'row' }, manualInput, manualBtn), h('p', { class: 'hint' }, Model.HINTS.manual), manualMsg));
 
     const screen = h('main', { class: 'screen' },
-      h('header', { class: 'top' }, h('h1', null, 'LanPlay'), h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode() }, 'Change mode')),
+      h('header', { class: 'top' }, h('h1', null, 'LanPlay'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, 'Change mode') : null),
       statusEl, errorEl, hostBox, settingsBox,
       h('div', { class: 'stream-row' }, streamBtn, stopBtn));
     Dom.setChildren(root, [screen]);

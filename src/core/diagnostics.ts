@@ -27,6 +27,13 @@ export interface DiagnosticsDeps {
   /** Extra listener details (host: get-listeners.ps1). */
   listeners?: () => Promise<unknown>;
   resolvedPaths: Record<string, unknown>;
+  /**
+   * Stored secrets (e.g. the Sunshine admin password) to mask in everything that goes into the zip. A fresh app
+   * session's Redactor has never seen them, and third-party logs (sunshine.log, installer logs) are copied verbatim.
+   */
+  secrets?: () => Promise<string[]>;
+  /** Other folders that may hold LanPlay logs (the elevated helper logs to %ProgramData% even when the app fell back). */
+  extraLogDirs?: string[];
   now?: () => Date;
   hostName?: string;
 }
@@ -124,16 +131,37 @@ export async function collectDiagnostics(d: DiagnosticsDeps, outDir?: string): P
   };
   const json = (v: unknown) => JSON.stringify(redactValue(d.redactor, v), null, 2);
 
+  // Register stored secrets FIRST so nothing collected below can carry them into the zip.
+  if (d.secrets) {
+    const got = await safe('secrets for redaction', d.secrets);
+    if (Array.isArray(got)) {
+      for (const sec of got) {
+        if (typeof sec !== 'string' || !sec) continue;
+        d.redactor.addSecret(sec);
+        // Also the forms it takes inside an HTTP Basic header.
+        d.redactor.addSecret(Buffer.from(sec, 'utf8').toString('base64'));
+        d.redactor.addSecret(Buffer.from(`${LANPLAY.sunshineAdminUser}:${sec}`, 'utf8').toString('base64'));
+      }
+    }
+  }
+
   const selfcheck = await safe('selfcheck', d.selfCheck);
   files.push({ name: 'selfcheck.json', text: json(selfcheck) });
 
   // Logs (tails) + extracted step/REST records.
   const logTexts: string[] = [];
-  for (const f of recentLogFiles(d.paths.logDir, now)) {
-    const t = readTailText(f, LANPLAY.diagnosticsTailBytes);
-    if (t === null) continue;
-    logTexts.push(t);
-    files.push({ name: `logs/${path.basename(f)}`, text: t });
+  const logDirs = [...new Set([d.paths.logDir, ...(d.extraLogDirs ?? [])])];
+  const seenLogNames = new Set<string>();
+  for (const dir of logDirs) {
+    for (const f of recentLogFiles(dir, now)) {
+      const t = readTailText(f, LANPLAY.diagnosticsTailBytes);
+      if (t === null) continue;
+      logTexts.push(t);
+      let name = path.basename(f);
+      if (seenLogNames.has(name)) name = `${path.basename(dir)}-${name}`;
+      seenLogNames.add(name);
+      files.push({ name: `logs/${name}`, text: t });
+    }
   }
   const rec = extractRecords(logTexts);
   files.push({ name: 'steps.jsonl', text: rec.steps.join('\n') + (rec.steps.length ? '\n' : '') });
@@ -149,7 +177,7 @@ export async function collectDiagnostics(d: DiagnosticsDeps, outDir?: string): P
   };
   files.push({ name: 'network.json', text: json(network) });
 
-  files.push({ name: 'paths.json', text: json({ ...d.paths, ...d.resolvedPaths }) });
+  files.push({ name: 'paths.json', text: json({ ...d.paths, ...d.resolvedPaths, logDirsRead: logDirs }) });
 
   const extra = await safe('extra files', d.extraFiles);
   if (Array.isArray(extra)) files.push(...extra);

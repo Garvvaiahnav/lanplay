@@ -71,6 +71,13 @@ describe('texts and states', () => {
       expect(text.length).toBeGreaterThan(10);
     }
   });
+  it('pair errors keep the PC\'s own explanation when it says what to do (e.g. Sunshine too old), but never for codes where it adds nothing', () => {
+    const tooOld = 'The Sunshine installed on the PC is too old for LanPlay. On the PC: Windows Settings > Apps > Sunshine > Uninstall, then press "Set up / Repair".';
+    const text: string = M.pairErrorMessage({ ok: false, hostId: 'h', code: 'sunshine-api-error', message: tooOld, retryable: true, durationMs: 1 });
+    expect(text).toMatch(/^Sunshine on the PC returned an error\..* Details: The Sunshine installed on the PC is too old/);
+    expect(M.pairErrorMessage({ ok: false, hostId: 'h', code: 'approval-denied', message: 'RAW', retryable: false, durationMs: 1 })).not.toMatch(/RAW|Details/);
+    expect(M.pairErrorMessage({ ok: false, hostId: 'h', code: 'no-pending-pairing', message: 'x'.repeat(900), retryable: true, durationMs: 1 }).length).toBeLessThan(520);
+  });
   it('validAddress accepts IPs and names, rejects URL-ish input', () => {
     for (const ok of ['192.168.1.20', ' 10.0.0.1 ', 'fe80::1', 'gaming-pc', 'pc.local']) expect(M.validAddress(ok)).not.toBeNull();
     for (const bad of ['', '999.1.1.1', 'http://1.2.3.4', '1.2.3.4/x', 'a b', 'pc?x=1', '1.2.3.4:47989']) expect(M.validAddress(bad)).toBeNull();
