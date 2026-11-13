@@ -6,7 +6,8 @@
 // if that is impossible (offline, gallery down) the analyzer is skipped and the reason is printed.
 // Usage: node scripts/check-ps.mjs [--no-analyzer]
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -29,18 +30,35 @@ function pwsh(args, opts = {}) {
   return execFileSync(PWSH, ['-NoLogo', '-NoProfile', '-NonInteractive', ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, env: { ...process.env, POWERSHELL_TELEMETRY_OPTOUT: '1', POWERSHELL_UPDATECHECK: 'Off' }, ...opts });
 }
 
+// Pinned hashes of the analyzer files (vendor/manifest.json devTools[psscriptanalyzer]).
+function analyzerIntact() {
+  const manifest = JSON.parse(readFileSync(join(ROOT, 'vendor', 'manifest.json'), 'utf8'));
+  const tool = (manifest.devTools ?? []).find((t) => t.id === 'psscriptanalyzer');
+  if (!tool || tool.version !== ANALYZER_VERSION) return 'no pinned hashes for this version in vendor/manifest.json';
+  const dir = join(MODULES, 'PSScriptAnalyzer', ANALYZER_VERSION);
+  for (const [rel, want] of Object.entries(tool.sha256)) {
+    const got = createHash('sha256').update(readFileSync(join(dir, rel))).digest('hex');
+    if (got !== want) return `SHA256 mismatch for ${rel} (got ${got})`;
+  }
+  return null;
+}
+
 let analyzerPath = '';
 let analyzerSkip = '';
 if (process.argv.includes('--no-analyzer')) {
   analyzerSkip = '--no-analyzer given';
-} else if (existsSync(join(MODULES, 'PSScriptAnalyzer', ANALYZER_VERSION))) {
-  analyzerPath = MODULES;
 } else {
-  try {
-    pwsh(['-Command', `Save-Module -Name PSScriptAnalyzer -RequiredVersion ${ANALYZER_VERSION} -Repository PSGallery -Path '${MODULES.replace(/'/g, "''")}' -Force -ErrorAction Stop`], { timeout: 180_000, stdio: ['ignore', 'pipe', 'pipe'] });
-    analyzerPath = MODULES;
-  } catch (e) {
-    analyzerSkip = String(e.stderr || e.message || e).split('\n').find((l) => l.trim()) ?? 'unknown error';
+  if (!existsSync(join(MODULES, 'PSScriptAnalyzer', ANALYZER_VERSION))) {
+    try {
+      pwsh(['-Command', `Save-Module -Name PSScriptAnalyzer -RequiredVersion ${ANALYZER_VERSION} -Repository PSGallery -Path '${MODULES.replace(/'/g, "''")}' -Force -ErrorAction Stop`], { timeout: 180_000, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (e) {
+      analyzerSkip = String(e.stderr || e.message || e).split('\n').find((l) => l.trim()) ?? 'unknown error';
+    }
+  }
+  if (!analyzerSkip) {
+    const bad = analyzerIntact();
+    if (bad) analyzerSkip = bad;
+    else analyzerPath = MODULES;
   }
 }
 

@@ -73,5 +73,21 @@
       "binary": "pwsh-macos/pwsh-7.7.0/pwsh",
       "notes": "Dev tool only (static check of *.ps1 via [System.Management.Automation.Language.Parser]::ParseFile). Never shipped. Verified running: $PSVersionTable.PSVersion = 7.7.0."
     }
+  ],
+  "devTools": [
+    {
+      "id": "psscriptanalyzer",
+      "product": "PSScriptAnalyzer",
+      "license": "MIT",
+      "source": "https://www.powershellgallery.com/packages/PSScriptAnalyzer/1.24.0",
+      "version": "1.24.0",
+      "installedBy": "scripts/check-ps.mjs (Save-Module -RequiredVersion 1.24.0 -Repository PSGallery -> vendor/psmodules)",
+      "sha256": {
+        "PSScriptAnalyzer.psd1": "b65f47ef115a4f68b562ca2ed749d3aab48d16a478f30e30a43df5d22ba54ac3",
+        "PSv7/Microsoft.Windows.PowerShell.ScriptAnalyzer.dll": "a816f622b3bc1b3000afd51be8c40358050a544675181c55d0e14fdfd1ce470c",
+        "PSv7/Microsoft.Windows.PowerShell.ScriptAnalyzer.BuiltinRules.dll": "318639f220718e14c587d07da5a37ac7f23b697dc56cb29e0dd8b2ea55950432"
+      },
+      "notes": "Dev-only static analysis, never shipped. The Gallery publishes no digest, so these hashes were recorded at first install (2026-11-13, trust on first use); check-ps.mjs refuses to load a module whose files differ."
+    }
   ]
 }
