@@ -4,7 +4,7 @@ namespace LP.Host {
 
   export interface Handle { destroy(): void }
 
-  export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode?: () => void } = {}): Handle {
+  export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode?: () => void; switchLabel?: string } = {}): Handle {
     let info: T.AppInfo | null = null;
     let status: T.HostSetupStatus | null = null;
     let agent: T.AgentState | null = null;
@@ -54,7 +54,7 @@ namespace LP.Host {
       h('section', { class: 'card', 'aria-labelledby': id }, h('h2', { id }, title), ...kids);
 
     const screen = h('main', { class: 'screen' },
-      h('header', { class: 'top' }, h('h1', null, 'LanPlay host'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, 'Change mode') : null),
+      h('header', { class: 'top' }, h('h1', null, 'LanPlay host'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, opts.switchLabel ?? 'Change mode') : null),
       noteEl,
       card('h-name', 'This PC is called', h('div', { class: 'row' }, hostNameEl, copyNameBtn), h('p', { class: 'hint' }, 'The other computer finds this PC by itself. If it cannot, type this name or the IP address there.')),
       card('h-sun', 'Sunshine', sunshineEl, h('div', { class: 'row' }, setupBtn), h('p', { class: 'hint' }, 'Windows will ask for permission once. This installs Sunshine, opens the firewall for your home network and starts it at login. If Sunshine was already installed, its web page login is replaced by one only LanPlay knows.'), adminWarn, stepsEl),

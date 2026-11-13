@@ -115,7 +115,11 @@ namespace LP.Model {
       case 'hevc':
         return 'HEVC: sharp and fast on almost every PC and Mac.';
       case 'av1':
-        return av1 ? 'AV1: best quality per Mbps, needs a recent graphics card on the PC.' : 'AV1: this Mac has no AV1 hardware decoder, so it may stutter. Try Auto.';
+        if (av1) return 'AV1: best quality per Mbps, needs a recent graphics card on the PC.';
+        // Only Apple chips are detected; on a Windows client (or unknown CPU) AV1 support depends on its graphics card.
+        return /^Apple /i.test(chip?.model ?? '') || !chip?.model
+          ? 'AV1: this Mac has no AV1 hardware decoder, so it may stutter. Try Auto.'
+          : 'AV1: needs AV1 hardware decoding on this computer\'s graphics card (no AV1 hardware decoder means it may stutter). Try Auto.';
       case 'h264':
         return 'H.264: works everywhere, needs more Mbps for the same quality.';
     }
@@ -174,6 +178,9 @@ namespace LP.Model {
     if (i.hostCount === 0) return i.searchTimedOut ? 'no-host' : 'searching';
     return 'ready';
   }
+
+  /** Moonlight's built-in shortcuts (moonlight-qt v6.2.0 app/streaming/input/input.cpp#L83-L91 SDLK_q quit / SDLK_z ungrab, keyboard.cpp#L199-L202 requires Ctrl+Alt+Shift). */
+  export const STREAM_ESCAPE_HINT = 'To leave the stream: press Ctrl+Alt+Shift+Q. To get your mouse back: Ctrl+Alt+Shift+Z.';
 
   export function phaseMessage(phase: ClientPhase, hostName: string | null): string {
     switch (phase) {

@@ -4,12 +4,12 @@ import os from 'node:os';
 import path from 'node:path';
 import { app, BrowserWindow, ipcMain, net, protocol, safeStorage, session, shell } from 'electron';
 import { IPC_INVOKE_CHANNELS, LANPLAY, SECURITY } from '../contracts.js';
-import type { IpcEventChannel, IpcEventMap, ServiceDeps } from '../contracts.js';
+import type { IpcEventChannel, IpcEventMap, Role, ServiceDeps } from '../contracts.js';
 import { computeAppPaths } from '../core/paths.js';
 import { NodeProcessRunner } from '../core/shared/exec.js';
 import { createJsonlLogger } from '../core/shared/logger.js';
 import { chooseSecretStore, JsonFileStore } from '../core/shared/stores.js';
-import { CliError, defaultRole, parseCli } from './cli.js';
+import { CliError, parseCli, readStoredRole, resolveRole } from './cli.js';
 import type { CliOptions } from './cli.js';
 import { createIpcRouter } from './ipc.js';
 import { applySecurity, isAllowedAppUrl } from './security.js';
@@ -43,12 +43,13 @@ function parseArgs(): CliOptions | null {
 }
 const parsed = parseArgs();
 const cli: CliOptions = parsed ?? { mode: 'gui', role: null, out: null, handoff: null, result: null, json: false, ignored: [] };
-const role = cli.role ?? defaultRole(process.platform);
+// Effective role is resolved in start() once the shared settings store is readable (--role flag > stored 'app.role' > platform default).
+let role: Role = cli.role ?? (process.platform === 'win32' ? 'host' : 'client');
 const headless = cli.mode === 'self-check' || cli.mode === 'diagnostics' || cli.mode === 'host-setup';
 
 if (!parsed) {
   app.exit(2);
-} else if (!headless && !app.requestSingleInstanceLock({ role })) {
+} else if (!headless && !app.requestSingleInstanceLock({ role: cli.role })) {
   // GUI and --agent share one instance: opening LanPlay while the login-item agent runs shows the window in that
   // process (no second agent fighting over port 47920). Headless modes never take the lock.
   app.quit();
@@ -74,8 +75,12 @@ async function start(): Promise<void> {
     appRoot: APP_ROOT,
     canWrite,
   });
+  const settings = new JsonFileStore(path.join(paths.sharedData, 'settings.json'));
+  // The elevated setup child is only ever started by the host role.
+  const resolved = cli.mode === 'host-setup' ? resolveRole({ flag: cli.role ?? 'host', stored: null, platform: process.platform }) : resolveRole({ flag: cli.role, stored: readStoredRole(settings), platform: process.platform });
+  role = resolved.role;
   const log = createJsonlLogger({ dir: paths.logDir, filePattern: cli.mode === 'host-setup' ? LANPLAY.elevatedLogFilePattern : LANPLAY.logFilePattern });
-  log.log('info', 'main', 'start', { mode: cli.mode, role, version: app.getVersion(), electron: process.versions.electron, platform: process.platform, arch: process.arch, packaged: app.isPackaged, logDirFellBack: paths.logDirFellBack, ignoredArgs: cli.ignored });
+  log.log('info', 'main', 'start', { mode: cli.mode, role, roleSource: resolved.source, version: app.getVersion(), electron: process.versions.electron, platform: process.platform, arch: process.arch, packaged: app.isPackaged, logDirFellBack: paths.logDirFellBack, ignoredArgs: cli.ignored });
   process.on('uncaughtException', (e) => log.log('error', 'main', 'uncaught exception', { error: e.message, stack: String(e.stack).split('\n').slice(0, 8) }));
   process.on('unhandledRejection', (e) => log.log('error', 'main', 'unhandled rejection', { error: String((e as Error)?.message ?? e) }));
 
@@ -84,7 +89,7 @@ async function start(): Promise<void> {
     log,
     paths,
     secrets,
-    settings: new JsonFileStore(path.join(paths.sharedData, 'settings.json')),
+    settings,
     runner: new NodeProcessRunner(log.redactor),
   };
   const selfArgsPrefix = app.isPackaged ? [] : [APP_ROOT];
@@ -97,6 +102,14 @@ async function start(): Promise<void> {
     isPackaged: app.isPackaged,
     appRoot: APP_ROOT,
     fileExists: existsSync,
+    platform: process.platform,
+    roleChoice: { canChoose: resolved.canChoose, stored: resolved.source !== 'default' },
+    relaunch: (r) => {
+      log.log('info', 'main', 'relaunching with new role', { role: r });
+      const args = process.argv.slice(1).filter((a, i, all) => a !== '--role' && all[i - 1] !== '--role' && !a.startsWith('--role='));
+      app.relaunch({ args: [...args, '--role', r] });
+      app.exit(0);
+    },
     loginItem:
       process.platform === 'win32' || process.platform === 'darwin'
         ? {
@@ -120,6 +133,12 @@ async function start(): Promise<void> {
     log.log('error', 'main', `${cli.mode} failed`, { error: (e as Error).message });
     process.stderr.write(`LanPlay ${cli.mode} failed: ${(e as Error).message}\n`);
     return app.exit(1);
+  }
+
+  // A Windows PC switched to the client role keeps its old --agent login item: nothing to run in the background.
+  if (cli.mode === 'agent' && role === 'client') {
+    log.log('info', 'main', '--agent ignored: this computer is a client');
+    return app.exit(0);
   }
 
   // GUI / agent

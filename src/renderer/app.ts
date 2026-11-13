@@ -29,19 +29,43 @@ namespace LP.App {
     };
   }
 
+  /** In-memory store seeded from main (Windows: the role lives in main's shared settings, not localStorage). */
+  export function memoryStore(initial: Mode | null): Store {
+    let v = initial;
+    return { get: () => v, set: (m) => { v = m; } };
+  }
+
+  /** Windows role chooser: stores the role in main; resolves true when main is relaunching in the other role. */
+  export interface RoleChooser { choose(mode: Mode): Promise<boolean> }
+
   /**
    * fixedRole: what this computer can be in v1 (main decides: Windows = host, macOS = client, see app:info). When set,
    * the matching screen opens directly: no "what is this computer for?" question whose wrong answer leads to a screen
    * where nothing works. Without it (tests, or app:info failed) the first-run choice is shown.
    */
-  export function start(root: HTMLElement, api: T.Api, store: Store = browserStore(), fixedRole: Mode | null = null): { destroy(): void } {
+  export function start(root: HTMLElement, api: T.Api, store: Store = browserStore(), fixedRole: Mode | null = null, chooser: RoleChooser | null = null): { destroy(): void } {
     let current: { destroy(): void } | null = null;
+
+    function pick(mode: Mode): void {
+      if (!chooser) return show(mode);
+      Dom.setChildren(root, [h('main', { class: 'screen first' }, h('p', { class: 'lead', role: 'status' }, 'Saving your choice...'))]);
+      chooser.choose(mode).then(
+        (relaunching) => {
+          if (relaunching) Dom.setChildren(root, [h('main', { class: 'screen first' }, h('p', { class: 'lead', role: 'status' }, 'Restarting LanPlay for this choice...'))]);
+          else show(mode);
+        },
+        (e: unknown) => {
+          firstRun();
+          root.querySelector('main')?.appendChild(h('p', { class: 'error', role: 'alert' }, 'Could not save your choice: ' + String((e as Error)?.message ?? e)));
+        },
+      );
+    }
 
     function show(mode: Mode | null): void {
       current?.destroy();
       current = null;
       if (!fixedRole) store.set(mode);
-      const opts = fixedRole ? {} : { onSwitchMode: () => show(null) };
+      const opts = fixedRole ? {} : { onSwitchMode: () => show(null), switchLabel: chooser ? 'Change role' : 'Change mode' };
       if (mode === 'client') current = Client.mount(root, api, opts);
       else if (mode === 'host') current = Host.mount(root, api, opts);
       else firstRun();
@@ -49,7 +73,7 @@ namespace LP.App {
 
     function firstRun(): void {
       const big = (title: string, sub: string, mode: Mode): HTMLButtonElement =>
-        h('button', { type: 'button', class: 'big', onClick: () => show(mode) }, h('span', { class: 'big-title' }, title), h('span', { class: 'big-sub' }, sub));
+        h('button', { type: 'button', class: 'big', onClick: () => pick(mode) }, h('span', { class: 'big-title' }, title), h('span', { class: 'big-sub' }, sub));
       const first = big('Play on this screen', 'This computer connects to a gaming PC and shows its games.', 'client');
       Dom.setChildren(root, [h('main', { class: 'screen first' },
         h('h1', null, 'LanPlay'),
@@ -74,7 +98,15 @@ namespace LP.App {
     const api = window.lanplay;
     root.textContent = 'Starting...';
     api.invoke('app:info').then(
-      (info) => start(root, api, browserStore(), info.role === 'host' || info.role === 'client' ? info.role : null),
+      (info) => {
+        const role = info.role === 'host' || info.role === 'client' ? info.role : null;
+        // Windows: the user picks client or host (first run shows the chooser until main has a stored role).
+        if (info.canChooseRole) {
+          const chooser: RoleChooser = { choose: (m) => api.invoke('app:role-set', { role: m }).then((r) => r.relaunching) };
+          return start(root, api, memoryStore(info.roleStored ? role : null), null, chooser);
+        }
+        return start(root, api, browserStore(), role);
+      },
       () => start(root, api),
     );
   }

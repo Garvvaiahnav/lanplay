@@ -1,4 +1,4 @@
-// Client-only diagnostics: Moonlight CLI logs (/tmp/Moonlight-<epoch>.log, observed on the Mac mini), macOS version, GPU.
+// Client-only diagnostics: Moonlight CLI logs (/tmp/Moonlight-<epoch>.log on macOS, %TEMP%\\Moonlight-<epoch>.log on Windows), OS version, GPU.
 import path from 'node:path';
 import os from 'node:os';
 import { LANPLAY, MOONLIGHT } from '../../contracts.js';
@@ -6,7 +6,7 @@ import type { ProcessRunner } from '../../contracts.js';
 import { newestFiles, readTailText } from '../diagnostics.js';
 import type { DiagFile } from '../diagnostics.js';
 
-export function clientDiagnosticsFiles(logDir = MOONLIGHT.macLogGlobDir): DiagFile[] {
+export function clientDiagnosticsFiles(logDir: string = MOONLIGHT.macLogGlobDir): DiagFile[] {
   const files: DiagFile[] = [];
   for (const f of newestFiles(logDir, (n) => n.startsWith(MOONLIGHT.macLogPrefix) && n.endsWith('.log'), 3)) {
     const t = readTailText(f, LANPLAY.diagnosticsTailBytes);
@@ -32,4 +32,10 @@ export async function macSystemInfo(runner: ProcessRunner) {
   if (ver) os_.version = ver;
   if (build) os_.build = build;
   return { os: os_, gpus, isAdmin: id.exitCode === 0 ? id.stdout.split(/\s+/).includes('admin') : null };
+}
+
+/** Windows client: no extra processes (keep diagnostics fast and dependency-free); CPU model stands in for the chip. */
+export async function winClientSystemInfo() {
+  const cpu = os.cpus()[0]?.model ?? 'unknown CPU';
+  return { os: { platform: 'win32', release: os.release(), arch: process.arch }, gpus: [] as Array<{ name: string; driverVersion?: string }>, isAdmin: null, extra: { cpu } };
 }

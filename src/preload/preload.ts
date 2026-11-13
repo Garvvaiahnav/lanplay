@@ -6,6 +6,7 @@ import type { IpcEnvelope, LanPlayPreloadApi } from '../contracts.js';
 
 const INVOKE_CHANNELS: readonly string[] = [
   'app:info',
+  'app:role-set',
   'client:system-info',
   'client:discover-start',
   'client:discover-stop',

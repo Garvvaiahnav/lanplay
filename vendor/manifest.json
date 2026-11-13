@@ -72,6 +72,25 @@
       "extract": "tar -xzf into vendor/pwsh-macos/pwsh-7.7.0; chmod +x pwsh",
       "binary": "pwsh-macos/pwsh-7.7.0/pwsh",
       "notes": "Dev tool only (static check of *.ps1 via [System.Management.Automation.Language.Parser]::ParseFile). Never shipped. Verified running: $PSVersionTable.PSVersion = 7.7.0."
+    },
+    {
+      "id": "moonlight-windows",
+      "product": "moonlight-qt",
+      "license": "GPL-3.0",
+      "repo": "https://github.com/moonlight-stream/moonlight-qt",
+      "tag": "v6.2.0",
+      "sourceCommit": "de2467e433821664cdd2224aad8c89a625be1ad9",
+      "sourceUrl": "https://github.com/moonlight-stream/moonlight-qt/releases/download/v6.2.0/MoonlightSrc-6.2.0.tar.gz",
+      "sourceSha256": "217afac54e4f8734f3d97b32cb8c8b46b677e87f25b77c945343dd06f359e189",
+      "platform": "win32",
+      "arch": "x64",
+      "asset": "MoonlightPortable-x64-6.2.0.zip",
+      "url": "https://github.com/moonlight-stream/moonlight-qt/releases/download/v6.2.0/MoonlightPortable-x64-6.2.0.zip",
+      "sizeBytes": 37242232,
+      "sha256": "6f91d268b41ed5ca8066d9d7578dc403b8db190991ff48f00b1700465f8f7ebf",
+      "extract": "unzip into vendor/moonlight-windows/ (ditto -xk on macOS, tar -xf on Windows)",
+      "binary": "Moonlight.exe (portable, no installer, no admin)",
+      "notes": "Official portable x64 build. SHA256 from the GitHub release asset digest field."
     }
   ],
   "devTools": [

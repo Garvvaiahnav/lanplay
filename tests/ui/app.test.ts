@@ -137,3 +137,57 @@ describe('storage safety', () => {
     expect(s.get()).toBeNull();
   });
 });
+
+describe('Windows role chooser (app:role-set)', () => {
+  function winApi(info: Record<string, unknown>, relaunching: boolean) {
+    const a = api();
+    a.handlers['app:info'] = () => ({ role: 'host', version: '1', platform: 'win32', arch: 'x64', logFile: '', ...info });
+    a.handlers['app:role-set'] = () => ({ relaunching });
+    return a;
+  }
+  async function boot(a: ReturnType<typeof api>) {
+    const w = window as unknown as { __LANPLAY_NO_AUTOSTART__?: boolean; lanplay?: unknown };
+    document.body.innerHTML = '<div id="app"></div>';
+    w.__LANPLAY_NO_AUTOSTART__ = false;
+    w.lanplay = a;
+    try {
+      LPG.App.boot();
+      await flush();
+    } finally {
+      w.__LANPLAY_NO_AUTOSTART__ = true;
+      delete w.lanplay;
+    }
+    return document.getElementById('app')!;
+  }
+
+  it('no stored role: shows the chooser; picking the other role stores it and shows a restart message', async () => {
+    const a = winApi({ canChooseRole: true, roleStored: false }, true);
+    const root = await boot(a);
+    expect(root.querySelectorAll('button.big')).toHaveLength(2);
+    (root.querySelectorAll('button.big')[0] as HTMLButtonElement).click();
+    await flush();
+    expect(a.calls.find((c) => c.channel === 'app:role-set')?.req).toEqual({ role: 'client' });
+    expect(root.textContent).toMatch(/Restarting LanPlay/);
+  });
+
+  it('stored role opens that screen with a Change role link back to the chooser', async () => {
+    const a = winApi({ role: 'client', canChooseRole: true, roleStored: true }, false);
+    const root = await boot(a);
+    expect(root.querySelector('.stream-btn')).toBeTruthy();
+    expect(root.textContent).toMatch(/Ctrl\+Alt\+Shift\+Q/);
+    expect(root.textContent).toMatch(/Ctrl\+Alt\+Shift\+Z/);
+    buttonByText(root, 'Change role').click();
+    await flush();
+    expect(root.querySelectorAll('button.big')).toHaveLength(2);
+    (root.querySelectorAll('button.big')[0] as HTMLButtonElement).click();
+    await flush();
+    expect(a.calls.filter((c) => c.channel === 'app:role-set')).toHaveLength(1);
+    expect(root.querySelector('.stream-btn')).toBeTruthy();
+  });
+
+  it('host screen also gets Change role on Windows', async () => {
+    const a = winApi({ role: 'host', canChooseRole: true, roleStored: true }, false);
+    const root = await boot(a);
+    expect([...root.querySelectorAll('button')].some((b) => b.textContent === 'Change role')).toBe(true);
+  });
+});

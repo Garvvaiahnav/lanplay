@@ -1,15 +1,16 @@
-// ClientService (Mac mini): discovery, settings, pairing, streaming, self-check.
+// ClientService (Mac, or a Windows PC in the client role): discovery, settings, pairing, streaming, self-check.
 import { randomUUID } from 'node:crypto';
-import { accessSync, constants, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { LANPLAY, MOONLIGHT } from '../../contracts.js';
+import { DEFAULT_STREAM_SETTINGS, LANPLAY, MOONLIGHT } from '../../contracts.js';
 import type {
   ClientService,
   ClientSystemInfo,
   HostInfo,
   MoonlightProcessHandle,
   MoonlightRunner,
+  MoonlightRunnerOptions,
   PairProgress,
   PairResult,
   SelfCheckReport,
@@ -23,7 +24,8 @@ import { httpGet } from '../shared/netprobe.js';
 import { timedStep } from '../shared/steprec.js';
 import { defaultDiscoveryDeps, LanDiscovery, localIPv4Interfaces } from './discovery.js';
 import type { DiscoveryDeps } from './discovery.js';
-import { createMoonlightRunner } from './moonlight.js';
+import { createMoonlightRunnerWith } from './moonlight.js';
+import { MOONLIGHT_WIN, platformLabel, readBundleVersion, readMoonlightVersion } from './platform.js';
 import { ClientPairingService } from './pairing.js';
 import type { PairingDeps } from './pairing.js';
 import { fetchServerInfo } from './serverinfo.js';
@@ -45,19 +47,11 @@ export interface ClientServiceExtras {
   /** How long the stream may run before we call it "running" (catches instant failures). */
   streamStartupMs?: number;
   selfCheckDiscoveryMs?: number;
+  /** Defaults to process.platform. 'win32' = Windows client (Moonlight.exe, no codesign, %TEMP% logs, taskkill). */
+  platform?: NodeJS.Platform;
 }
 
-/** CFBundleShortVersionString from <App>.app/Contents/Info.plist (XML plist). */
-export function readBundleVersion(binary: string): string | null {
-  const plist = path.join(path.dirname(binary), '..', 'Info.plist');
-  try {
-    const t = readFileSync(plist, 'utf8');
-    const m = /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/.exec(t);
-    return m ? m[1]!.trim() : null;
-  } catch {
-    return null;
-  }
-}
+export { readBundleVersion };
 
 export function defaultClientName(): string {
   const raw = os.hostname().replace(/\.local$/i, '').replace(/[^\p{L}\p{N} ._-]/gu, '-');
@@ -71,21 +65,23 @@ export class MacClientService implements ClientService {
   private readonly pairing: ClientPairingService;
   private readonly streams = new Map<string, MoonlightProcessHandle>();
   private readonly cpuModel: string;
+  private readonly platform: NodeJS.Platform;
 
   constructor(
     private readonly deps: ServiceDeps,
     private readonly x: ClientServiceExtras,
   ) {
+    this.platform = x.platform ?? process.platform;
     this.cpuModel = x.cpuModel ?? os.cpus()[0]?.model ?? '';
     this.discovery = new LanDiscovery({ ...defaultDiscoveryDeps(deps.log.child('client')), ...(x.discovery ?? {}) });
-    const mlOpts: Parameters<typeof createMoonlightRunner>[0] = {
-      binary: x.moonlightBinary ?? path.join('/Applications', MOONLIGHT.macBundleBinary),
+    const mlOpts: MoonlightRunnerOptions = {
+      binary: x.moonlightBinary ?? (this.platform === 'win32' ? MOONLIGHT_WIN.installedDefault : path.join('/Applications', MOONLIGHT.macBundleBinary)),
       prefixArgs: x.prefixArgs ?? [],
       runner: deps.runner,
       log: deps.log.child('client'),
     };
     if (x.moonlightEnv) mlOpts.env = x.moonlightEnv;
-    this.moonlight = createMoonlightRunner(mlOpts);
+    this.moonlight = createMoonlightRunnerWith(mlOpts, { platform: this.platform });
     this.pairing = new ClientPairingService({
       moonlight: this.moonlight,
       log: deps.log.child('client'),
@@ -112,12 +108,14 @@ export class MacClientService implements ClientService {
     return {
       chip: detectAppleChip(this.cpuModel),
       moonlightPath: present ? bin : null,
-      moonlightVersion: present && bin ? readBundleVersion(bin) : null,
+      moonlightVersion: present && bin ? readMoonlightVersion(bin, this.platform) : null,
     };
   }
 
   getSettings(): StreamSettings {
     const raw = this.deps.settings.get<unknown>(SETTINGS_KEY, null);
+    // Windows default: borderless (windowed fullscreen) so Alt+Tab and the Windows key still reach the desktop.
+    if (raw === null && this.platform === 'win32') return normalizeStreamSettings({ ...DEFAULT_STREAM_SETTINGS, displayMode: 'borderless' });
     try {
       return normalizeStreamSettings(raw ?? {});
     } catch {
@@ -140,7 +138,7 @@ export class MacClientService implements ClientService {
   async pair(hostId: string, onProgress: (p: PairProgress) => void): Promise<PairResult> {
     const h = this.host(hostId);
     if (!this.x.moonlightBinary) {
-      return { ok: false, hostId, code: 'moonlight-missing', message: 'Moonlight is not bundled with this build and not in /Applications.', retryable: false, durationMs: 0 };
+      return { ok: false, hostId, code: 'moonlight-missing', message: this.platform === 'win32' ? `Moonlight is not bundled with this build and not installed in ${MOONLIGHT_WIN.installedDefault}.` : 'Moonlight is not bundled with this build and not in /Applications.', retryable: false, durationMs: 0 };
     }
     const r = await this.pairing.pair(h, onProgress);
     if (r.ok) {
@@ -204,8 +202,9 @@ export class MacClientService implements ClientService {
     };
 
     push(
-      await timedStep('chip', 'Apple chip', async () => {
+      await timedStep('chip', this.platform === 'win32' ? 'Processor' : 'Apple chip', async () => {
         const c = detectAppleChip(this.cpuModel);
+        if (this.platform === 'win32') return { status: 'pass', message: `${c.model || 'unknown CPU'}: codec Auto uses HEVC when the PC offers it, else H.264.`, data: { ...c } };
         return { status: c.generation === null ? 'warn' : 'pass', message: `${c.model || 'unknown CPU'}: codec Auto uses ${c.av1HardwareDecode ? 'AV1 when the PC offers it, else HEVC' : 'HEVC (AV1 needs M3 or newer)'}.`, data: { ...c } };
       }),
     );
@@ -214,17 +213,17 @@ export class MacClientService implements ClientService {
       await timedStep('moonlight', 'Bundled Moonlight', async (s) => {
         const bin = this.x.moonlightBinary;
         s.data.binary = bin;
-        if (!bin || !existsSync(bin)) return { status: 'fail', message: `Moonlight not found (looked for ${bin ?? 'bundled app and /Applications'}).` };
+        if (!bin || !existsSync(bin)) return { status: 'fail', message: `Moonlight not found (looked for ${bin ?? (this.platform === 'win32' ? `bundled Moonlight.exe and ${MOONLIGHT_WIN.installedDefault}` : 'bundled app and /Applications')}).` };
         try {
           accessSync(bin, constants.X_OK);
         } catch {
           return { status: 'fail', message: `${bin} is not executable.` };
         }
-        const version = readBundleVersion(bin);
+        const version = readMoonlightVersion(bin, this.platform);
         s.data.version = version;
         // Read-only signature check (the bundled app must keep its notarized signature).
         const app = path.resolve(path.dirname(bin), '..', '..');
-        if (process.platform === 'darwin' && app.endsWith('.app') && existsSync('/usr/bin/codesign')) {
+        if (this.platform === 'darwin' && app.endsWith('.app') && existsSync('/usr/bin/codesign')) {
           const r = await runRecorded(this.deps.runner, { file: '/usr/bin/codesign', args: ['--verify', '--deep', '--strict', app], timeoutMs: 60_000 }, log.redactor, s.commands);
           if (r.exitCode !== 0) return { status: 'warn', message: `Moonlight ${version ?? '?'} found, but its code signature does not verify (macOS may block it): ${tail(r.stderr, 300).trim()}` };
         }
@@ -266,7 +265,7 @@ export class MacClientService implements ClientService {
         d.stop();
         found = d.list();
         s.data.hosts = found.map((h) => ({ name: h.name, addresses: h.addresses, sources: h.sources, agentReachable: h.agentReachable ?? null }));
-        if (!found.length) return { status: 'warn', message: `No PC answered within ${wait / 1000} s (mDNS, LanPlay UDP, port scan). macOS may be blocking local network access: System Settings > Privacy & Security > Local Network > LanPlay.` };
+        if (!found.length) return { status: 'warn', message: `No PC answered within ${wait / 1000} s (mDNS, LanPlay UDP, port scan). ${this.platform === 'win32' ? 'Check that this PC is on the same network and the network is set to Private in Windows Settings.' : 'macOS may be blocking local network access: System Settings > Privacy & Security > Local Network > LanPlay.'}` };
         return { status: 'pass', message: `Found ${found.map((h) => `${h.name} (${h.preferredAddress} via ${h.sources.join('+')})`).join(', ')}.` };
       }),
     );
@@ -300,7 +299,7 @@ export class MacClientService implements ClientService {
             s.data.listStderr = tail(p.result.stderr, 500);
           }
           if (problems.length) return { status: 'fail', message: problems.join('; ') + '.' };
-          return { status: 'pass', message: `Sunshine and the LanPlay agent answer${s.data.paired === true ? '; this Mac is paired' : s.data.paired === false ? '; not paired yet (Stream will pair)' : ''}.` };
+          return { status: 'pass', message: `Sunshine and the LanPlay agent answer${s.data.paired === true ? `; this ${platformLabel(this.platform)} is paired` : s.data.paired === false ? '; not paired yet (Stream will pair)' : ''}.` };
         }),
       );
     }

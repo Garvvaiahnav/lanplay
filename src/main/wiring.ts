@@ -5,7 +5,9 @@ import path from 'node:path';
 import { LANPLAY, SUNSHINE } from '../contracts.js';
 import type { AppInfo, ClientService, DiagnosticsService, HostService, IpcEventChannel, IpcEventMap, Role, SelfCheckReport, ServiceDeps } from '../contracts.js';
 import { createMacClientService } from '../core/client/service.js';
-import { clientDiagnosticsFiles, macSystemInfo } from '../core/client/diagnostics-client.js';
+import { clientDiagnosticsFiles, macSystemInfo, winClientSystemInfo } from '../core/client/diagnostics-client.js';
+import { moonlightLogDir } from '../core/client/platform.js';
+import { writeStoredRole } from '../core/client/role.js';
 import { moonlightCandidates } from '../core/client/moonlight.js';
 import { createDiagnosticsService } from '../core/diagnostics.js';
 import { hostDiagnosticsFiles, hostListeners, hostSystemInfo } from '../core/host/diagnostics-host.js';
@@ -23,6 +25,12 @@ export interface WiringEnv {
   appRoot: string;
   loginItem: { get(): boolean; set(on: boolean): void } | null;
   fileExists: (p: string) => boolean;
+  /** Defaults to process.platform (tests pass 'win32'). */
+  platform?: NodeJS.Platform;
+  /** Windows role choice (from resolveRole). Absent = role is fixed. */
+  roleChoice?: { canChoose: boolean; stored: boolean };
+  /** Relaunch the app with --role <role> (main: app.relaunch + app.exit). */
+  relaunch?: (role: Role) => void;
 }
 
 export interface Services {
@@ -35,7 +43,7 @@ export interface Services {
 
 export function findMoonlight(env: WiringEnv): string | null {
   const devVendor = env.isPackaged ? null : path.join(env.appRoot, 'vendor');
-  const list = moonlightCandidates(env.deps.paths.vendorDir, devVendor);
+  const list = moonlightCandidates(env.deps.paths.vendorDir, devVendor, env.platform ?? process.platform, process.env);
   return list.find((p) => env.fileExists(p)) ?? null;
 }
 
@@ -48,7 +56,7 @@ export function buildServices(env: WiringEnv): Services {
   if (env.role === 'client') {
     const ml = findMoonlight(env);
     resolvedPaths.moonlight = ml;
-    client = createMacClientService(deps, { moonlightBinary: ml });
+    client = createMacClientService(deps, { moonlightBinary: ml, platform: env.platform ?? process.platform });
   } else {
     host = createWindowsHostService(deps, { selfExe: env.selfExe, selfArgsPrefix: env.selfArgsPrefix, loginItem: env.loginItem, systemRoot });
     resolvedPaths.bundledMsi = path.join(deps.paths.vendorDir, SUNSHINE.msiAsset);
@@ -71,11 +79,11 @@ export function buildServices(env: WiringEnv): Services {
     ...(env.role === 'host' ? { extraLogDirs: [path.join(deps.paths.sharedData, 'logs')] } : {}),
     system: async () => {
       if (env.role === 'host') return hostSystemInfo({ runner: deps.runner, redactor: deps.log.redactor, paths: deps.paths, systemRoot });
-      return macSystemInfo(deps.runner);
+      return (env.platform ?? process.platform) === 'win32' ? winClientSystemInfo() : macSystemInfo(deps.runner);
     },
     ...(env.role === 'host' ? { listeners: () => hostListeners({ runner: deps.runner, redactor: deps.log.redactor, paths: deps.paths, systemRoot }) } : {}),
     extraFiles: async () => {
-      if (env.role === 'client') return clientDiagnosticsFiles();
+      if (env.role === 'client') return clientDiagnosticsFiles(moonlightLogDir(env.platform ?? process.platform));
       const certPath = path.join(deps.paths.sharedData, PINNED_CERT_NAME);
       return hostDiagnosticsFiles({
         runner: deps.runner,
@@ -121,9 +129,21 @@ export function buildHandlers(
     logFile: env.deps.log.currentFile(),
     hostName: os.hostname(),
     localAddresses: localAddresses(),
+    canChooseRole: env.roleChoice?.canChoose ?? false,
+    roleStored: env.roleChoice?.stored ?? true,
   });
   const common: IpcHandlers = {
     'app:info': appInfo,
+    'app:role-set': async ({ role }) => {
+      if (!env.roleChoice?.canChoose) throw new Error('The role of this computer cannot be changed here.');
+      const r = writeStoredRole(env.deps.settings, role);
+      env.deps.log.log('info', 'main', 'role chosen', { role: r, running: env.role });
+      env.roleChoice = { ...env.roleChoice, stored: true };
+      if (r === env.role) return { relaunching: false };
+      // Let the IPC reply reach the renderer before the process exits.
+      setTimeout(() => env.relaunch?.(r), 300);
+      return { relaunching: true };
+    },
     'selfcheck:run': () => once('selfcheck', () => s.selfCheck()),
     'diagnostics:collect': async () => {
       const r = await once('diagnostics', () => s.diagnostics.collect());

@@ -6,7 +6,7 @@ namespace LP.Client {
 
   interface ErrorInfo { message: string }
 
-  export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode?: () => void } = {}): Handle {
+  export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode?: () => void; switchLabel?: string } = {}): Handle {
     let hosts: T.HostInfo[] = [];
     let selectedId: string | null = null;
     let settings: T.StreamSettings | null = null;
@@ -48,6 +48,8 @@ namespace LP.Client {
     const codecHint = h('p', { class: 'hint' });
     const streamBtn = h('button', { type: 'button', class: 'stream-btn' }, 'Stream');
     const stopBtn = h('button', { type: 'button', class: 'btn danger', hidden: true }, 'Stop streaming');
+    // Moonlight captures the mouse: always say how to get out of the stream (also shown before streaming starts).
+    const escapeHint = h('p', { class: 'stream-escape', role: 'note' }, Model.STREAM_ESCAPE_HINT);
 
     const field = (label: string, control: Node, hint: string | Node, id?: string): HTMLElement =>
       h('div', { class: 'field' }, h('label', id ? { for: id, class: 'label' } : { class: 'label' }, label), control, typeof hint === 'string' ? h('p', { class: 'hint' }, hint) : hint);
@@ -70,9 +72,9 @@ namespace LP.Client {
       h('div', { class: 'manual' }, h('label', { for: 'manual-ip', class: 'label' }, 'IP address'), h('div', { class: 'row' }, manualInput, manualBtn), h('p', { class: 'hint' }, Model.HINTS.manual), manualMsg));
 
     const screen = h('main', { class: 'screen' },
-      h('header', { class: 'top' }, h('h1', null, 'LanPlay'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, 'Change mode') : null),
+      h('header', { class: 'top' }, h('h1', null, 'LanPlay'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, opts.switchLabel ?? 'Change mode') : null),
       statusEl, errorEl, hostBox, settingsBox,
-      h('div', { class: 'stream-row' }, streamBtn, stopBtn));
+      h('div', { class: 'stream-row' }, escapeHint, streamBtn, stopBtn));
     Dom.setChildren(root, [screen]);
 
     /* ---------- rendering ---------- */
@@ -142,6 +144,7 @@ namespace LP.Client {
       streamBtn.disabled = busy || sel === null || settings === null;
       streamBtn.textContent = ph === 'pairing' ? 'Pairing...' : ph === 'streaming' ? (stream?.state === 'starting' ? 'Starting...' : 'Streaming') : sel && sel.paired !== true ? 'Pair and stream' : 'Stream';
       stopBtn.hidden = ph !== 'streaming';
+      escapeHint.classList.toggle('live', ph === 'streaming');
     }
 
     /* ---------- actions ---------- */

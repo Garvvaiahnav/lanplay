@@ -101,3 +101,6 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .big-title { font-size: 1.35rem; font-weight: 700; }
 .big-sub { color: var(--muted); }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+.stream-escape { margin: 0; font-size: 0.92rem; color: var(--muted); }
+.stream-escape.live { color: inherit; font-weight: 600; font-size: 1rem; }

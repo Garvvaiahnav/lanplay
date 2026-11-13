@@ -1,9 +1,10 @@
 // MoonlightRunner: argv builders + spawning the bundled moonlight-qt. argv arrays only, never a shell.
 // Flags: https://github.com/moonlight-stream/moonlight-qt/blob/v6.2.0/app/cli/commandlineparser.cpp#L260-L373
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
 import { MOONLIGHT } from '../../contracts.js';
+import { MOONLIGHT_WIN } from './platform.js';
 import type { CreateMoonlightRunner, ExecResult, MoonlightProcessHandle, MoonlightRunner, MoonlightRunnerOptions, MoonlightStreamArgsInput, ResolvedCodec } from '../../contracts.js';
 import { tail } from '../shared/exec.js';
 
@@ -56,20 +57,67 @@ export function buildListArgs(host: string): string[] {
   return ['list', assertHostArg(host)];
 }
 
-/** Bundled first (packaged: resources/vendor/Moonlight.app; dev: vendor/moonlight-macos/Moonlight.app), then /Applications. */
-export function moonlightCandidates(vendorDir: string, devVendorDir: string | null): string[] {
+/**
+ * Moonlight binary candidates, first existing wins.
+ * darwin: bundled Moonlight.app (packaged: resources/vendor; dev: vendor/moonlight-macos), then /Applications.
+ * win32:  <vendorDir>/moonlight-windows/Moonlight.exe (bundled), then the installed
+ *         C:\Program Files\Moonlight Game Streaming\Moonlight.exe, then the portable dev vendor path
+ *         <repo>/vendor/moonlight-windows/Moonlight.exe.
+ */
+export function moonlightCandidates(vendorDir: string, devVendorDir: string | null, platform: NodeJS.Platform = process.platform, env: Readonly<Record<string, string | undefined>> = {}): string[] {
+  if (platform === 'win32') {
+    const w = path.win32;
+    const list = [w.join(vendorDir, MOONLIGHT_WIN.bundledDirName, MOONLIGHT_WIN.exeName)];
+    const installed: string[] = [MOONLIGHT_WIN.installedDefault];
+    for (const root of [env.ProgramW6432, env.ProgramFiles]) if (root) installed.push(w.join(root, MOONLIGHT_WIN.installedRelative));
+    for (const p of installed) if (!list.some((x) => x.toLowerCase() === p.toLowerCase())) list.push(p);
+    if (devVendorDir) list.push(w.join(devVendorDir, MOONLIGHT_WIN.bundledDirName, MOONLIGHT_WIN.exeName));
+    return list;
+  }
   const list = [path.join(vendorDir, MOONLIGHT.macBundleBinary)];
   if (devVendorDir) list.push(path.join(devVendorDir, 'moonlight-macos', MOONLIGHT.macBundleBinary));
   list.push(path.join('/Applications', MOONLIGHT.macBundleBinary));
   return list;
 }
 
-function spawnHandle(o: MoonlightRunnerOptions, argv: string[]): MoonlightProcessHandle {
+/** Test seams for spawnHandle / terminate. Production uses the defaults. */
+export interface MoonlightPlatformOptions {
+  platform?: NodeJS.Platform;
+  /** Tests: fake child_process.spawn. */
+  spawnFn?: typeof spawn;
+  /** Tests: record the taskkill argv instead of running it. Resolves when taskkill is done. */
+  taskkill?: (file: string, args: string[]) => Promise<void>;
+  env?: Readonly<Record<string, string | undefined>>;
+  /** After taskkill, how long terminate() still waits for the process to be reaped before giving up (default 3000). */
+  killWaitMs?: number;
+}
+
+/** Absolute taskkill.exe (never resolved through PATH). */
+export function taskkillPath(env: Readonly<Record<string, string | undefined>>): string {
+  return path.win32.join(env.SystemRoot || env.windir || 'C:\\Windows', 'System32', 'taskkill.exe');
+}
+
+/** argv for killing a process tree: taskkill /PID <pid> /T /F (T = children too, F = force). */
+export function taskkillArgs(pid: number): string[] {
+  if (!Number.isInteger(pid) || pid <= 0) throw new Error(`invalid pid ${pid}`);
+  return ['/PID', String(pid), '/T', '/F'];
+}
+
+function defaultTaskkill(file: string, args: string[]): Promise<void> {
+  return new Promise((resolve) => {
+    // UNTESTED-ON-WINDOWS: real taskkill.exe. execFile = argv array, no shell; errors (already gone) are not fatal.
+    execFile(file, args, { windowsHide: true, timeout: 10_000 }, () => resolve());
+  });
+}
+
+export function spawnHandle(o: MoonlightRunnerOptions, argv: string[], p: MoonlightPlatformOptions = {}): MoonlightProcessHandle {
+  const platform = p.platform ?? process.platform;
+  const spawnFn = p.spawnFn ?? spawn;
   const full = [...o.prefixArgs, ...argv];
   const started = Date.now();
   let stdout = '';
   let stderr = '';
-  const child = spawn(o.binary, full, {
+  const child = spawnFn(o.binary, full, {
     shell: false,
     windowsHide: true,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -98,23 +146,40 @@ function spawnHandle(o: MoonlightRunnerOptions, argv: string[]): MoonlightProces
   void exited.then(() => {
     finished = true;
   });
+  const pid = child.pid;
   return {
-    pid: child.pid,
+    pid,
     argv: o.log.redactor.redactArgv(argv),
     exited,
     async terminate(graceMs: number) {
       if (finished) return;
       child.kill('SIGTERM');
+      // Windows: kill() is TerminateProcess on the main process only; child processes (and their inherited stdio pipes,
+      // which hold 'close' back) can survive. After the grace period kill the whole tree: taskkill /PID <pid> /T /F.
+      let forced: Promise<void> | null = null;
       const t = setTimeout(() => {
-        if (!finished) child.kill('SIGKILL');
+        if (finished) return;
+        if (platform === 'win32' && pid !== undefined) {
+          // UNTESTED-ON-WINDOWS (argv + ordering are unit-tested with an injected taskkill).
+          forced = (p.taskkill ?? defaultTaskkill)(taskkillPath(p.env ?? process.env), taskkillArgs(pid));
+        } else child.kill('SIGKILL');
       }, graceMs);
-      await exited;
+      if (platform !== 'win32') {
+        await exited;
+        clearTimeout(t);
+        return;
+      }
+      // Never hang the UI on Windows: give up waiting killWaitMs after taskkill ran.
+      const afterKill = new Promise<void>((r) => setTimeout(r, graceMs + 10))
+        .then(() => forced ?? undefined)
+        .then(() => (finished ? undefined : new Promise<void>((r) => setTimeout(r, p.killWaitMs ?? 3000))));
+      await Promise.race([exited.then(() => undefined), afterKill]);
       clearTimeout(t);
     },
   };
 }
 
-export const createMoonlightRunner: CreateMoonlightRunner = (o) => {
+export function createMoonlightRunnerWith(o: MoonlightRunnerOptions, p: MoonlightPlatformOptions = {}): MoonlightRunner {
   const runner: MoonlightRunner = {
     binaryPath: () => o.binary,
     buildStreamArgs,
@@ -124,7 +189,7 @@ export const createMoonlightRunner: CreateMoonlightRunner = (o) => {
       o.log.redactor.addSecret(pin);
       const argv = buildPairArgs(host, pin);
       o.log.log('info', 'moonlight', 'starting pair', { argv: o.log.redactor.redactArgv(argv) });
-      return spawnHandle(o, argv);
+      return spawnHandle(o, argv, p);
     },
     async isPaired(host, timeoutMs) {
       const argv = buildListArgs(host);
@@ -137,8 +202,10 @@ export const createMoonlightRunner: CreateMoonlightRunner = (o) => {
     startStream(input) {
       const argv = buildStreamArgs(input);
       o.log.log('info', 'moonlight', 'starting stream', { argv });
-      return spawnHandle(o, argv);
+      return spawnHandle(o, argv, p);
     },
   };
   return runner;
-};
+}
+
+export const createMoonlightRunner: CreateMoonlightRunner = (o) => createMoonlightRunnerWith(o);

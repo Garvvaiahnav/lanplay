@@ -970,6 +970,10 @@ export interface AppInfo {
   hostName?: string;
   /** Added by ui builder (additive, optional): local IPv4 addresses for the host screen. */
   localAddresses?: string[];
+  /** Windows only (no --role flag): the user may switch between client and host ('app:role-set'). */
+  canChooseRole?: boolean;
+  /** True when `role` came from the stored 'app.role' setting or --role (not the platform default). */
+  roleStored?: boolean;
 }
 
 export interface ClientSystemInfo {
@@ -997,6 +1001,8 @@ export interface StreamState {
 /** Invoke channels: name -> [request, response]. */
 export interface IpcInvokeMap {
   'app:info': [void, AppInfo];
+  /** Windows: store the chosen role; main relaunches with --role when it differs from the running role. */
+  'app:role-set': [{ role: Role }, { relaunching: boolean }];
   'client:system-info': [void, ClientSystemInfo];
   'client:discover-start': [void, HostInfo[]];
   'client:discover-stop': [void, void];
@@ -1036,6 +1042,7 @@ export type IpcResponse<C extends IpcInvokeChannel> = IpcInvokeMap[C][1];
 /** Runtime allow-lists used by preload (only these strings may cross the bridge). Keep in sync with the maps above (a test enforces it). */
 export const IPC_INVOKE_CHANNELS = Object.freeze([
   'app:info',
+  'app:role-set',
   'client:system-info',
   'client:discover-start',
   'client:discover-stop',

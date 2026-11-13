@@ -1,7 +1,7 @@
 // electron-builder config (use: electron-builder --config scripts/electron-builder.config.cjs ...).
 // macOS: unsigned local build (dir, arm64); Moonlight.app is copied by scripts/after-pack.cjs with `ditto` so its
 //        notarized signature stays intact (no signing step touches it because identity is null).
-// Windows: portable dir + zip only (no NSIS). signAndEditExecutable:false avoids rcedit/wine when building on a Mac.
+// Windows: portable dir + zip + one-click per-user NSIS setup. Ships Sunshine MSI (host) and portable Moonlight (client). signAndEditExecutable:false avoids rcedit/wine when building on a Mac.
 /** @type {import('electron-builder').Configuration} */
 module.exports = {
   appId: 'dev.lanplay.app',
@@ -30,15 +30,25 @@ module.exports = {
       NSBonjourServices: ['_nvstream._tcp'],
     },
   },
+  nsis: {
+    oneClick: true,          // double-click setup .exe: no wizard, installs per-user (no admin prompt)
+    perMachine: false,
+    runAfterFinish: true,
+    deleteAppDataOnUninstall: false,
+    artifactName: 'LanPlay-Setup-${version}.${ext}',
+  },
   win: {
     target: [
       { target: 'dir', arch: ['x64'] },
       { target: 'zip', arch: ['x64'] },
+      { target: 'nsis', arch: ['x64'] },
     ],
     signAndEditExecutable: false,
     extraResources: [
       { from: 'vendor/sunshine-windows-msi/Sunshine-Windows-AMD64-installer.msi', to: 'vendor/Sunshine-Windows-AMD64-installer.msi' },
       { from: 'scripts/windows', to: 'ps', filter: ['*.ps1'] },
+      // Portable moonlight-qt for the Windows client role (Moonlight.exe at the folder root). The source zip is not shipped.
+      { from: 'vendor/moonlight-windows', to: 'vendor/moonlight-windows', filter: ['**/*', '!MoonlightPortable-*.zip'] },
     ],
   },
 };

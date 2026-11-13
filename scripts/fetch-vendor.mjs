@@ -8,7 +8,7 @@
 //   pwsh-macos:      tar -xzf into vendor/pwsh-macos/pwsh-7.7.0 ; chmod +x pwsh
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -27,7 +27,7 @@ const args = process.argv.slice(2);
 const verifyOnly = args.includes('--verify-only');
 const idsArg = args.indexOf('--ids') >= 0 ? args[args.indexOf('--ids') + 1] : undefined;
 const windows = args.includes('--windows') || process.platform === 'win32';
-const defaultIds = windows ? ['sunshine-windows-msi'] : ['moonlight-macos', 'pwsh-macos'];
+const defaultIds = windows ? ['sunshine-windows-msi', 'moonlight-windows'] : ['moonlight-macos', 'pwsh-macos'];
 const ids = idsArg ? idsArg.split(',') : defaultIds;
 
 const manifest = JSON.parse(readFileSync(join(VENDOR, 'manifest.json'), 'utf8'));
@@ -53,6 +53,21 @@ function extract(a, dest) {
     }
     execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app], { stdio: 'inherit' });
     console.log(`${a.id}: extracted ${app} (signature verified)`);
+  } else if (a.id === 'moonlight-windows') {
+    const exe = join(dir, 'Moonlight.exe');
+    if (existsSync(exe)) return;
+    // Portable zip: Moonlight.exe at the zip root (checked after extraction; moved up if nested one level).
+    if (process.platform === 'win32') execFileSync('tar', ['-xf', dest, '-C', dir], { stdio: 'inherit' });
+    else execFileSync('/usr/bin/ditto', ['-xk', dest, dir], { stdio: 'inherit' });
+    if (!existsSync(exe)) {
+      const nested = readdirSync(dir, { withFileTypes: true }).find((e) => e.isDirectory() && existsSync(join(dir, e.name, 'Moonlight.exe')));
+      if (nested) {
+        for (const f of readdirSync(join(dir, nested.name))) renameSync(join(dir, nested.name, f), join(dir, f));
+        rmSync(join(dir, nested.name), { recursive: true, force: true });
+      }
+    }
+    if (!existsSync(exe)) throw new Error('Moonlight.exe not found after extracting the portable zip');
+    console.log(`${a.id}: extracted ${dir}`);
   } else if (a.id === 'pwsh-macos') {
     const out = join(dir, 'pwsh-7.7.0');
     if (existsSync(join(out, 'pwsh'))) return;

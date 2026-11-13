@@ -28,6 +28,11 @@ const HOST_ID = /^[\x21-\x7e]{1,200}$/;
 
 export const IPC_VALIDATORS: { [C in IpcInvokeChannel]: Validator<C> } = {
   'app:info': none,
+  'app:role-set': (raw) => {
+    const r = obj(raw).role;
+    if (r !== 'client' && r !== 'host') throw new IpcValidationError('invalid role');
+    return { role: r };
+  },
   'client:system-info': none,
   'client:discover-start': none,
   'client:discover-stop': none,

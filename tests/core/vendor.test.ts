@@ -34,13 +34,15 @@ describe('vendor pinning', () => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const cfg = require(path.join(ROOT, 'scripts', 'electron-builder.config.cjs'));
     expect(cfg.win.signAndEditExecutable).toBe(false);
-    expect(cfg.win.target.map((t: { target: string }) => t.target)).toEqual(['dir', 'zip']);
+    expect(cfg.win.target.map((t: { target: string }) => t.target)).toEqual(['dir', 'zip', 'nsis']);
+    expect(cfg.nsis).toMatchObject({ oneClick: true, perMachine: false, runAfterFinish: true, artifactName: 'LanPlay-Setup-${version}.${ext}' });
+    expect(cfg.win.extraResources).toEqual(expect.arrayContaining([expect.objectContaining({ from: 'vendor/moonlight-windows', to: 'vendor/moonlight-windows', filter: ['**/*', '!MoonlightPortable-*.zip'] })]));
     expect(cfg.win.extraResources).toEqual(expect.arrayContaining([expect.objectContaining({ to: 'vendor/Sunshine-Windows-AMD64-installer.msi' }), expect.objectContaining({ from: 'scripts/windows', to: 'ps' })]));
     expect(cfg.extraResources.map((r: { to: string }) => r.to)).toEqual(expect.arrayContaining(['LICENSE', 'SOURCE-OFFER.md']));
     expect(cfg.mac.extendInfo.NSBonjourServices).toEqual(['_nvstream._tcp']);
     expect(cfg.mac.extendInfo.NSLocalNetworkUsageDescription).toBeTruthy();
     expect(cfg.mac.identity).toBeNull();
-    // dmg/nsis targets would pull extra helper binaries from outside the download allow-list
+    // dmg targets would pull extra helper binaries from outside the download allow-list
     expect(cfg.mac.target.map((t: { target: string }) => t.target)).toEqual(['dir']);
   });
   it('npm pack scripts actually use that config (without it the Mac app ships without Moonlight and the Local Network keys)', () => {

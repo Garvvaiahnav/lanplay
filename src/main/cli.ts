@@ -74,6 +74,7 @@ export function parseCli(argv: readonly string[], platform: NodeJS.Platform = pr
   return o;
 }
 
-export function defaultRole(platform: NodeJS.Platform): Role {
-  return platform === 'win32' ? 'host' : 'client';
-}
+// Role resolution lives in core (pure, tested). Re-exported so main.ts keeps importing from './cli.js':
+//   const r = resolveRole({ flag: cli.role, stored: settings.get('app.role', null), platform: process.platform });
+export { defaultRole, parseStoredRole, readStoredRole, resolveRole, writeStoredRole, ROLE_SETTING_KEY } from '../core/client/role.js';
+export type { ResolvedRole, RoleSource } from '../core/client/role.js';
