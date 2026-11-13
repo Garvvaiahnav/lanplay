@@ -22,9 +22,8 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
+const here = __dirname;
 export const SUNSHINE_TEST_CERT = readFileSync(path.join(here, 'certs', 'sunshine-cert.pem'), 'utf8');
 const SUNSHINE_TEST_KEY = readFileSync(path.join(here, 'certs', 'sunshine-key.pem'), 'utf8');
 export const WRONG_TEST_CERT = readFileSync(path.join(here, 'certs', 'wrong-cert.pem'), 'utf8');
