@@ -1,0 +1,11 @@
+node_modules/
+dist/
+out/
+release/
+coverage/
+*.log
+.DS_Store
+# Vendored third-party binaries are downloaded and SHA256-verified by scripts/fetch-vendor.mjs.
+# Only the manifest (pinned URLs + hashes) is committed.
+vendor/*
+!vendor/manifest.json

@@ -1,0 +1,30 @@
+{
+  "name": "lanplay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LanPlay: one simple app that sets up Sunshine (Windows host) and launches Moonlight (Mac client) on your own LAN.",
+  "license": "GPL-3.0-only",
+  "main": "dist/main/main.js",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.json",
+    "start": "npm run build && electron .",
+    "vendor:verify": "node scripts/verify-vendor.mjs",
+    "pack:mac": "npm run build && electron-builder --mac dir --arm64",
+    "pack:win": "npm run build && electron-builder --win dir --x64"
+  },
+  "dependencies": {
+    "bonjour-service": "1.4.4",
+    "yazl": "3.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/yazl": "3.3.1",
+    "electron": "45.1.0",
+    "electron-builder": "26.18.0",
+    "typescript": "6.0.3",
+    "vitest": "5.0.5"
+  }
+}
