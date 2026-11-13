@@ -13,6 +13,7 @@
     "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true,
     "esModuleInterop": true,
+    "moduleDetection": "legacy",
     "skipLibCheck": true,
     "sourceMap": true,
     "types": ["node"]

@@ -959,6 +959,10 @@ export interface AppInfo {
   platform: NodeJS.Platform;
   arch: string;
   logFile: string;
+  /** Added by ui builder (additive, optional): os.hostname(), shown on the host screen so the client can be told the name. */
+  hostName?: string;
+  /** Added by ui builder (additive, optional): local IPv4 addresses for the host screen. */
+  localAddresses?: string[];
 }
 
 export interface ClientSystemInfo {

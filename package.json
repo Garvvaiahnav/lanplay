@@ -9,7 +9,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
     "test": "vitest run",
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node src/renderer/copy-static.mjs",
     "start": "npm run build && electron .",
     "vendor:verify": "node scripts/verify-vendor.mjs",
     "pack:mac": "npm run build && electron-builder --mac dir --arm64",
@@ -24,6 +24,7 @@
     "@types/yazl": "3.3.1",
     "electron": "45.1.0",
     "electron-builder": "26.18.0",
+    "happy-dom": "21.0.4",
     "typescript": "6.0.3",
     "vitest": "5.0.5"
   }
