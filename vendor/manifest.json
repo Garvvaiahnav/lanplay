@@ -1,5 +1,5 @@
 {
-  "$comment": "Pinned third-party binaries. SHA256 values were taken from the GitHub release asset 'digest' field (api.github.com/repos/<repo>/releases/latest, queried 2026-11-13) AND re-computed locally with shasum -a 256 after download; both matched. scripts/fetch-vendor.mjs downloads only these URLs and refuses any file whose SHA256 differs.",
+  "$comment": "Pinned third-party binaries. SHA256 values were taken from the GitHub release asset 'digest' field (api.github.com/repos/<repo>/releases/latest, queried 2026-11-13) AND re-computed locally with shasum -a 256 after download; both matched. Exceptions, each cross-checked against an independent source and recorded in that artifact's notes: vigembus-windows-installer (release is from 2023, GitHub has no digest for it; matched the winget-pkgs manifest) and vigemclient-windows-x64 (NuGet package; matched nuget.org's catalog SHA512). scripts/fetch-vendor.mjs downloads only these URLs (allow-list in the script) and refuses any file whose SHA256 differs; an artifact with an 'extracted' block also has the extracted file re-hashed.",
   "schemaVersion": 1,
   "artifacts": [
     {
@@ -91,6 +91,51 @@
       "extract": "unzip into vendor/moonlight-windows/ (ditto -xk on macOS, tar -xf on Windows)",
       "binary": "Moonlight.exe (portable, no installer, no admin)",
       "notes": "Official portable x64 build. SHA256 from the GitHub release asset digest field."
+    },
+    {
+      "id": "vigembus-windows-installer",
+      "product": "ViGEmBus",
+      "license": "BSD-3-Clause",
+      "repo": "https://github.com/nefarius/ViGEmBus",
+      "tag": "v1.22.0",
+      "sourceCommit": "d986e1d93708ec9b11049542fa6027272cce716c",
+      "sourceUrl": "https://github.com/nefarius/ViGEmBus/archive/refs/tags/v1.22.0.tar.gz",
+      "sourceSha256": null,
+      "platform": "win32",
+      "arch": "x64 (one installer for x64, x86 and arm64)",
+      "asset": "ViGEmBus_1.22.0_x64_x86_arm64.exe",
+      "url": "https://github.com/nefarius/ViGEmBus/releases/download/v1.22.0/ViGEmBus_1.22.0_x64_x86_arm64.exe",
+      "sizeBytes": 6278576,
+      "sha256": "89220a7865076b342892f98865f3499fb7c4cfd673159e89d352c360fd014c6a",
+      "extract": "none (bundled as-is; installed silently by scripts/windows/install-vigembus.ps1 with: /exenoui /qn /norestart)",
+      "binary": "installs the kernel driver ViGEmBus.sys (service ViGEmBus, hardware id Nefarius\\ViGEmBus\\Gen1)",
+      "notes": "Upstream is archived (last release 2023-11-02) but is the standard virtual-gamepad driver. GitHub has no digest for this old release (digest: null), so the SHA256 was computed locally and matches InstallerSha256 in microsoft/winget-pkgs manifests/v/ViGEm/ViGEmBus/1.22.0 (ProductCode {9C581C76-2D68-40F8-AA6F-94D3C5215C05}, silent switches /exenoui /qn /norestart). Authenticode-signed by 'Nefarius Software Solutions e.U.' (DigiCert); built with Advanced Installer (setup/ViGEmBus.aip), not WiX. Not downloaded or run on the Mac."
+    },
+    {
+      "id": "vigemclient-windows-x64",
+      "product": "ViGEmClient",
+      "license": "MIT",
+      "repo": "https://github.com/nefarius/ViGEmClient",
+      "tag": null,
+      "sourceCommit": "7e471cbfeaef6d06d01b66c33b6811e071e62866",
+      "sourceUrl": "https://github.com/nefarius/ViGEmClient/archive/7e471cbfeaef6d06d01b66c33b6811e071e62866.tar.gz",
+      "sourceSha256": null,
+      "platform": "win32",
+      "arch": "x64",
+      "asset": "nefarius.vigem.client.1.21.256.nupkg",
+      "url": "https://api.nuget.org/v3-flatcontainer/nefarius.vigem.client/1.21.256/nefarius.vigem.client.1.21.256.nupkg",
+      "sizeBytes": 198914,
+      "sha256": "ff460031b33e0882cd1166fe2d072d0fe97578480c61ed85dccfa6c930fdb55e",
+      "extract": "unzip the nupkg; the managed lib/netstandard2.0/Nefarius.ViGEm.Client.dll embeds the native x86 and x64 ViGEmClient.dll as .NET resources (Costura); scripts/fetch-vendor.mjs reads the CLR resource area and writes the x64 one to vendor/vigemclient-windows-x64/ViGEmClient.dll",
+      "extracted": {
+        "file": "ViGEmClient.dll",
+        "sizeBytes": 141312,
+        "sha256": "00303f99e1968d523fbd08a7c691d60d145b7335059ec593947841d124c10875",
+        "machine": "x64",
+        "requiredExports": ["vigem_alloc", "vigem_connect", "vigem_target_x360_alloc", "vigem_target_add", "vigem_target_x360_update", "vigem_target_remove", "vigem_target_free", "vigem_disconnect", "vigem_free"]
+      },
+      "binary": "ViGEmClient.dll (PE32+ x64 DLL, 28 exports, imports only SETUPAPI.dll and KERNEL32.dll)",
+      "notes": "nefarius/ViGEmClient publishes no DLL release (only 2018 tags without assets and source), so this is the DLL inside the official, author-signed (Nefarius, DigiCert) NuGet package Nefarius.ViGEm.Client 1.21.256 (MIT). The nupkg SHA256 was computed locally; its SHA512 matches packageHash in the nuget.org catalog entry (catalog0/data/2023.02.05.02.02.24). The DLL's PE timestamp 2023-02-05T01:48:49Z and PDB path (C:\\projects\\vigemclient\\bin\\release\\x64, AppVeyor) fit ViGEmClient commit 7e471cb (merge of PR #25, 2023-02-05T01:47:56Z), whose headers the TypeScript bindings were checked against. Not downloaded on the Mac by default."
     }
   ],
   "devTools": [

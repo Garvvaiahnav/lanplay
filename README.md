@@ -16,6 +16,9 @@ A macOS build (viewer role) is built the same way and published when ready.
 - Rest the mouse in any screen corner for half a second: a menu appears with **Close stream**, **Change settings**,
   **Reconnect** and **Keep playing**. In-game mouse lock hides the pointer from LanPlay, so use Ctrl+Alt+Shift+Q to quit there.
 
+## Phone as controller
+The host PC can turn phones into Xbox controllers (no app on the phone, fully customizable layouts saved on the host). See `docs/PHONE-CONTROLLER.md`.
+
 ## Updates
 LanPlay checks GitHub Releases at start and every 6 hours. A new version is downloaded, verified against an Ed25519-signed
 manifest (public key in `src/core/update/update.ts`) and its SHA-256, then offered: "Restart and update". Nothing

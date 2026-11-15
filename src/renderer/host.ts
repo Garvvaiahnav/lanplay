@@ -17,6 +17,7 @@ namespace LP.Host {
     let diagPath = '';
     let note = '';
     let noteIsError = false;
+    let ctl: T.ControllersState | null = null;
     let confirmUuid: string | null = null;
     let confirmTimer: ReturnType<typeof setTimeout> | undefined;
     let destroyed = false;
@@ -45,6 +46,17 @@ namespace LP.Host {
     const agentLine = h('p', { class: 'hint' });
     const pendingEl = h('ul', { class: 'list', 'aria-label': 'Waiting for approval' });
     const devicesEl = h('ul', { class: 'list', 'aria-label': 'Paired devices' });
+    const padSwitch = Dom.toggle('Let phones act as game controllers', (on) => {
+      api.invoke('host:controllers-set-enabled', { on }).then(setCtl, (e: unknown) => {
+        padSwitch.set(!on);
+        say('Could not change the switch: ' + msg(e), true);
+      });
+    });
+    const padLine = h('p', { class: 'hint', role: 'status', 'aria-live': 'polite' });
+    const padDriverBtn = h('button', { type: 'button', class: 'btn primary' }, 'Install driver');
+    const padLinksEl = h('div', { class: 'pad-links', 'aria-label': 'Phone controller links' });
+    const padPlayersEl = h('ul', { class: 'list', 'aria-label': 'Connected phones' });
+    const padNewLinkBtn = h('button', { type: 'button', class: 'btn' }, 'New link');
     const checkBtn = h('button', { type: 'button', class: 'btn' }, 'Run self-check');
     const checkEl = h('ol', { class: 'steps', 'aria-label': 'Self-check results' });
     const diagBtn = h('button', { type: 'button', class: 'btn' }, 'Copy diagnostics');
@@ -62,6 +74,9 @@ namespace LP.Host {
         h('p', { class: 'hint' }, 'On: any computer on your home network can pair without a code. Off: you approve each one here.'), agentLine,
         h('p', { class: 'hint' }, 'You can close this window: LanPlay keeps running in the background so the other computer can connect. To stop it completely, use File > Exit.'), pendingEl),
       card('h-dev', 'Paired devices', devicesEl),
+      card('h-pad', 'Phone controllers', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Let phones act as game controllers'), padSwitch.el), padLine,
+        h('div', { class: 'row' }, padDriverBtn, padNewLinkBtn), padLinksEl, padPlayersEl,
+        h('p', { class: 'hint' }, 'Open the link on each phone (same Wi-Fi) or scan the code. Each phone becomes its own Xbox controller on this PC. On the phone, tap Edit to move buttons, change sensitivity and save layouts; they are kept on this PC. "New link" stops old links from working.')),
       card('h-health', 'Health', h('div', { class: 'row' }, checkBtn, diagBtn), h('p', { class: 'hint' }, 'If something does not work, press Copy diagnostics and send the zip file.'), diagEl, checkEl));
     Dom.setChildren(root, [screen]);
 
@@ -103,12 +118,53 @@ namespace LP.Host {
         return h('li', { class: 'item' }, h('span', { class: 'iname' }, d.name, h('span', { class: 'sub' }, Model.deviceVia(d) + (d.lastAddress ? ', ' + d.lastAddress : ''))),
           h('button', { type: 'button', class: 'btn' + (sure ? ' danger' : ''), 'aria-label': (sure ? 'Confirm revoke ' : 'Revoke ') + d.name, onClick: () => revoke(d) }, sure ? 'Really revoke?' : 'Revoke'));
       }));
+      renderPad();
       checkBtn.disabled = checkBusy;
       checkBtn.textContent = checkBusy ? 'Checking...' : 'Run self-check';
       Dom.setChildren(checkEl, report ? [h('li', { class: 'step ' + (report.ok ? 'pass' : 'fail') }, h('span', { class: 'stitle' }, report.ok ? 'All checks passed' : 'Some checks failed')), ...report.steps.map(stepRow)] : []);
       diagBtn.disabled = diagBusy;
       diagBtn.textContent = diagBusy ? 'Collecting...' : 'Copy diagnostics';
       Dom.setChildren(diagEl, diagPath ? ['Saved: ' + diagPath + ' ', h('button', { type: 'button', class: 'link', onClick: () => void reveal() }, 'Show file')] : []);
+    }
+
+    function renderPad(): void {
+      padSwitch.set(ctl?.enabled ?? false);
+      const needDriver = ctl !== null && !ctl.driver.ok && ctl.driver.reason === 'driver-missing';
+      padDriverBtn.hidden = !needDriver;
+      padDriverBtn.disabled = ctl?.setupRunning === true;
+      padDriverBtn.textContent = ctl?.setupRunning ? 'Installing...' : 'Install driver';
+      padNewLinkBtn.hidden = !ctl?.running;
+      const lines: string[] = [];
+      if (ctl?.error) lines.push(ctl.error);
+      else if (needDriver) lines.push('The virtual controller driver (ViGEmBus) is not installed. Windows will ask for permission once.');
+      else if (ctl && !ctl.driver.ok) lines.push('Virtual controllers are not available: ' + ctl.driver.message);
+      else if (ctl?.running) lines.push('Ready on port ' + ctl.port + '. Up to 4 phones.');
+      else if (ctl?.enabled) lines.push('Turning on...');
+      padLine.textContent = lines.join(' ');
+      padLine.className = 'hint' + (ctl?.error ? ' err' : '');
+      Dom.setChildren(padLinksEl, (ctl?.links ?? []).map((l) =>
+        h('div', { class: 'pad-link' },
+          h('img', { class: 'qr', src: l.qrDataUrl, alt: 'QR code for ' + l.address, width: 140, height: 140 }),
+          h('div', { class: 'pad-link-text' },
+            h('code', { class: 'copyable' }, l.url),
+            h('button', { type: 'button', class: 'btn ghost', onClick: () => void copyLink(l.url) }, 'Copy link')))));
+      Dom.setChildren(padPlayersEl, (ctl?.players ?? []).map((p) =>
+        h('li', { class: 'item' },
+          h('span', { class: 'iname' }, 'Player ' + p.slot + ': ' + p.name, h('span', { class: 'sub' }, p.address + (p.stale ? ', not responding' : ''))),
+          h('button', { type: 'button', class: 'btn', 'aria-label': 'Remove ' + p.name, onClick: () => kickPlayer(p.id) }, 'Remove'))));
+    }
+
+    function setCtl(s: T.ControllersState): void {
+      ctl = s;
+      render();
+    }
+
+    async function copyLink(url: string): Promise<void> {
+      say((await Dom.copyText(url)) ? 'Link copied.' : 'Could not copy. Select the link and copy it by hand.', false);
+    }
+
+    function kickPlayer(id: string): void {
+      api.invoke('host:controllers-kick', { id }).then(setCtl, (e: unknown) => say('Could not remove the phone: ' + msg(e), true));
     }
 
     function setAgent(a: T.AgentState): void {
@@ -192,6 +248,22 @@ namespace LP.Host {
         render();
       }
     });
+    padDriverBtn.addEventListener('click', () => {
+      say('Installing the controller driver. Approve the Windows prompt if it appears.');
+      api.invoke('host:controllers-setup').then(
+        (s) => {
+          setCtl(s);
+          say(s.error ? s.error : 'Phone controllers are ready.', s.error !== null);
+        },
+        (e: unknown) => say('Driver install failed: ' + msg(e), true),
+      );
+    });
+    padNewLinkBtn.addEventListener('click', () => {
+      api.invoke('host:controllers-new-link').then((s) => {
+        setCtl(s);
+        say('New link created. Phones that used the old link must open the new one.');
+      }, (e: unknown) => say('Could not create a new link: ' + msg(e), true));
+    });
     copyNameBtn.addEventListener('click', async () => {
       if (!info?.hostName) return;
       say((await Dom.copyText(info.hostName)) ? 'Name copied.' : 'Could not copy. Select the name and copy it by hand.', false);
@@ -207,6 +279,8 @@ namespace LP.Host {
       render();
     }));
 
+    unsubs.push(api.on('host:controllers-changed', setCtl));
+
     async function refreshDevices(): Promise<void> {
       try {
         devices = await api.invoke('host:devices-list');
@@ -220,6 +294,7 @@ namespace LP.Host {
     api.invoke('app:info').then((i) => { info = i; render(); }, () => undefined);
     api.invoke('host:setup-status').then((s) => { status = s; render(); }, (e: unknown) => say('Could not read setup status: ' + msg(e), true));
     api.invoke('host:agent-state').then(setAgent, () => undefined);
+    api.invoke('host:controllers-state').then(setCtl, () => undefined);
     void refreshDevices();
 
     return {

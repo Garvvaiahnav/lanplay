@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d12">
+  <meta name="color-scheme" content="dark">
+  <meta name="referrer" content="no-referrer">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <title>LanPlay Controller</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="controller.css">
+  <script src="controller.js" defer></script>
+</head>
+<body>
+  <noscript><p class="noscript">LanPlay Controller needs JavaScript.</p></noscript>
+
+  <!-- Every control is drawn here from the active layout (src/core/controller/layout.ts), so this stays empty in the markup. -->
+  <main id="field" class="field" aria-label="Game controller"></main>
+
+  <div id="strip" class="strip" data-state="connecting">
+    <span class="dot" aria-hidden="true"></span>
+    <span id="status" class="status" role="status" aria-live="polite">Connecting…</span>
+    <span id="save" class="save" role="status" hidden></span>
+    <button type="button" id="save-retry" class="strip-btn text-btn" hidden>Retry</button>
+    <span class="strip-actions">
+      <select id="layout-pick" class="strip-select" aria-label="Layout" hidden></select>
+      <button type="button" id="fullscreen" class="strip-btn" aria-label="Enter full screen" hidden>
+        <span class="fs-icon" aria-hidden="true"></span>
+      </button>
+      <button type="button" id="edit" class="strip-btn text-btn edit-btn" aria-label="Edit layout (press and hold)" title="Press and hold to edit" hidden>Edit</button>
+    </span>
+  </div>
+
+  <aside id="panel" class="panel" aria-label="Layout editor" hidden>
+    <div class="panel-head">
+      <button type="button" id="done" class="action small">Done</button>
+      <button type="button" id="undo" class="strip-btn text-btn" disabled>Undo</button>
+      <button type="button" id="panel-save" class="save-btn" aria-live="polite" disabled hidden></button>
+      <button type="button" id="collapse" class="strip-btn text-btn" aria-expanded="true" aria-controls="panel-body">Hide</button>
+    </div>
+    <div id="panel-body" class="panel-body">
+      <div class="tabs" role="tablist" aria-label="Editor sections">
+        <button type="button" class="tab" role="tab" data-tab="control" aria-selected="true">Control</button>
+        <button type="button" class="tab" role="tab" data-tab="add" aria-selected="false">Add</button>
+        <button type="button" class="tab" role="tab" data-tab="layout" aria-selected="false">Layouts</button>
+      </div>
+      <p id="panel-msg" class="panel-msg" role="status"></p>
+      <div id="panel-content" class="panel-content"></div>
+    </div>
+  </aside>
+
+  <div id="hint" class="hint" hidden>
+    <span>Set your screen timeout to Never while playing</span>
+    <button type="button" id="hint-close" class="hint-close">Got it</button>
+  </div>
+
+  <div id="notice" class="overlay" role="alert" hidden>
+    <p id="notice-text" class="overlay-title"></p>
+    <button type="button" id="retry" class="action" hidden>Try again</button>
+  </div>
+
+  <div id="rotate" class="overlay rotate-overlay">
+    <div class="phone-icon" aria-hidden="true"></div>
+    <p class="overlay-title">Rotate your phone</p>
+    <p class="overlay-sub">Hold it sideways to use the controller.</p>
+  </div>
+</body>
+</html>

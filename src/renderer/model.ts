@@ -16,6 +16,7 @@ namespace LP.T {
   export type HostSetupStatus = import('../contracts.js').HostSetupStatus;
   export type AgentState = import('../contracts.js').AgentState;
   export type PairedDevice = import('../contracts.js').PairedDevice;
+  export type ControllersState = import('../contracts.js').ControllersState;
   export type SelfCheckReport = import('../contracts.js').SelfCheckReport;
   export type AppInfo = import('../contracts.js').AppInfo;
   export type Api = import('../contracts.js').LanPlayPreloadApi;

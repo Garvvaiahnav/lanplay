@@ -508,6 +508,7 @@ export type PsScriptName =
   | 'set-agent-firewall-rule' // -Port 47920 -Name "LanPlay Pair Agent" (idempotent New/Set-NetFirewallRule)
   | 'get-listeners' // -Ports 47984,... -> {listeners:[{port,protocol,pid,process}]}
   | 'get-system-info' // {os,build,gpus:[{name,driverVersion}],isAdmin,userName}
+  | 'setup-controllers' // ELEVATED child only: -InstallerPath -Port -ResultFile [-Program]; installs ViGEmBus + firewall, writes the result JSON to -ResultFile
   | 'invoke-elevated'; // -File <exe> -ArgumentList <json array> -> Start-Process -Verb RunAs -Wait -PassThru; {exitCode}
 
 export interface PsInvocation {
@@ -1000,6 +1001,42 @@ export interface StreamState {
   message?: string;
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * Phone controllers (host role): phones open a LAN web page; the host makes one virtual Xbox pad per phone.
+ * ---------------------------------------------------------------------------------------------- */
+export type ControllerDriverStatus = { ok: true } | { ok: false; reason: 'dll-missing' | 'driver-missing' | 'error'; message: string };
+export interface ControllerPlayerView {
+  /** Connection id (opaque; pass it back to host:controllers-kick). */
+  id: string;
+  /** Player number, 1-based. */
+  slot: number;
+  name: string;
+  address: string;
+  /** The phone has gone quiet and its pad is held at neutral. */
+  stale: boolean;
+}
+export interface ControllerLink {
+  /** This PC's home-network address the link uses. */
+  address: string;
+  /** http://<address>:<port>/?t=<token>: contains the session token, show it only on the host screen. */
+  url: string;
+  /** SVG QR code of the url as a data: URL (img-src allows data:). */
+  qrDataUrl: string;
+}
+export interface ControllersState {
+  /** The user's switch (persisted). */
+  enabled: boolean;
+  /** The LAN server is listening. */
+  running: boolean;
+  port: number;
+  links: ControllerLink[];
+  driver: ControllerDriverStatus;
+  players: ControllerPlayerView[];
+  /** The elevated driver + firewall setup is running. */
+  setupRunning: boolean;
+  error: string | null;
+}
+
 /** Invoke channels: name -> [request, response]. */
 export interface IpcInvokeMap {
   'app:info': [void, AppInfo];
@@ -1021,6 +1058,13 @@ export interface IpcInvokeMap {
   'host:agent-decide': [{ requestId: string; approve: boolean }, AgentState];
   'host:devices-list': [void, PairedDevice[]];
   'host:devices-revoke': [{ uuid: string }, PairedDevice[]];
+  'host:controllers-state': [void, ControllersState];
+  'host:controllers-set-enabled': [{ on: boolean }, ControllersState];
+  'host:controllers-kick': [{ id: string }, ControllersState];
+  /** New session token: old phone links stop working. */
+  'host:controllers-new-link': [void, ControllersState];
+  /** Elevated (UAC): install the virtual-controller driver and open the LAN port. */
+  'host:controllers-setup': [void, ControllersState];
   'selfcheck:run': [void, SelfCheckReport];
   'diagnostics:collect': [void, { zipPath: string; bytes: number }];
   /** Only accepts a zipPath previously returned by diagnostics:collect (main keeps the allow-list). */
@@ -1034,6 +1078,7 @@ export interface IpcEventMap {
   'client:stream-state': StreamState;
   'host:setup-progress': StepRecord;
   'host:agent-state-changed': AgentState;
+  'host:controllers-changed': ControllersState;
 }
 
 export type IpcInvokeChannel = keyof IpcInvokeMap;
@@ -1061,6 +1106,11 @@ export const IPC_INVOKE_CHANNELS = Object.freeze([
   'host:agent-decide',
   'host:devices-list',
   'host:devices-revoke',
+  'host:controllers-state',
+  'host:controllers-set-enabled',
+  'host:controllers-kick',
+  'host:controllers-new-link',
+  'host:controllers-setup',
   'selfcheck:run',
   'diagnostics:collect',
   'diagnostics:reveal',
@@ -1072,6 +1122,7 @@ export const IPC_EVENT_CHANNELS = Object.freeze([
   'client:stream-state',
   'host:setup-progress',
   'host:agent-state-changed',
+  'host:controllers-changed',
 ] as const satisfies readonly IpcEventChannel[]);
 
 /** Every IPC reply is wrapped so errors cross the bridge as data (no stack traces / paths with secrets). */

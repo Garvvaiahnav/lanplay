@@ -11,6 +11,7 @@ import { writeStoredRole } from '../core/client/role.js';
 import { moonlightCandidates } from '../core/client/moonlight.js';
 import { createDiagnosticsService } from '../core/diagnostics.js';
 import { hostDiagnosticsFiles, hostListeners, hostSystemInfo } from '../core/host/diagnostics-host.js';
+import type { ControllerService } from '../core/controller/service.js';
 import { createWindowsHostService, LazySunshineClient, PINNED_CERT_NAME } from '../core/host/service.js';
 import type { WindowsHostService } from '../core/host/service.js';
 import type { IpcHandlers } from './ipc.js';
@@ -31,11 +32,14 @@ export interface WiringEnv {
   roleChoice?: { canChoose: boolean; stored: boolean };
   /** Relaunch the app with --role <role> (main: app.relaunch + app.exit). */
   relaunch?: (role: Role) => void;
+  /** Phone controllers (host role only); main builds it because it needs Electron paths and the elevated setup. */
+  controllers?: ControllerService | null;
 }
 
 export interface Services {
   client: ClientService | null;
   host: WindowsHostService | null;
+  controllers: ControllerService | null;
   diagnostics: DiagnosticsService;
   selfCheck: () => Promise<SelfCheckReport>;
   resolvedPaths: Record<string, unknown>;
@@ -96,7 +100,7 @@ export function buildServices(env: WiringEnv): Services {
       });
     },
   });
-  return { client, host, diagnostics, selfCheck, resolvedPaths };
+  return { client, host, controllers: env.role === 'host' ? (env.controllers ?? null) : null, diagnostics, selfCheck, resolvedPaths };
 }
 
 export function localAddresses(): string[] {
@@ -193,6 +197,17 @@ export function buildHandlers(
       await h.agent.revoke(uuid);
       return h.agent.listDevices();
     },
+    ...(s.controllers ? controllerHandlers(s.controllers) : {}),
+  };
+}
+
+function controllerHandlers(c: ControllerService): IpcHandlers {
+  return {
+    'host:controllers-state': async () => c.state(),
+    'host:controllers-set-enabled': ({ on }) => c.setEnabled(on),
+    'host:controllers-kick': async ({ id }) => c.kick(id),
+    'host:controllers-new-link': () => c.newLink(),
+    'host:controllers-setup': () => c.setup(),
   };
 }
 

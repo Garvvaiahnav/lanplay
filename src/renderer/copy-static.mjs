@@ -9,3 +9,10 @@ const out = join(here, '..', '..', 'dist', 'renderer');
 mkdirSync(out, { recursive: true });
 for (const f of ['index.html', 'styles.css', 'stream-menu.html', 'stream-menu.css']) copyFileSync(join(here, f), join(out, f));
 console.log('renderer assets copied to', out);
+
+// Phone controller page (served to phones by the host over the LAN): src/controller-ui -> dist/controller-ui, next to the compiled controller.js.
+const uiSrc = join(here, '..', 'controller-ui');
+const uiOut = join(here, '..', '..', 'dist', 'controller-ui');
+mkdirSync(uiOut, { recursive: true });
+for (const f of ['index.html', 'controller.css']) copyFileSync(join(uiSrc, f), join(uiOut, f));
+console.log('controller page assets copied to', uiOut);

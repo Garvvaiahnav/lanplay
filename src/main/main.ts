@@ -6,6 +6,11 @@ import { app, BrowserWindow, dialog, ipcMain, net, protocol, safeStorage, screen
 import { IPC_INVOKE_CHANNELS, LANPLAY, SECURITY } from '../contracts.js';
 import type { IpcEventChannel, IpcEventMap, Role, ServiceDeps } from '../contracts.js';
 import { StreamMenuController } from '../core/client/stream-menu.js';
+import { CONTROLLER_PORT, ControllerService } from '../core/controller/service.js';
+import { runControllerSetup } from '../core/controller/setup.js';
+import { createViGEmBackend } from '../core/controller/vigem.js';
+import type { PadBackend } from '../core/controller/vigem.js';
+import { isPrivateAddress } from '../core/shared/ipnet.js';
 import { computeAppPaths } from '../core/paths.js';
 import { NodeProcessRunner } from '../core/shared/exec.js';
 import { createJsonlLogger } from '../core/shared/logger.js';
@@ -16,7 +21,7 @@ import { createIpcRouter } from './ipc.js';
 import { applySecurity, isAllowedAppUrl } from './security.js';
 import { createStreamMenuWindow } from './stream-menu-window.js';
 import { createUpdates } from './updates.js';
-import { buildHandlers, buildServices, runDiagnosticsCli, runSelfCheckCli } from './wiring.js';
+import { buildHandlers, buildServices, localAddresses, runDiagnosticsCli, runSelfCheckCli } from './wiring.js';
 import type { Services, WiringEnv } from './wiring.js';
 
 const APP_ROOT = path.resolve(__dirname, '..', '..');
@@ -97,7 +102,38 @@ async function start(): Promise<void> {
     runner: new NodeProcessRunner(log.redactor),
   };
   const selfArgsPrefix = app.isPackaged ? [] : [APP_ROOT];
+  // Phone controllers: host role only. Virtual Xbox pads need Windows (ViGEmBus); elsewhere the backend just reports it is unavailable.
+  const notWindows: PadBackend = {
+    status: () => ({ ok: false, reason: 'error', message: 'Phone controllers need Windows.' }),
+    createPad: () => {
+      throw new Error('Phone controllers need Windows.');
+    },
+  };
+  const controllers =
+    role === 'host'
+      ? new ControllerService({
+          backend: process.platform === 'win32' ? createViGEmBackend({ dllPath: path.join(paths.vendorDir, 'ViGEmClient.dll') }) : notWindows,
+          layoutsDir: path.join(paths.userData, 'controller-layouts'),
+          uiDir: path.join(APP_ROOT, 'dist', 'controller-ui'),
+          port: CONTROLLER_PORT,
+          settings,
+          localAddresses: () => localAddresses().filter((a) => isPrivateAddress(a)),
+          isAllowedAddress: (a) => isPrivateAddress(a),
+          log: (level, msg, data) => log.log(level, 'controllers', msg, data),
+          runSetup: () =>
+            runControllerSetup({
+              runner: deps.runner,
+              redactor: log.redactor,
+              systemRoot: process.env.SystemRoot || process.env.windir || 'C:\\Windows',
+              psDir: paths.psDir,
+              installerPath: path.join(paths.vendorDir, 'ViGEmBus_1.22.0_x64_x86_arm64.exe'),
+              selfExe: process.execPath,
+              port: CONTROLLER_PORT,
+            }),
+        })
+      : null;
   const env: WiringEnv = {
+    controllers,
     role,
     deps,
     appInfo: { name: LANPLAY.productName, version: app.getVersion(), electron: process.versions.electron ?? '', node: process.versions.node, chrome: process.versions.chrome ?? '' },
@@ -183,6 +219,11 @@ async function start(): Promise<void> {
     });
   }
 
+  if (controllers) {
+    controllers.onChange((st) => push('host:controllers-changed', st));
+    // Left on at the last run: phones can connect again without opening the window (also in the background --agent mode).
+    void controllers.init();
+  }
   if (services.host) {
     services.host.agent.onChange((s) => push('host:agent-state-changed', s));
     const auto = services.host.agentAutoStart();
@@ -224,6 +265,7 @@ async function start(): Promise<void> {
     if (role === 'client') app.quit();
   });
   app.on('before-quit', () => {
+    void controllers?.shutdown();
     void services.host?.agent.stop();
     services.client?.discovery.stop();
   });

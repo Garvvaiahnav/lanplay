@@ -30,6 +30,9 @@ describe.skipIf(!has)('PowerShell wrappers (pwsh 7.7 runtime smoke test)', () =>
     ['get-firewall-rules.ps1', ['-Names', ' , '], [2]],
     ['get-firewall-rules.ps1', ['-Names', 'Sunshine,LanPlay Pair Agent'], [0, 1]],
     ['set-agent-firewall-rule.ps1', ['-Port', '0', '-Name', 'x'], [2]],
+    ['get-vigembus-status.ps1', [], [0, 1]],
+    ['install-vigembus.ps1', ['-Installer', 'relative.exe'], [2]],
+    ['install-vigembus.ps1', ['-Installer', path.join(ROOT, 'does-not-exist.exe')], [1]], // Get-Service is Windows-only: still one JSON object, exit 1
     ['invoke-elevated.ps1', ['-FilePath', PWSH, '-ArgumentListB64', '!!notbase64!!'], [2]],
     ['invoke-elevated.ps1', ['-FilePath', PWSH, '-ArgumentListB64', Buffer.from(JSON.stringify(['--version', '"C:\\Users\\J\u00f6rg M\u00fcller\\x"'])).toString('base64')], [1]],
   ];
@@ -44,9 +47,18 @@ describe.skipIf(!has)('PowerShell wrappers (pwsh 7.7 runtime smoke test)', () =>
     if (args[1] === 'äh') expect(out).toContain('\\u00e4');
   });
 
+  // setup-controllers.ps1 runs only as the elevated child of invoke-elevated: it reports through -ResultFile, not stdout.
+  it('setup-controllers.ps1 rejects bad arguments with exit 2 and no stdout', () => {
+    const r = run('setup-controllers.ps1', ['-Port', '0', '-ResultFile', path.join(ROOT, 'result.json')]);
+    expect(r.code).toBe(2);
+    expect(r.stdout.trim()).toBe('');
+    const r2 = run('setup-controllers.ps1', ['-Port', '47921', '-ResultFile', 'relative.json']);
+    expect(r2.code).toBe(2);
+  });
+
   it('every wrapper is covered', () => {
     const scripts = readdirSync(DIR).filter((f) => f.endsWith('.ps1'));
-    expect(new Set(cases.map((c) => c[0]))).toEqual(new Set(scripts));
+    expect(new Set([...cases.map((c) => c[0]), 'setup-controllers.ps1'])).toEqual(new Set(scripts));
   });
 
   it('check-ps rejects PS7-only syntax and missing wrapper rules', () => {

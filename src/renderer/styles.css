@@ -104,3 +104,10 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .stream-escape { margin: 0; font-size: 0.92rem; color: var(--muted); }
 .stream-escape.live { color: inherit; font-weight: 600; font-size: 1rem; }
+
+/* Phone controllers card */
+.pad-links { display: flex; flex-direction: column; gap: 12px; margin: 8px 0; }
+.pad-link { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.pad-link .qr { width: 140px; height: 140px; padding: 6px; background: #fff; border-radius: 10px; }
+.pad-link-text { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; min-width: 0; }
+.pad-link-text code { overflow-wrap: anywhere; }

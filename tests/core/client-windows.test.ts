@@ -161,7 +161,7 @@ describe('wiring: Windows PC as a client', () => {
     env.roleChoice = { canChoose: true, stored: false };
     const relaunched: string[] = [];
     env.relaunch = (r) => void relaunched.push(r);
-    const s = { client: null, host: {} as never, diagnostics: { collect: async () => ({ zipPath: 'x', bytes: 0 }) }, selfCheck: async () => ({}) as never, resolvedPaths: {} };
+    const s = { client: null, host: {} as never, controllers: null, diagnostics: { collect: async () => ({ zipPath: 'x', bytes: 0 }) }, selfCheck: async () => ({}) as never, resolvedPaths: {} };
     const h = buildHandlers(env, s, () => undefined, () => undefined);
     expect(await h['app:info']!()).toMatchObject({ role: 'host', canChooseRole: true, roleStored: false });
     expect(await h['app:role-set']!({ role: 'host' })).toEqual({ relaunching: false });
@@ -174,7 +174,7 @@ describe('wiring: Windows PC as a client', () => {
   });
   it('app:role-set is refused when the role is fixed (macOS)', async () => {
     const env = wiringEnv('client', 'darwin');
-    const s = { client: buildServices(env).client, host: null, diagnostics: { collect: async () => ({ zipPath: 'x', bytes: 0 }) }, selfCheck: async () => ({}) as never, resolvedPaths: {} };
+    const s = { client: buildServices(env).client, host: null, controllers: null, diagnostics: { collect: async () => ({ zipPath: 'x', bytes: 0 }) }, selfCheck: async () => ({}) as never, resolvedPaths: {} };
     const h = buildHandlers(env, s, () => undefined, () => undefined);
     await expect(h['app:role-set']!({ role: 'host' })).rejects.toThrow(/cannot be changed/);
     expect(await h['app:info']!()).toMatchObject({ canChooseRole: false });

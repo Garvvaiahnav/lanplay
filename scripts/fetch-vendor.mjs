@@ -1,19 +1,23 @@
 #!/usr/bin/env node
 // Downloads pinned third-party binaries listed in vendor/manifest.json, verifies SHA256, and extracts them.
-// Only github.com release URLs of the three allowed repos are accepted. Nothing downloaded is executed.
+// Only the allow-listed URL prefixes below are accepted (GitHub release assets of five repos, one NuGet package). Nothing downloaded is executed.
 // Usage: node scripts/fetch-vendor.mjs [--ids id1,id2] [--windows] [--verify-only]
-//   default ids on macOS: moonlight-macos,pwsh-macos ; on Windows (or --windows): sunshine-windows-msi
+//   default ids on macOS: moonlight-macos,pwsh-macos ; on Windows (or --windows): sunshine-windows-msi,moonlight-windows,
+//   vigembus-windows-installer,vigemclient-windows-x64
 // Extraction (no shell strings, argv arrays only):
 //   moonlight-macos: hdiutil attach -nobrowse -readonly -> ditto Moonlight.app (keeps the notarized signature) -> detach
 //   pwsh-macos:      tar -xzf into vendor/pwsh-macos/pwsh-7.7.0 ; chmod +x pwsh
+//   vigemclient-windows-x64: unzip the nupkg into a temp dir, read the CLR resource area of Nefarius.ViGEm.Client.dll (pure
+//                    JS, scripts/pe-tools.mjs), take the embedded x64 native PE, check machine/exports/SHA256, write ViGEmClient.dll
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync } from 'node:fs';
+import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
+import { extractEmbeddedNativeDll, MACHINE_X64, parsePe, peExports } from './pe-tools.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const VENDOR = join(ROOT, 'vendor');
@@ -21,13 +25,15 @@ export const ALLOWED_PREFIXES = [
   'https://github.com/LizardByte/Sunshine/releases/download/',
   'https://github.com/moonlight-stream/moonlight-qt/releases/download/',
   'https://github.com/PowerShell/PowerShell/releases/download/',
+  'https://github.com/nefarius/ViGEmBus/releases/download/',
+  'https://api.nuget.org/v3-flatcontainer/nefarius.vigem.client/',
 ];
 
 const args = process.argv.slice(2);
 const verifyOnly = args.includes('--verify-only');
 const idsArg = args.indexOf('--ids') >= 0 ? args[args.indexOf('--ids') + 1] : undefined;
 const windows = args.includes('--windows') || process.platform === 'win32';
-const defaultIds = windows ? ['sunshine-windows-msi', 'moonlight-windows'] : ['moonlight-macos', 'pwsh-macos'];
+const defaultIds = windows ? ['sunshine-windows-msi', 'moonlight-windows', 'vigembus-windows-installer', 'vigemclient-windows-x64'] : ['moonlight-macos', 'pwsh-macos'];
 const ids = idsArg ? idsArg.split(',') : defaultIds;
 
 const manifest = JSON.parse(readFileSync(join(VENDOR, 'manifest.json'), 'utf8'));
@@ -38,8 +44,46 @@ async function sha256(file) {
   return h.digest('hex');
 }
 
+const sha256Buf = (buf) => createHash('sha256').update(buf).digest('hex');
+
+/** Checks a file extracted from a download against the manifest's 'extracted' block (size, SHA256, PE machine, exports). */
+function checkExtracted(a, buf) {
+  const x = a.extracted;
+  const problems = [];
+  if (buf.length !== x.sizeBytes) problems.push(`size ${buf.length} != ${x.sizeBytes}`);
+  const got = sha256Buf(buf);
+  if (got !== x.sha256) problems.push(`SHA256 ${got} != ${x.sha256}`);
+  try {
+    const pe = parsePe(buf);
+    if (x.machine === 'x64' && pe.machine !== MACHINE_X64) problems.push(`PE machine 0x${pe.machine.toString(16)} is not x64`);
+    if (!pe.isDll) problems.push('not a DLL');
+    const have = new Set(peExports(buf));
+    for (const name of x.requiredExports ?? []) if (!have.has(name)) problems.push(`missing export ${name}`);
+  } catch (e) {
+    problems.push(e.message);
+  }
+  return problems;
+}
+
 function extract(a, dest) {
   const dir = join(VENDOR, a.id);
+  if (a.id === 'vigemclient-windows-x64') {
+    const out = join(dir, a.extracted.file);
+    if (existsSync(out) && checkExtracted(a, readFileSync(out)).length === 0) return;
+    const tmp = mkdtempSync(join(tmpdir(), 'lanplay-vigemclient-'));
+    try {
+      if (process.platform === 'win32') execFileSync('tar', ['-xf', dest, '-C', tmp], { stdio: 'inherit' });
+      else execFileSync('/usr/bin/ditto', ['-xk', dest, tmp], { stdio: 'inherit' });
+      const dll = extractEmbeddedNativeDll(readFileSync(join(tmp, 'lib', 'netstandard2.0', 'Nefarius.ViGEm.Client.dll')), MACHINE_X64);
+      const problems = checkExtracted(a, dll);
+      if (problems.length) throw new Error(`extracted ${a.extracted.file} rejected: ${problems.join('; ')}`);
+      writeFileSync(out, dll);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+    console.log(`${a.id}: extracted ${out} (x64 PE, SHA256 ${a.extracted.sha256}, required exports present)`);
+    return;
+  }
   if (a.id === 'moonlight-macos') {
     const app = join(dir, 'Moonlight.app');
     if (existsSync(join(app, 'Contents', 'MacOS', 'Moonlight'))) return;
@@ -104,6 +148,13 @@ for (const id of ids) {
     continue;
   }
   console.log(`${id}: OK ${got}`);
+  if (verifyOnly && a.extracted) {
+    const out = join(dir, a.extracted.file);
+    if (!existsSync(out)) { console.error(`${id}: missing extracted ${out}`); failed++; continue; }
+    const problems = checkExtracted(a, readFileSync(out));
+    if (problems.length) { console.error(`${id}: extracted ${a.extracted.file} FAILED: ${problems.join('; ')}`); failed++; continue; }
+    console.log(`${id}: extracted ${a.extracted.file} OK ${a.extracted.sha256}`);
+  }
   if (!verifyOnly) {
     try {
       extract(a, dest);

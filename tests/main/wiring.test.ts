@@ -39,6 +39,7 @@ describe('buildHandlers', () => {
     const s: Services = {
       client,
       host: null,
+      controllers: null,
       diagnostics: { collect: async () => ({ zipPath: '/tmp/LanPlay-diagnostics-x.zip', bytes: 10 }) },
       selfCheck: async () => {
         checks++;

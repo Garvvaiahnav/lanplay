@@ -23,12 +23,17 @@ const INVOKE_CHANNELS: readonly string[] = [
   'host:agent-decide',
   'host:devices-list',
   'host:devices-revoke',
+  'host:controllers-state',
+  'host:controllers-set-enabled',
+  'host:controllers-kick',
+  'host:controllers-new-link',
+  'host:controllers-setup',
   'selfcheck:run',
   'diagnostics:collect',
   'diagnostics:reveal',
 ];
 
-const EVENT_CHANNELS: readonly string[] = ['client:hosts-updated', 'client:pair-progress', 'client:stream-state', 'host:setup-progress', 'host:agent-state-changed'];
+const EVENT_CHANNELS: readonly string[] = ['client:hosts-updated', 'client:pair-progress', 'client:stream-state', 'host:setup-progress', 'host:agent-state-changed', 'host:controllers-changed'];
 
 const api = {
   async invoke(channel: string, ...req: unknown[]): Promise<unknown> {
