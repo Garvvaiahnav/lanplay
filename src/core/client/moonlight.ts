@@ -45,6 +45,10 @@ export function buildStreamArgs(input: MoonlightStreamArgsInput): string[] {
     s.displayMode,
     s.vsync ? F.vsync : F.noVsync,
     s.framePacing ? F.framePacing : F.noFramePacing,
+    // Windows key, Alt+Tab etc. go to the streamed PC, not the viewer. "always" so it also holds in borderless/windowed.
+    // Ctrl+Alt+Shift+Q (quit) and Ctrl+Alt+Shift+Z (ungrab) stay handled inside Moonlight.
+    F.captureSystemKeys,
+    'always',
   ];
 }
 

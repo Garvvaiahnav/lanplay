@@ -114,7 +114,8 @@ export class MacClientService implements ClientService {
 
   getSettings(): StreamSettings {
     const raw = this.deps.settings.get<unknown>(SETTINGS_KEY, null);
-    // Windows default: borderless (windowed fullscreen) so Alt+Tab and the Windows key still reach the desktop.
+    // Windows default: borderless (windowed fullscreen), so other windows (e.g. the exit menu) can still appear above the stream.
+    // System keys are captured separately via --capture-system-keys (see buildStreamArgs).
     if (raw === null && this.platform === 'win32') return normalizeStreamSettings({ ...DEFAULT_STREAM_SETTINGS, displayMode: 'borderless' });
     try {
       return normalizeStreamSettings(raw ?? {});

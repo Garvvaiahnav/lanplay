@@ -166,6 +166,8 @@ export const MOONLIGHT = Object.freeze({
     videoCodec: '--video-codec', // auto | H.264 | HEVC | AV1 (m_VideoCodecMap, #L308-L313; case-sensitive keys)
     audioConfig: '--audio-config', // stereo | 5.1-surround | 7.1-surround (#L303-L307)
     displayMode: '--display-mode', // fullscreen | windowed | borderless (#L298-L302)
+    /** never | fullscreen | always. Default is "never": the Windows key and Alt+Tab then act on the viewer PC, not the host. */
+    captureSystemKeys: '--capture-system-keys',
     vsync: '--vsync',
     noVsync: '--no-vsync',
     framePacing: '--frame-pacing',

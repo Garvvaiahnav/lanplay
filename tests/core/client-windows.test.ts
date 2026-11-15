@@ -149,7 +149,7 @@ describe('wiring: Windows PC as a client', () => {
     expect(s.client).toBeTruthy();
     expect(s.host).toBeNull();
     expect(s.resolvedPaths.moonlight).toBe(bundled);
-    // Windows default display mode is borderless (Alt+Tab / Windows key keep working).
+    // Windows default display mode is borderless (other windows can appear above the stream).
     expect(s.client!.getSettings().displayMode).toBe('borderless');
   });
   it('macOS keeps fullscreen as the default display mode', () => {

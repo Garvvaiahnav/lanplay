@@ -9,3 +9,7 @@ coverage/
 # Only the manifest (pinned URLs + hashes) is committed.
 vendor/*
 !vendor/manifest.json
+
+# Private working notes / chat logs: never publish
+HANDOFF.md
+RANDOM-CHAT-TRANSCRIPT.md

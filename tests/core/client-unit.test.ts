@@ -78,6 +78,7 @@ describe('Moonlight argv', () => {
     expect(buildStreamArgs({ host: '192.168.1.10', settings, resolvedCodec: 'hevc' })).toEqual([
       'stream', '192.168.1.10', 'Desktop', '--4K', '--fps', '60', '--bitrate', '150000', '--video-codec', 'HEVC',
       '--audio-config', 'stereo', '--display-mode', 'borderless', '--vsync', '--frame-pacing',
+      '--capture-system-keys', 'always',
     ]);
     const low = buildStreamArgs({ host: 'fe80::1', settings: { ...settings, resolution: '1080p', fps: 120, bitrateMbps: 20, vsync: false, framePacing: false }, resolvedCodec: 'h264' });
     expect(low).toContain('--1080');
@@ -86,6 +87,13 @@ describe('Moonlight argv', () => {
     expect(low).toContain('--no-frame-pacing');
     expect(low[low.indexOf('--bitrate') + 1]).toBe('20000');
     expect(buildStreamArgs({ host: '10.0.0.2', settings: { ...settings, resolution: '1440p' }, resolvedCodec: 'av1' })).toEqual(expect.arrayContaining(['--1440', 'AV1']));
+  });
+
+  it('always captures system keys (Windows key, Alt+Tab) for every display mode', () => {
+    for (const displayMode of ['fullscreen', 'borderless', 'windowed'] as const) {
+      const argv = buildStreamArgs({ host: '10.0.0.2', settings: { ...settings, displayMode }, resolvedCodec: 'hevc' });
+      expect(argv[argv.indexOf('--capture-system-keys') + 1]).toBe('always');
+    }
   });
 
   it('refuses option-like hosts and app names, out-of-range values', () => {
