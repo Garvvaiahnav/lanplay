@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="color-scheme" content="dark light">
+<title>LanPlay menu</title>
+<link rel="stylesheet" href="stream-menu.css">
+</head>
+<body>
+<main class="menu" role="dialog" aria-label="Stream menu">
+  <h1>LanPlay</h1>
+  <p class="sub">You are streaming. What now?</p>
+  <button type="button" data-action="close" class="danger">Close stream</button>
+  <button type="button" data-action="settings">Change settings</button>
+  <button type="button" data-action="reconnect">Reconnect</button>
+  <button type="button" data-action="dismiss" class="primary" id="keep">Keep playing</button>
+</main>
+<script src="stream-menu.js"></script>
+</body>
+</html>

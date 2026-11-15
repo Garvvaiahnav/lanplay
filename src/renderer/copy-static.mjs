@@ -7,5 +7,5 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const out = join(here, '..', '..', 'dist', 'renderer');
 mkdirSync(out, { recursive: true });
-for (const f of ['index.html', 'styles.css']) copyFileSync(join(here, f), join(out, f));
+for (const f of ['index.html', 'styles.css', 'stream-menu.html', 'stream-menu.css']) copyFileSync(join(here, f), join(out, f));
 console.log('renderer assets copied to', out);

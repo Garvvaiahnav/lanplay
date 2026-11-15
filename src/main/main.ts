@@ -2,9 +2,10 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { app, BrowserWindow, ipcMain, net, protocol, safeStorage, session, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, net, protocol, safeStorage, screen, session, shell } from 'electron';
 import { IPC_INVOKE_CHANNELS, LANPLAY, SECURITY } from '../contracts.js';
 import type { IpcEventChannel, IpcEventMap, Role, ServiceDeps } from '../contracts.js';
+import { StreamMenuController } from '../core/client/stream-menu.js';
 import { computeAppPaths } from '../core/paths.js';
 import { NodeProcessRunner } from '../core/shared/exec.js';
 import { createJsonlLogger } from '../core/shared/logger.js';
@@ -13,12 +14,14 @@ import { CliError, parseCli, readStoredRole, resolveRole } from './cli.js';
 import type { CliOptions } from './cli.js';
 import { createIpcRouter } from './ipc.js';
 import { applySecurity, isAllowedAppUrl } from './security.js';
+import { createStreamMenuWindow } from './stream-menu-window.js';
 import { buildHandlers, buildServices, runDiagnosticsCli, runSelfCheckCli } from './wiring.js';
 import type { Services, WiringEnv } from './wiring.js';
 
 const APP_ROOT = path.resolve(__dirname, '..', '..');
 const RENDERER_DIR = path.join(APP_ROOT, 'dist', 'renderer');
 const PRELOAD = path.join(__dirname, '..', 'preload', 'preload.js');
+const MENU_PRELOAD = path.join(__dirname, '..', 'preload', 'menu-preload.js');
 
 /** Real write test: on Windows accessSync(W_OK) only looks at the read-only attribute, not at the folder's ACL. */
 function canWrite(dir: string): boolean {
@@ -148,7 +151,10 @@ async function start(): Promise<void> {
     (msg, data) => log.log('warn', 'security', msg, data),
   );
   let win: BrowserWindow | null = null;
+  let streamMenu: StreamMenuController | null = null;
   const push = <E extends IpcEventChannel>(channel: E, payload: IpcEventMap[E]) => {
+    // The in-stream menu follows the same stream-state events the window gets (including streams it restarts itself).
+    if (channel === 'client:stream-state') streamMenu?.onStreamState(payload as IpcEventMap['client:stream-state']);
     if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
   };
   const router = createIpcRouter(buildHandlers(env, services, push, (p) => shell.showItemInFolder(p)), log.redactor, (channel, err) =>
@@ -209,6 +215,32 @@ async function start(): Promise<void> {
     void services.host?.agent.stop();
     services.client?.discovery.stop();
   });
+  // Client only: move the cursor into a screen corner while streaming to get Close / Change settings / Reconnect.
+  if (services.client) {
+    const client = services.client;
+    const menuWindow = createStreamMenuWindow({
+      rendererDir: RENDERER_DIR,
+      preload: MENU_PRELOAD,
+      onChoose: (a) => void streamMenu?.choose(a).catch((e: Error) => log.log('error', 'stream-menu', `${a} failed`, { error: e.message })),
+      onClosed: () => streamMenu?.menuClosed(),
+      warn: (msg, data) => log.log('warn', 'stream-menu', msg, data),
+    });
+    const ctl = new StreamMenuController({
+      getCursor: () => screen.getCursorScreenPoint(),
+      getDisplays: () => screen.getAllDisplays().map((d) => d.bounds),
+      now: () => Date.now(),
+      openMenu: (display) => menuWindow.open(display),
+      closeMenu: () => menuWindow.close(),
+      stopStream: (hostId) => client.stopStream(hostId),
+      startStream: (hostId) => client.startStream(hostId, client.getSettings(), (st) => push('client:stream-state', st)),
+      showMainWindow: () => createWindow(),
+      sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    });
+    streamMenu = ctl;
+    // Idle (returns at once) unless a stream is running.
+    setInterval(() => ctl.tick(), ctl.pollMs).unref();
+  }
+
   if (cli.mode !== 'agent') createWindow();
   else log.log('info', 'main', 'running as background pair agent (open LanPlay to show the window)');
 }
