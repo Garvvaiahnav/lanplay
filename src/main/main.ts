@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { app, BrowserWindow, ipcMain, net, protocol, safeStorage, screen, session, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, net, protocol, safeStorage, screen, session, shell } from 'electron';
 import { IPC_INVOKE_CHANNELS, LANPLAY, SECURITY } from '../contracts.js';
 import type { IpcEventChannel, IpcEventMap, Role, ServiceDeps } from '../contracts.js';
 import { StreamMenuController } from '../core/client/stream-menu.js';
@@ -15,6 +15,7 @@ import type { CliOptions } from './cli.js';
 import { createIpcRouter } from './ipc.js';
 import { applySecurity, isAllowedAppUrl } from './security.js';
 import { createStreamMenuWindow } from './stream-menu-window.js';
+import { createUpdates } from './updates.js';
 import { buildHandlers, buildServices, runDiagnosticsCli, runSelfCheckCli } from './wiring.js';
 import type { Services, WiringEnv } from './wiring.js';
 
@@ -145,13 +146,24 @@ async function start(): Promise<void> {
   }
 
   // GUI / agent
+  let streamMenu: StreamMenuController | null = null;
+  const updates = createUpdates({
+    app,
+    net,
+    dialog,
+    stageDir: path.join(paths.userData, 'updates'),
+    mode: cli.mode === 'agent' ? 'agent' : 'gui',
+    isStreaming: () => streamMenu?.activeHostId() != null,
+    log: (level, msg, data) => log.log(level, 'update', msg, data),
+  });
+  // A verified update downloaded earlier is installed first: the installer starts and this process exits.
+  if (updates.applyStagedAtLaunch()) return;
   applySecurity(
     { app, session: session.defaultSession, openExternal: (u) => shell.openExternal(u), protocol, netFetch: (u, i) => net.fetch(u, i) },
     RENDERER_DIR,
     (msg, data) => log.log('warn', 'security', msg, data),
   );
   let win: BrowserWindow | null = null;
-  let streamMenu: StreamMenuController | null = null;
   const push = <E extends IpcEventChannel>(channel: E, payload: IpcEventMap[E]) => {
     // The in-stream menu follows the same stream-state events the window gets (including streams it restarts itself).
     if (channel === 'client:stream-state') streamMenu?.onStreamState(payload as IpcEventMap['client:stream-state']);
@@ -241,6 +253,7 @@ async function start(): Promise<void> {
     setInterval(() => ctl.tick(), ctl.pollMs).unref();
   }
 
+  updates.start();
   if (cli.mode !== 'agent') createWindow();
   else log.log('info', 'main', 'running as background pair agent (open LanPlay to show the window)');
 }

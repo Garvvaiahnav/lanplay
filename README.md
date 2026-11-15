@@ -1,29 +1,44 @@
 # LanPlay
 
 One small app that replaces the Sunshine + Moonlight setup dance on your own home network.
-Windows PC = **host** (installs and configures Sunshine for you). Mac mini = **client** (finds the PC, pairs without
-typing a PIN, and starts Moonlight with good settings). Status: **v0.1, not yet run on real hardware**; see `SPEC.md`.
+One installer per OS does both jobs: on Windows you choose **host** (installs and configures Sunshine for you) or
+**viewer** (finds the host, pairs without typing a PIN, streams with Moonlight). Status: **v0.2, early; the Windows-to-Windows
+path has not been verified on real hardware yet**; see `SPEC.md` and `docs/WINDOWS-TEST.md`.
 
-## Use it
-- **Windows PC (host):** build it there once with `scripts\build-windows.ps1`, run `release\win-unpacked\LanPlay.exe`
-  (normally, not "as administrator"), click **Install and set up**, accept the one Windows admin prompt. Leave
-  "Auto-approve devices on my network" on. **Paired devices** lets you revoke a Mac. Closing the window keeps it running.
-- **Mac mini (client):** `npm ci && node scripts/fetch-vendor.mjs && npm run pack:mac` (`npm ci` fetches the Electron
-  runtime from github.com/electron/electron, checksum-verified), open `release/mac-arm64/LanPlay.app`, pick a preset,
-  press **Pair and stream**. Allow "Local Network" when macOS asks.
+## Install
+Download the latest installer from **Releases**: `LanPlay-Setup-<version>.exe` for Windows. Run it (per-user, no admin
+prompt for LanPlay itself). Windows SmartScreen may say "Windows protected your PC" because the app is unsigned: More info,
+then Run anyway. The first time, pick **Host** on the PC that has the games and **Viewer** on the PC you play from.
+A macOS build (viewer role) is built the same way and published when ready.
+
+## While streaming
+- Windows key, Alt+Tab and other system keys go to the host PC, not your own computer.
+- Rest the mouse in any screen corner for half a second: a menu appears with **Close stream**, **Change settings**,
+  **Reconnect** and **Keep playing**. In-game mouse lock hides the pointer from LanPlay, so use Ctrl+Alt+Shift+Q to quit there.
+
+## Updates
+LanPlay checks GitHub Releases at start and every 6 hours. A new version is downloaded, verified against an Ed25519-signed
+manifest (public key in `src/core/update/update.ts`) and its SHA-256, then offered: "Restart and update". Nothing
+unsigned is ever run. See `docs/RELEASING.md` for how a release is signed and published.
+
+## Build from source
+- **Windows host or viewer:** `npm ci`, `node scripts/fetch-vendor.mjs --windows`, then
+  `npx electron-builder --config scripts/electron-builder.config.cjs --win nsis --x64 --publish never`
+  (or `scripts\build-windows.ps1` on Windows).
+- **Mac viewer:** `npm ci && node scripts/fetch-vendor.mjs && npm run pack:mac`, open `release/mac-arm64/LanPlay.app`,
+  allow "Local Network" when macOS asks.
 - Something wrong? **Run self-check**, then **Copy diagnostics** and send the zip
   (CLI: `LanPlay --self-check`, `LanPlay --diagnostics`).
 - If Sunshine is already installed it is kept, but its web login becomes a LanPlay-managed one. An old (NSIS) Sunshine
   must be uninstalled first; setup says so.
 
 ## Tested vs not tested
-- Tested on the Mac: `npm run typecheck`, `npm test` (unit + end-to-end against a mock Sunshine HTTPS server and a fake
-  Moonlight CLI), PowerShell parse + PSScriptAnalyzer with pinned pwsh 7.7 (`npm run check:ps`), vendor hashes
-  (`npm run vendor:verify`), the real Moonlight 6.2.0 `--help` flags, and the screens in a browser with a stub backend.
-- **Not tested:** the app has never been started under Electron (the Electron binary comes from
-  github.com/electron/electron, outside the download allow-list: your decision) and was never packaged; the real
-  Windows host (MSI, service, firewall, UAC, Windows PowerShell 5.1); real pairing; real streaming.
-  The first run on the PC is the test; diagnostics are built to fix a failure in one round.
+- Tested on a Mac: `npm run typecheck`, `npm test` (unit + end-to-end against a mock Sunshine HTTPS server and a fake
+  Moonlight CLI), the corner-menu window in real Electron, PowerShell parse + PSScriptAnalyzer (`npm run check:ps`), vendor hashes
+  (`npm run vendor:verify`).
+- **Not tested on real Windows yet:** system-key capture, the corner menu over a fullscreen stream, the silent self-update
+  installer, the Sunshine MSI/service/firewall/UAC steps, real pairing and streaming. The first run on the PCs is the test;
+  diagnostics are built to fix a failure in one round.
 
 ## License and source
 LanPlay is GPL-3.0-only (`LICENSE`). It bundles Sunshine v2026.914.233613 and moonlight-qt v6.2.0, both GPL-3.0;
