@@ -1,0 +1,15 @@
+Libraries inside Sunshine.app (macOS build)
+
+LanPlay ships LizardByte's Sunshine.app unmodified (Sunshine v2026.914.233613, GPL-3.0; see Sunshine-GPL-3.0.txt and
+SOURCE-OFFER.md). The app brings its own copies of these libraries in Contents/Frameworks. Nothing in them was
+changed by LanPlay.
+
+Qt 6.11.1 (QtCore, QtDBus, QtGui, QtSvg, QtWidgets and the plugins in Contents/PlugIns): LGPL-3.0 (some Qt modules and
+tools use other licenses; see the Qt project). Source: https://download.qt.io/official_releases/qt/6.11/ and
+https://code.qt.io/cgit/qt/qtbase.git. License text: https://www.gnu.org/licenses/lgpl-3.0.txt. The Qt libraries are
+dynamic libraries inside the app; you may replace them with a modified build of the same Qt version.
+
+The other libraries in Contents/Frameworks (OpenSSL, ICU, GLib, HarfBuzz, FreeType, libpng, libjpeg, zstd, PCRE2,
+libdbus, miniupnpc, libb2, double-conversion, md4c, graphite2, libintl) are open-source projects under their own
+licenses (Apache-2.0, ICU, LGPL-2.1+, MIT, BSD, FreeType, libpng and similar). Their source is available from each
+project and from the Sunshine build recipe at https://github.com/LizardByte/Sunshine/tree/v2026.914.233613.

@@ -190,3 +190,202 @@ describe('host screen', () => {
     expect(root.textContent).toMatch(/Pair agent is not running. port busy/);
   });
 });
+
+describe('host screen on macOS', () => {
+  const mstep = (stepId: string, status: string, data?: Record<string, unknown>, message = '') => ({ ...step(stepId, status, message), data });
+  const MAC_INSTALL = { root: '/Users/me/Library/Application Support/LanPlay/sunshine', exe: '', serviceExe: '', configDir: '', configFile: '', logFile: '', certFile: '', foundVia: 'lanplay-managed' };
+  const macStatus = (steps: unknown[], over: Record<string, unknown> = {}) => ({ lastRunAt: 'now', ok: false, steps, install: MAC_INSTALL, isAdmin: false, ...over });
+  const NEEDS_SCREEN = mstep('mac-screen-recording', 'fail', { settingsPane: 'screen-recording' }, 'Sunshine cannot see the screen yet.');
+  const NEEDS_INPUT = mstep('mac-input', 'warn', { settingsPane: 'accessibility', userAction: 'confirm-input' });
+
+  function setupMac(steps: unknown[] = [], over: Record<string, (r: unknown) => unknown> = {}, status: Record<string, unknown> = {}): void {
+    setup({
+      'app:info': () => ({ role: 'host', version: '0.4.0', platform: 'darwin', arch: 'arm64', logFile: '/x.log', hostName: 'Garvs-Mac' }),
+      'host:setup-status': () => macStatus(steps, status),
+      'host:open-settings': () => undefined,
+      ...over,
+    });
+  }
+
+  it('speaks Mac: no Windows, administrator or UAC wording, and one "Set up this Mac" card', async () => {
+    setupMac([], { 'host:setup-status': () => macStatus([], { lastRunAt: null, install: null }) });
+    await ready();
+    expect(root.textContent).toContain('This Mac is called');
+    expect(q(root, 'section[aria-labelledby="h-sun"] h2').textContent).toBe('Set up this Mac');
+    expect(buttonByText(root, 'Set up this Mac')).toBeTruthy();
+    const shown = root.cloneNode(true) as HTMLElement;
+    shown.querySelectorAll('[hidden]').forEach((e) => e.remove());
+    expect(shown.textContent).not.toMatch(/Windows|administrator|This PC|PC /);
+    expect(q(root, 'section[aria-labelledby="h-sun"]').textContent).toMatch(/Screen Recording.*Accessibility/);
+  });
+
+  it('after setup it offers Set up / Repair like Windows', async () => {
+    setupMac([mstep('mac-launch-agent', 'pass'), mstep('web-ui', 'pass')]);
+    await ready();
+    expect(buttonByText(root, 'Set up / Repair')).toBeTruthy();
+    // no Windows "service" step on a Mac: the LaunchAgent step says whether Sunshine runs
+    expect([...root.querySelectorAll('.chip')].map((c) => c.textContent)).toEqual(['Installed: yes', 'Running: yes']);
+  });
+
+  it('shows the last run steps without pressing setup, so the buttons survive a relaunch', async () => {
+    setupMac([NEEDS_SCREEN]);
+    await ready();
+    expect(root.querySelector('[aria-label="Setup steps"]')?.textContent).toMatch(/Sunshine cannot see the screen yet/);
+  });
+
+  it('a failing Screen Recording step has a button that opens exactly that pane', async () => {
+    setupMac([NEEDS_SCREEN, mstep('web-ui', 'pass')]);
+    await ready();
+    buttonByText(root, 'Open Screen Recording settings').click();
+    await flush();
+    expect(api.called('host:open-settings')).toEqual([{ pane: 'screen-recording' }]);
+  });
+
+  it('Screen Recording: after the grant, "Restart Sunshine" on the step restarts it (Sunshine only checks at start)', async () => {
+    let restarted = false;
+    const denied = mstep('mac-screen-recording', 'fail', { settingsPane: 'screen-recording', userAction: 'restart-sunshine' });
+    setupMac([], {
+      'host:setup-status': () => macStatus([restarted ? mstep('mac-screen-recording', 'pass') : denied]),
+      'host:sunshine-restart': () => { restarted = true; return macStatus([mstep('mac-screen-recording', 'pass')], { ok: true }); },
+    });
+    await ready();
+    const step = q(root, '[aria-label="Setup steps"]');
+    expect([...step.querySelectorAll('button')].map((b) => b.textContent)).toEqual(['Open Screen Recording settings', 'Restart Sunshine']);
+    [...step.querySelectorAll('button')].find((b) => b.textContent === 'Restart Sunshine')!.click();
+    await flush();
+    expect(api.called('host:sunshine-restart')).toHaveLength(1);
+    expect(q(root, '[aria-label="Setup steps"]').querySelector('button')).toBeNull();
+  });
+
+  it('Accessibility: Open settings plus "I did this", which confirms and shows the new status', async () => {
+    let confirmed = false;
+    setupMac([], {
+      'host:setup-status': () => macStatus(confirmed ? [mstep('mac-input', 'pass')] : [NEEDS_INPUT]),
+      'host:confirm-input': () => { confirmed = true; return macStatus([mstep('mac-input', 'pass')], { ok: true }); },
+    });
+    await ready();
+    buttonByText(root, 'Open Accessibility settings').click();
+    await flush();
+    expect(api.called('host:open-settings')).toEqual([{ pane: 'accessibility' }]);
+    buttonByText(root, 'I did this').click();
+    await flush();
+    expect(api.called('host:confirm-input')).toEqual([{ ok: true }]);
+    expect(root.querySelector('.badge.pass')).toBeTruthy();
+    expect([...root.querySelectorAll('button')].some((b) => b.textContent === 'I did this')).toBe(false);
+    expect([...root.querySelectorAll('button')].some((b) => /settings$/.test(b.textContent ?? ''))).toBe(false);
+  });
+
+  it('a step that already passed carries no button, and an unknown pane name draws none', async () => {
+    setupMac([mstep('mac-screen-recording', 'pass', { settingsPane: 'screen-recording' }), mstep('mac-network', 'warn', { settingsPane: 'https://evil.example' })]);
+    await ready();
+    expect([...root.querySelectorAll('[aria-label="Setup steps"] button')]).toHaveLength(0);
+  });
+
+  it('when macOS refuses to open the pane the error is shown', async () => {
+    setupMac([NEEDS_SCREEN], { 'host:open-settings': () => { throw new Error('unknown pane'); } });
+    await ready();
+    buttonByText(root, 'Open Screen Recording settings').click();
+    await flush();
+    expect(q(root, '.status').textContent).toMatch(/Could not open System Settings: unknown pane/);
+  });
+
+  it('polls the status every 2 s while a step waits for Screen Recording, then stops', async () => {
+    let granted = false;
+    setupMac([], { 'host:setup-status': () => macStatus(granted ? [mstep('mac-screen-recording', 'pass'), mstep('web-ui', 'pass')] : [NEEDS_SCREEN]) });
+    await ready();
+    const polls = (): number => api.called('host:setup-status').length;
+    const first = polls();
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(polls()).toBe(first + 1);
+    granted = true;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(polls()).toBe(first + 2);
+    expect(root.querySelector('.step.fail')).toBeNull();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(polls()).toBe(first + 2);
+  });
+
+  it('does not poll while only a confirm-input warning is open, nor after the screen is destroyed', async () => {
+    setupMac([NEEDS_INPUT]);
+    await ready();
+    const n = api.called('host:setup-status').length;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(api.called('host:setup-status')).toHaveLength(n);
+    handle.destroy();
+    setupMac([NEEDS_SCREEN]);
+    await ready();
+    const m = api.called('host:setup-status').length;
+    handle.destroy();
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(api.called('host:setup-status')).toHaveLength(m);
+  });
+
+  it('Windows never polls', async () => {
+    setup({ 'host:setup-status': () => ({ lastRunAt: 'now', ok: false, steps: [mstep('web-ui', 'fail', { settingsPane: 'screen-recording' })], install: INSTALL, isAdmin: false }) });
+    await ready();
+    const n = api.called('host:setup-status').length;
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(api.called('host:setup-status')).toHaveLength(n);
+  });
+
+  it('setup run: says what macOS will show, then points at the permissions still open', async () => {
+    let finish: (v: unknown) => void = () => undefined;
+    setupMac([], { 'host:setup-run': () => new Promise((r) => { finish = r; }) });
+    await ready();
+    buttonByText(root, 'Set up / Repair').click();
+    await flush();
+    expect(q(root, '.status').textContent).toMatch(/Background items/);
+    finish(macStatus([NEEDS_SCREEN]));
+    await ready();
+    expect(q(root, '.status').textContent).toMatch(/System Settings/);
+    expect(q(root, '.status').className).not.toContain('error-text');
+    expect(buttonByText(root, 'Open Screen Recording settings')).toBeTruthy();
+  });
+
+  it('setup run with nothing left to do says the Mac is ready', async () => {
+    setupMac([], { 'host:setup-run': () => macStatus([mstep('mac-input', 'pass')], { ok: true }) });
+    await ready();
+    buttonByText(root, 'Set up / Repair').click();
+    await ready();
+    expect(q(root, '.status').textContent).toBe('Setup finished. This Mac is ready.');
+  });
+
+  it('a pending Sunshine update shows a banner whose button restarts Sunshine', async () => {
+    let restarted = false;
+    setupMac([], {
+      'host:setup-status': () => macStatus([mstep('mac-install', 'pass')], restarted ? {} : { sunshineUpdate: { installed: '2025.1.0', bundled: '2025.2.0' } }),
+      'host:sunshine-restart': () => { restarted = true; return macStatus([mstep('mac-install', 'pass')], { ok: true }); },
+    });
+    await ready();
+    const banner = q(root, '.banner');
+    expect(banner.hidden).toBe(false);
+    expect(banner.textContent).toMatch(/Sunshine update ready/);
+    expect(banner.textContent).toMatch(/2025\.2\.0/);
+    buttonByText(root, 'Restart Sunshine').click();
+    await flush();
+    expect(api.called('host:sunshine-restart')).toHaveLength(1);
+    expect(q(root, '.banner').hidden).toBe(true);
+  });
+
+  it('no banner without an update, and none on Windows', async () => {
+    setupMac([mstep('mac-install', 'pass')]);
+    await ready();
+    expect(q(root, '.banner').hidden).toBe(true);
+    handle.destroy();
+    setup({ 'host:setup-status': () => ({ lastRunAt: 'now', ok: true, steps: [], install: INSTALL, isAdmin: false, sunshineUpdate: { installed: '1', bundled: '2' } }) });
+    await ready();
+    expect(q(root, '.banner').hidden).toBe(true);
+  });
+
+  it('a failed restart is reported', async () => {
+    setupMac([], {
+      'host:setup-status': () => macStatus([], { sunshineUpdate: { installed: '1', bundled: '2' } }),
+      'host:sunshine-restart': () => { throw new Error('launchctl exit 5'); },
+    });
+    await ready();
+    buttonByText(root, 'Restart Sunshine').click();
+    await flush();
+    expect(q(root, '.status').textContent).toMatch(/Could not restart Sunshine: launchctl exit 5/);
+    expect(buttonByText(root, 'Restart Sunshine').disabled).toBe(false);
+  });
+});

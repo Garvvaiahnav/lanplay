@@ -48,6 +48,18 @@ describe('IPC router', () => {
     expect(() => IPC_VALIDATORS['host:agent-decide']({ requestId: 'x', approve: true })).toThrow();
     expect(() => IPC_VALIDATORS['client:stream-start']({ hostId: 'a', settings: null })).toThrow();
   });
+  it('validates the macOS host channels', () => {
+    for (const pane of ['screen-recording', 'accessibility', 'microphone', 'local-network', 'login-items', 'firewall'] as const) {
+      expect(IPC_VALIDATORS['host:open-settings']({ pane })).toEqual({ pane });
+    }
+    for (const bad of [{ pane: 'x-apple.systempreferences:com.apple.preference.security' }, { pane: 'toString' }, { pane: 1 }, {}, null]) {
+      expect(() => IPC_VALIDATORS['host:open-settings'](bad)).toThrow();
+    }
+    expect(IPC_VALIDATORS['host:confirm-input']({ ok: false })).toEqual({ ok: false });
+    expect(() => IPC_VALIDATORS['host:confirm-input']({ ok: 'yes' })).toThrow();
+    expect(() => IPC_VALIDATORS['host:sunshine-restart']({ force: true })).toThrow();
+    expect(IPC_VALIDATORS['host:sunshine-restart'](undefined)).toBeUndefined();
+  });
 });
 
 describe('diagnostics zip', () => {

@@ -29,6 +29,13 @@ export const STEP_TITLES: Record<HostStepId, string> = {
   'firewall-agent': 'Firewall rule "LanPlay Pair Agent"',
   'agent-autostart': 'Start LanPlay pair agent at login',
   'agent-listening': 'LanPlay pair agent answering',
+  'mac-bundle': 'Sunshine for Mac is bundled and signed',
+  'mac-install': 'Install Sunshine (private copy)',
+  'mac-launch-agent': 'Sunshine runs in the background (starts at login)',
+  'mac-screen-recording': 'Screen Recording allowed for Sunshine',
+  'mac-input': 'Keyboard and mouse control (Accessibility)',
+  'mac-audio': 'System audio',
+  'mac-network': 'Local network and firewall',
 };
 
 export interface FirewallRuleFact {

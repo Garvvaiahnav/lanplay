@@ -2,6 +2,8 @@
 // Effective role = --role flag, else the stored 'app.role' setting, else the platform default
 // (darwin = client, win32 = host). On Windows nothing says which one the user wants until they choose,
 // so `needsChoice` is true there until a role is stored; the renderer then asks (IPC 'app:role-set').
+// macOS can choose too, but is never asked: every Mac install predates the Mac host, so an update must keep
+// opening as a client. Those users switch through the "Change role" link instead.
 import type { KeyValueStore, Role } from '../../contracts.js';
 
 /** Key in the shared settings store (KeyValueStore). */
@@ -12,9 +14,9 @@ export type RoleSource = 'flag' | 'stored' | 'default';
 export interface ResolvedRole {
   role: Role;
   source: RoleSource;
-  /** The user may switch role in the UI (Windows only; also with --role, because 'app:role-set' relaunches with --role). Feeds AppInfo.canChooseRole. */
+  /** The user may switch role in the UI (Windows and macOS; also with --role, because 'app:role-set' relaunches with --role). Feeds AppInfo.canChooseRole. */
   canChoose: boolean;
-  /** Windows, no flag, nothing stored yet: the renderer must show the "Host or Client?" question first. */
+  /** Windows only (see header), no flag, nothing stored yet: the renderer must show the "Host or Client?" question first. */
   needsChoice: boolean;
 }
 
@@ -37,10 +39,11 @@ export interface ResolveRoleInput {
 
 export function resolveRole(i: ResolveRoleInput): ResolvedRole {
   const stored = parseStoredRole(i.stored);
-  const canChoose = i.platform === 'win32';
+  const canChoose = i.platform === 'win32' || i.platform === 'darwin';
+  const needsChoice = i.platform === 'win32';
   if (i.flag) return { role: i.flag, source: 'flag', canChoose, needsChoice: false };
   if (stored) return { role: stored, source: 'stored', canChoose, needsChoice: false };
-  return { role: defaultRole(i.platform), source: 'default', canChoose, needsChoice: canChoose };
+  return { role: defaultRole(i.platform), source: 'default', canChoose, needsChoice };
 }
 
 export function readStoredRole(settings: KeyValueStore): Role | null {

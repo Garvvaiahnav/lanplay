@@ -8,8 +8,7 @@ import type { IpcEventChannel, IpcEventMap, Role, ServiceDeps } from '../contrac
 import { StreamMenuController } from '../core/client/stream-menu.js';
 import { CONTROLLER_PORT, ControllerService } from '../core/controller/service.js';
 import { runControllerSetup } from '../core/controller/setup.js';
-import { createViGEmBackend } from '../core/controller/vigem.js';
-import type { PadBackend } from '../core/controller/vigem.js';
+import { createPadBackendFor } from '../core/controller/backend.js';
 import { isPrivateAddress } from '../core/shared/ipnet.js';
 import { computeAppPaths } from '../core/paths.js';
 import { NodeProcessRunner } from '../core/shared/exec.js';
@@ -21,7 +20,7 @@ import { createIpcRouter } from './ipc.js';
 import { applySecurity, isAllowedAppUrl } from './security.js';
 import { createStreamMenuWindow } from './stream-menu-window.js';
 import { createUpdates } from './updates.js';
-import { buildHandlers, buildServices, localAddresses, runDiagnosticsCli, runSelfCheckCli } from './wiring.js';
+import { buildHandlers, buildServices, localAddresses, releaseMacHost, runDiagnosticsCli, runSelfCheckCli } from './wiring.js';
 import type { Services, WiringEnv } from './wiring.js';
 
 const APP_ROOT = path.resolve(__dirname, '..', '..');
@@ -103,16 +102,10 @@ async function start(): Promise<void> {
   };
   const selfArgsPrefix = app.isPackaged ? [] : [APP_ROOT];
   // Phone controllers: host role only. Virtual Xbox pads need Windows (ViGEmBus); elsewhere the backend just reports it is unavailable.
-  const notWindows: PadBackend = {
-    status: () => ({ ok: false, reason: 'error', message: 'Phone controllers need Windows.' }),
-    createPad: () => {
-      throw new Error('Phone controllers need Windows.');
-    },
-  };
   const controllers =
     role === 'host'
       ? new ControllerService({
-          backend: process.platform === 'win32' ? createViGEmBackend({ dllPath: path.join(paths.vendorDir, 'ViGEmClient.dll') }) : notWindows,
+          backend: createPadBackendFor(process.platform, { vigemDllPath: path.join(paths.vendorDir, 'ViGEmClient.dll') }),
           layoutsDir: path.join(paths.userData, 'controller-layouts'),
           uiDir: path.join(APP_ROOT, 'dist', 'controller-ui'),
           port: CONTROLLER_PORT,
@@ -120,16 +113,20 @@ async function start(): Promise<void> {
           localAddresses: () => localAddresses().filter((a) => isPrivateAddress(a)),
           isAllowedAddress: (a) => isPrivateAddress(a),
           log: (level, msg, data) => log.log(level, 'controllers', msg, data),
-          runSetup: () =>
-            runControllerSetup({
-              runner: deps.runner,
-              redactor: log.redactor,
-              systemRoot: process.env.SystemRoot || process.env.windir || 'C:\\Windows',
-              psDir: paths.psDir,
-              installerPath: path.join(paths.vendorDir, 'ViGEmBus_1.22.0_x64_x86_arm64.exe'),
-              selfExe: process.execPath,
-              port: CONTROLLER_PORT,
-            }),
+          // The driver and firewall setup is a Windows UAC flow.
+          runSetup:
+            process.platform === 'win32'
+              ? () =>
+                  runControllerSetup({
+                    runner: deps.runner,
+                    redactor: log.redactor,
+                    systemRoot: process.env.SystemRoot || process.env.windir || 'C:\\Windows',
+                    psDir: paths.psDir,
+                    installerPath: path.join(paths.vendorDir, 'ViGEmBus_1.22.0_x64_x86_arm64.exe'),
+                    selfExe: process.execPath,
+                    port: CONTROLLER_PORT,
+                  })
+              : async () => ({ ok: false, message: 'Phone controllers need Windows.' }),
         })
       : null;
   const env: WiringEnv = {
@@ -143,15 +140,18 @@ async function start(): Promise<void> {
     appRoot: APP_ROOT,
     fileExists: existsSync,
     platform: process.platform,
-    roleChoice: { canChoose: resolved.canChoose, stored: resolved.source !== 'default' },
+    // A Mac that has nothing stored is not asked (needsChoice is Windows-only), so for it "stored" is true.
+    roleChoice: { canChoose: resolved.canChoose, stored: resolved.source !== 'default' || !resolved.needsChoice },
     relaunch: (r) => {
       log.log('info', 'main', 'relaunching with new role', { role: r });
       const args = process.argv.slice(1).filter((a, i, all) => a !== '--role' && all[i - 1] !== '--role' && !a.startsWith('--role='));
       app.relaunch({ args: [...args, '--role', r] });
       app.exit(0);
     },
+    openExternal: (url) => shell.openExternal(url),
+    // The Mac host starts at login through its own LaunchAgents, not through Electron's login item.
     loginItem:
-      process.platform === 'win32' || process.platform === 'darwin'
+      process.platform === 'win32'
         ? {
             get: () => app.getLoginItemSettings({ path: process.execPath, args: [...selfArgsPrefix, '--agent'] }).openAtLogin,
             set: (on) => app.setLoginItemSettings({ openAtLogin: on, path: process.execPath, args: [...selfArgsPrefix, '--agent'] }),
@@ -166,13 +166,20 @@ async function start(): Promise<void> {
     if (cli.mode === 'self-check') return app.exit(await runSelfCheckCli(services, paths.logDir, print));
     if (cli.mode === 'diagnostics') return app.exit(await runDiagnosticsCli(services, cli.out, print));
     if (cli.mode === 'host-setup') {
-      if (role !== 'host' || !services.host) throw new CliError('--host-setup is only for the Windows host');
+      if (role !== 'host' || !services.host || process.platform !== 'win32') throw new CliError('--host-setup is only for the Windows host');
       return app.exit(await services.host.runElevatedSetup(cli.handoff!, cli.result!));
     }
   } catch (e) {
     log.log('error', 'main', `${cli.mode} failed`, { error: (e as Error).message });
     process.stderr.write(`LanPlay ${cli.mode} failed: ${(e as Error).message}\n`);
     return app.exit(1);
+  }
+
+  // A Mac switched to the client role must not keep a Sunshine or pair agent running (or starting at login).
+  try {
+    await releaseMacHost(env);
+  } catch (e) {
+    log.log('warn', 'main', 'could not remove the Mac host LaunchAgents', { error: (e as Error).message });
   }
 
   // A Windows PC switched to the client role keeps its old --agent login item: nothing to run in the background.

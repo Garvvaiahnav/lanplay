@@ -1,7 +1,8 @@
 // IPC router: validates every renderer payload (the renderer is untrusted) and wraps replies in IpcEnvelope.
 // Pure (no Electron import) so it is unit-tested directly.
 import { IPC_INVOKE_CHANNELS } from '../contracts.js';
-import type { IpcEnvelope, IpcInvokeChannel, IpcRequest, IpcResponse, Redactor } from '../contracts.js';
+import type { IpcEnvelope, IpcInvokeChannel, IpcRequest, IpcResponse, Redactor, SettingsPane } from '../contracts.js';
+import { settingsUrl } from '../core/host/mac/permissions-mac.js';
 
 export class IpcValidationError extends Error {}
 
@@ -48,6 +49,14 @@ export const IPC_VALIDATORS: { [C in IpcInvokeChannel]: Validator<C> } = {
   'client:stream-stop': (raw) => ({ hostId: str(obj(raw), 'hostId', HOST_ID, 200) }),
   'host:setup-status': none,
   'host:setup-run': none,
+  'host:open-settings': (raw) => {
+    const pane = obj(raw).pane;
+    // The same table main opens links from, so a pane that passes here always has a deep link.
+    if (settingsUrl(pane) === null) throw new IpcValidationError('invalid pane');
+    return { pane: pane as SettingsPane };
+  },
+  'host:confirm-input': (raw) => ({ ok: bool(obj(raw), 'ok') }),
+  'host:sunshine-restart': none,
   'host:agent-state': none,
   'host:agent-set-auto-approve': (raw) => ({ on: bool(obj(raw), 'on') }),
   'host:agent-decide': (raw) => {

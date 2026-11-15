@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { HOST_STEP_ORDER, LANPLAY, SUNSHINE, SunshineApiError } from '../../contracts.js';
+import { HOST_STEP_ORDER, LANPLAY } from '../../contracts.js';
 import type {
   HostService,
   HostSetupHandoff,
@@ -17,14 +17,13 @@ import type {
   SelfCheckReport,
   ServiceDeps,
   StepRecord,
-  SunshineClient,
-  SunshineClientOptions,
 } from '../../contracts.js';
 import { localDateStamp } from '../shared/logger.js';
-import { httpGet, tcpProbe, tlsPinCheck, udpQuery } from '../shared/netprobe.js';
+import { tcpProbe, tlsPinCheck } from '../shared/netprobe.js';
 import { JsonFileStore } from '../shared/stores.js';
 import { timedStep } from '../shared/steprec.js';
 import { LanPairAgent } from './agent.js';
+import { defaultLocalIdentity, generateAdminPassword, LAST_SETUP_KEY, LazySunshineClient, PINNED_CERT_NAME, probeAgent, SETUP_EXE_KEY } from './common.js';
 import type { PairAgentExtraOptions } from './agent.js';
 import { runPs } from './ps.js';
 import { certFingerprint256, createSunshineClient } from './sunshine-client.js';
@@ -33,10 +32,7 @@ import type { HostStepsEnv } from './steps.js';
 import { quoteWindowsArg } from './winargs.js';
 import { sha256File, SUNSHINE_MSI_NAME } from './vendor.js';
 
-export const LAST_SETUP_KEY = 'host.lastSetup';
-/** LanPlay.exe path the firewall rules were created for (the program-bound rules stop matching when the folder moves). */
-export const SETUP_EXE_KEY = 'host.setupExe';
-export const PINNED_CERT_NAME = 'sunshine-cert.pem';
+export { defaultLocalIdentity, generateAdminPassword, LAST_SETUP_KEY, LazySunshineClient, PINNED_CERT_NAME, probeAgent, SETUP_EXE_KEY };
 
 export interface HostServiceExtras {
   /** LanPlay.exe (process.execPath). */
@@ -58,12 +54,6 @@ export interface HostServiceExtras {
   now?: () => number;
 }
 
-export function defaultLocalIdentity(): { hostName: string; addresses: string[] } {
-  const addresses: string[] = [];
-  for (const list of Object.values(os.networkInterfaces())) for (const a of list ?? []) addresses.push(a.address);
-  return { hostName: os.hostname(), addresses };
-}
-
 /** Secret store holding only the handoff password (elevated child). */
 class HandoffSecrets implements SecretStore {
   constructor(private readonly pw: string) {}
@@ -81,52 +71,6 @@ class HandoffSecrets implements SecretStore {
   }
 }
 
-/**
- * Lazily builds a pinned SunshineClient on each call: the cert copy and password may appear only after setup ran.
- */
-export class LazySunshineClient implements SunshineClient {
-  constructor(
-    private readonly certPath: string,
-    private readonly getPassword: () => Promise<string | null>,
-    private readonly onCall: SunshineClientOptions['onCall'],
-    private readonly baseUrl = `https://127.0.0.1:${SUNSHINE.webUiPort}`,
-  ) {}
-  private async client(): Promise<SunshineClient> {
-    let pem: string;
-    try {
-      pem = readFileSync(this.certPath, 'utf8');
-    } catch {
-      throw new SunshineApiError(`LanPlay setup has not finished: no pinned Sunshine certificate at ${this.certPath}`, null, 'network');
-    }
-    const pw = await this.getPassword();
-    if (!pw) throw new SunshineApiError('LanPlay setup has not finished: no stored Sunshine admin password', null, 'auth');
-    const o: SunshineClientOptions = { baseUrl: this.baseUrl, username: LANPLAY.sunshineAdminUser, getPassword: async () => pw, pinnedCertPem: pem, timeoutMs: 10_000 };
-    if (this.onCall) o.onCall = this.onCall;
-    return createSunshineClient(o);
-  }
-  async getPendingPairings() {
-    return (await this.client()).getPendingPairings();
-  }
-  async submitPin(r: { pairingId: string; pin: string; name: string }) {
-    return (await this.client()).submitPin(r);
-  }
-  async cancelPairing(id: string) {
-    return (await this.client()).cancelPairing(id);
-  }
-  async listClients() {
-    return (await this.client()).listClients();
-  }
-  async unpairClient(uuid: string) {
-    return (await this.client()).unpairClient(uuid);
-  }
-  async getVersion() {
-    return (await this.client()).getVersion();
-  }
-  async getLogsTail(n: number) {
-    return (await this.client()).getLogsTail(n);
-  }
-}
-
 export function validateHandoff(v: unknown): HostSetupHandoff {
   const h = v as Partial<HostSetupHandoff> | null;
   if (!h || typeof h !== 'object') throw new Error('handoff is not an object');
@@ -138,14 +82,6 @@ export function validateHandoff(v: unknown): HostSetupHandoff {
   if (typeof h.logDir !== 'string' || typeof h.sharedData !== 'string') throw new Error('handoff paths invalid');
   if (typeof h.createdAt !== 'string' || Number.isNaN(Date.parse(h.createdAt))) throw new Error('handoff createdAt invalid');
   return h as HostSetupHandoff;
-}
-
-export function generateAdminPassword(): string {
-  // base64url may start with "-" or "_"; an argv value that looks like an option is asking for trouble, so re-roll.
-  for (;;) {
-    const pw = randomBytes(32).toString('base64url');
-    if (/^[A-Za-z0-9]/.test(pw)) return pw;
-  }
 }
 
 /**
@@ -180,6 +116,13 @@ export function collectSunshineInstallerLogs(systemRoot: string, userTemp: strin
     }
   }
   return out;
+}
+
+export interface PlatformHostService extends HostService {
+  agentIdle(reason: string | undefined): void;
+  agentAutoStart(): { start: boolean; reason?: string };
+  /** macOS: bundled Sunshine differs from the installed copy. Windows: always null. */
+  pendingSunshineUpdate(): { installed: string; bundled: string } | null;
 }
 
 export class WindowsHostService implements HostService {
@@ -246,7 +189,7 @@ export class WindowsHostService implements HostService {
       pinnedCertPath: this.certPath,
       selfExe: this.x.selfExe,
       loginItem: userSession ? this.x.loginItem : null,
-      agentProbe: userSession ? () => this.probeAgent() : null,
+      agentProbe: userSession ? () => probeAgent(this.agent) : null,
       now: this.now,
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     };
@@ -265,23 +208,6 @@ export class WindowsHostService implements HostService {
       install: null,
       isAdmin,
     };
-  }
-
-  async probeAgent(): Promise<{ http: boolean; udp: boolean; detail: string }> {
-    const port = this.agent.getState().port || LANPLAY.agentPort;
-    let http = false;
-    let detail = '';
-    try {
-      const r = await httpGet('127.0.0.1', port, '/v1/info', 3000);
-      http = r.status === 200;
-      detail = `GET /v1/info -> ${r.status} ${r.body.slice(0, 200)}`;
-    } catch (e) {
-      detail = `GET /v1/info failed: ${(e as Error).message}`;
-    }
-    const u = await udpQuery('127.0.0.1', port, LANPLAY.agentDiscoveryMagic, 1500);
-    const udp = Boolean(u && u.includes(LANPLAY.agentDiscoveryMagic));
-    if (!udp) detail += '; UDP discovery: no reply';
-    return { http, udp, detail };
   }
 
   private async isAdmin(): Promise<boolean> {

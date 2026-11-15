@@ -1,9 +1,42 @@
-// electron-builder afterPack hook: copy the pinned Moonlight.app into LanPlay.app/Contents/Resources/vendor with
-// `ditto` (preserves symlinks, xattrs and the notarized code signature), then verify the signature.
+// electron-builder afterPack hook: copy the pinned Moonlight.app and Sunshine.app into LanPlay.app/Contents/Resources/vendor
+// with `ditto` (preserves symlinks, xattrs and the notarized code signatures), then verify each signature (Sunshine also
+// its team id, pinned in vendor/manifest.json).
 // argv arrays only, no shell.
-const { execFileSync } = require('node:child_process');
-const { existsSync, mkdirSync, readdirSync, rmSync } = require('node:fs');
+const { execFileSync, spawnSync } = require('node:child_process');
+const { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } = require('node:fs');
 const path = require('node:path');
+
+const ROOT = path.resolve(__dirname, '..');
+
+function pinnedArtifact(id) {
+  const manifest = JSON.parse(readFileSync(path.join(ROOT, 'vendor', 'manifest.json'), 'utf8'));
+  const a = manifest.artifacts.find((x) => x.id === id);
+  if (!a) throw new Error(`${id} is not in vendor/manifest.json`);
+  return a;
+}
+
+/** `TeamIdentifier=ABCDE12345` from `codesign -dv` output; undefined for unsigned or "not set". */
+function parseTeamId(codesignOutput) {
+  const m = /^TeamIdentifier=([A-Z0-9]{10})$/m.exec(codesignOutput);
+  return m ? m[1] : undefined;
+}
+
+/** Copies a vendored .app into destDir with ditto, verifies its signature and, when teamId is given, that team. Throws on any problem. */
+function bundleVendorApp({ name, src, binary, destDir, teamId }) {
+  if (!existsSync(path.join(src, binary))) throw new Error(`${name} missing at ${src}. Run: node scripts/fetch-vendor.mjs`);
+  mkdirSync(destDir, { recursive: true });
+  const dest = path.join(destDir, name);
+  rmSync(dest, { recursive: true, force: true });
+  execFileSync('/usr/bin/ditto', [src, dest], { stdio: 'inherit' });
+  execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', dest], { stdio: 'inherit' });
+  if (teamId) {
+    // codesign -dv writes to stderr
+    const info = spawnSync('/usr/bin/codesign', ['-dv', dest], { encoding: 'utf8' });
+    const got = parseTeamId(`${info.stdout}${info.stderr}`);
+    if (got !== teamId) throw new Error(`${name} is signed by team ${got ?? 'none'}, expected ${teamId}`);
+  }
+  console.log(`after-pack: bundled ${dest} (signature verified${teamId ? `, team ${teamId}` : ''})`);
+}
 
 // Windows: the phone-controller driver layer needs koffi's win32-x64 addon, outside the asar, and nothing else from koffi.
 function assertWindowsKoffi(context) {
@@ -29,15 +62,10 @@ exports.default = async function afterPack(context) {
   if (context.electronPlatformName === 'win32') return assertWindowsKoffi(context);
   if (context.electronPlatformName !== 'darwin') return;
   dropKoffiNative(context);
-  const src = path.resolve(__dirname, '..', 'vendor', 'moonlight-macos', 'Moonlight.app');
-  if (!existsSync(path.join(src, 'Contents', 'MacOS', 'Moonlight'))) {
-    throw new Error(`Moonlight.app missing at ${src}. Run: node scripts/fetch-vendor.mjs`);
-  }
-  const appName = `${context.packager.appInfo.productFilename}.app`;
-  const destDir = path.join(context.appOutDir, appName, 'Contents', 'Resources', 'vendor');
-  mkdirSync(destDir, { recursive: true });
-  const dest = path.join(destDir, 'Moonlight.app');
-  execFileSync('/usr/bin/ditto', [src, dest], { stdio: 'inherit' });
-  execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', dest], { stdio: 'inherit' });
-  console.log(`after-pack: bundled ${dest} (signature verified)`);
+  const vendorDir = path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, 'Contents', 'Resources', 'vendor');
+  bundleVendorApp({ name: 'Moonlight.app', src: path.join(ROOT, 'vendor', 'moonlight-macos', 'Moonlight.app'), binary: 'Contents/MacOS/Moonlight', destDir: vendorDir });
+  const sunshine = pinnedArtifact('sunshine-macos-arm64');
+  bundleVendorApp({ name: 'Sunshine.app', src: path.join(ROOT, 'vendor', sunshine.id, 'Sunshine.app'), binary: 'Contents/MacOS/Sunshine', destDir: vendorDir, teamId: sunshine.teamId });
 };
+exports.bundleVendorApp = bundleVendorApp;
+exports.parseTeamId = parseTeamId;

@@ -412,7 +412,10 @@ export interface StepRecord {
     timedOut: boolean;
     spawnError?: string;
   }>;
-  /** Structured extra facts (paths resolved, versions, rule names). Must contain no secrets. */
+  /**
+   * Structured extra facts (paths resolved, versions, rule names). Must contain no secrets.
+   * macOS convention: `{ settingsPane?: SettingsPane, userAction?: 'confirm-input' | 'restart-sunshine' }`; the renderer draws buttons from it.
+   */
   data?: Record<string, unknown>;
 }
 
@@ -423,13 +426,13 @@ export interface SunshineInstall {
   /** Install root, e.g. "C:\\Program Files\\Sunshine". Always path.win32-normalised. */
   root: string;
   exe: string; // <root>\sunshine.exe
-  serviceExe: string; // <root>\tools\sunshinesvc.exe
+  serviceExe: string; // <root>\tools\sunshinesvc.exe ('' on macOS: Sunshine runs as a LaunchAgent, not a service)
   configDir: string; // <root>\config
   configFile: string; // <root>\config\sunshine.conf
   logFile: string; // <root>\config\sunshine.log (or log_path override from sunshine.conf)
   certFile: string; // <root>\config\credentials\cacert.pem
   /** How root was found (first hit wins, in this order). */
-  foundVia: 'service-binpath' | 'uninstall-registry' | 'fallback-path';
+  foundVia: 'service-binpath' | 'uninstall-registry' | 'fallback-path' | 'lanplay-managed';
   version?: string; // uninstall DisplayVersion or GET /api/config "version"
 }
 
@@ -443,7 +446,39 @@ export interface SunshineFactsPs {
 /** Pure resolver (Builder B: src/host/sunshine-locate.ts). Uses path.win32 only. */
 export type LocateSunshine = (facts: SunshineFactsPs, fileExists: (p: string) => boolean) => SunshineInstall | null;
 
+/** Facts about the Sunshine.app that LanPlay bundles and copies to <sharedData>/sunshine on macOS. */
+export const SUNSHINE_MAC = Object.freeze({
+  bundleId: 'dev.lizardbyte.app.Sunshine',
+  appName: 'Sunshine.app',
+  /** Relative to Sunshine.app; the file the LaunchAgent runs. */
+  binaryRelative: 'Contents/MacOS/Sunshine',
+  dmgAsset: 'Sunshine-macOS-arm64.dmg',
+  launchdLabel: 'dev.lanplay.sunshine',
+  agentLaunchdLabel: 'dev.lanplay.agent',
+  /** Logged by Sunshine when macOS withholds the Screen Recording grant; the only machine-readable signal for it. */
+  noScreenPermissionLog: 'No screen capture permission!',
+  /** Sunshine's system-audio capture needs macOS 14. */
+  minMacOS: 14,
+} as const);
+
+/** Steps that only exist on macOS. Shared ids (config, web-ui, ...) stay in the Windows list below. */
+export type MacHostStepId =
+  | 'mac-bundle' // bundled Sunshine.app present, signature valid, team id pinned, version matches
+  | 'mac-install' // copy in <sharedData>/sunshine/Sunshine.app is current and signature-valid
+  | 'config'
+  | 'credentials'
+  | 'mac-launch-agent' // dev.lanplay.sunshine loaded and running
+  | 'mac-screen-recording'
+  | 'web-ui'
+  | 'api-auth'
+  | 'mac-input' // Accessibility for keyboard/mouse (user-confirmed: macOS gives no API to read it for another app)
+  | 'mac-audio' // info: macOS >= 14, system audio prompt
+  | 'mac-network' // Local Network + application firewall state (info/warn)
+  | 'agent-autostart'
+  | 'agent-listening';
+
 export type HostStepId =
+  | MacHostStepId
   | 'admin' // running elevated?
   | 'locate-sunshine'
   | 'install-sunshine' // msiexec /i <msi> /qn /norestart /l*v <log>
@@ -473,6 +508,25 @@ export const HOST_STEP_ORDER: readonly HostStepId[] = Object.freeze([
   'agent-autostart',
   'agent-listening',
 ] as const);
+
+export const MAC_HOST_STEP_ORDER: readonly HostStepId[] = Object.freeze([
+  'mac-bundle',
+  'mac-install',
+  'config',
+  'credentials',
+  'mac-launch-agent',
+  'mac-screen-recording',
+  'web-ui',
+  'api-auth',
+  'mac-input',
+  'mac-audio',
+  'mac-network',
+  'agent-autostart',
+  'agent-listening',
+] as const);
+
+/** System Settings panes the app may open. The renderer sends a name, never a URL; main maps it to the deep link. */
+export type SettingsPane = 'screen-recording' | 'accessibility' | 'microphone' | 'local-network' | 'login-items' | 'firewall';
 
 export interface HostStep {
   id: HostStepId;
@@ -973,8 +1027,10 @@ export interface AppInfo {
   hostName?: string;
   /** Added by ui builder (additive, optional): local IPv4 addresses for the host screen. */
   localAddresses?: string[];
-  /** Windows only (no --role flag): the user may switch between client and host ('app:role-set'). */
+  /** Windows and macOS (no --role flag): the user may switch between client and host ('app:role-set'). */
   canChooseRole?: boolean;
+  /** False on a Mac older than macOS 14 or not arm64: the host role is then not offered. Absent = supported. */
+  hostSupported?: boolean;
   /** True when `role` came from the stored 'app.role' setting or --role (not the platform default). */
   roleStored?: boolean;
 }
@@ -991,7 +1047,10 @@ export interface HostSetupStatus {
   ok: boolean;
   steps: StepRecord[];
   install: SunshineInstall | null;
+  /** Always false on macOS (nothing there needs elevation). */
   isAdmin: boolean;
+  /** macOS: the bundled Sunshine differs from the installed copy (the host screen offers "Restart Sunshine"). */
+  sunshineUpdate?: { installed: string; bundled: string } | null;
 }
 
 export interface StreamState {
@@ -1053,6 +1112,12 @@ export interface IpcInvokeMap {
   'client:stream-stop': [{ hostId: string }, void];
   'host:setup-status': [void, HostSetupStatus];
   'host:setup-run': [void, HostSetupStatus];
+  /** macOS: open one System Settings pane (the permission onboarding buttons). */
+  'host:open-settings': [{ pane: SettingsPane }, void];
+  /** macOS: the user says whether they granted Accessibility; there is no API to check it for another app. */
+  'host:confirm-input': [{ ok: boolean }, HostSetupStatus];
+  /** macOS: restart Sunshine's LaunchAgent (needed after a grant such as Screen Recording). */
+  'host:sunshine-restart': [void, HostSetupStatus];
   'host:agent-state': [void, AgentState];
   'host:agent-set-auto-approve': [{ on: boolean }, AgentState];
   'host:agent-decide': [{ requestId: string; approve: boolean }, AgentState];
@@ -1101,6 +1166,9 @@ export const IPC_INVOKE_CHANNELS = Object.freeze([
   'client:stream-stop',
   'host:setup-status',
   'host:setup-run',
+  'host:open-settings',
+  'host:confirm-input',
+  'host:sunshine-restart',
   'host:agent-state',
   'host:agent-set-auto-approve',
   'host:agent-decide',

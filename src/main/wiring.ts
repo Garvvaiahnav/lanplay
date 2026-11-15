@@ -2,18 +2,22 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { LANPLAY, SUNSHINE } from '../contracts.js';
-import type { AppInfo, ClientService, DiagnosticsService, HostService, IpcEventChannel, IpcEventMap, Role, SelfCheckReport, ServiceDeps } from '../contracts.js';
+import { LANPLAY, SUNSHINE, SUNSHINE_MAC } from '../contracts.js';
+import type { AppInfo, ClientService, DiagnosticsService, HostSetupStatus, IpcEventChannel, IpcEventMap, Role, SelfCheckReport, ServiceDeps } from '../contracts.js';
 import { createMacClientService } from '../core/client/service.js';
 import { clientDiagnosticsFiles, macSystemInfo, winClientSystemInfo } from '../core/client/diagnostics-client.js';
 import { moonlightLogDir } from '../core/client/platform.js';
 import { writeStoredRole } from '../core/client/role.js';
 import { moonlightCandidates } from '../core/client/moonlight.js';
-import { createDiagnosticsService } from '../core/diagnostics.js';
+import { createDiagnosticsService, readTailText } from '../core/diagnostics.js';
 import { hostDiagnosticsFiles, hostListeners, hostSystemInfo } from '../core/host/diagnostics-host.js';
+import { hostDiagnosticsFilesMac, hostListenersMac } from '../core/host/mac/diagnostics-host-mac.js';
+import { macosMajorFromDarwin, settingsUrl } from '../core/host/mac/permissions-mac.js';
+import { createMacHostService, locateBundledSunshine, teardownMacHost } from '../core/host/mac/service-mac.js';
+import type { MacHostService } from '../core/host/mac/service-mac.js';
 import type { ControllerService } from '../core/controller/service.js';
 import { createWindowsHostService, LazySunshineClient, PINNED_CERT_NAME } from '../core/host/service.js';
-import type { WindowsHostService } from '../core/host/service.js';
+import type { PlatformHostService } from '../core/host/service.js';
 import type { IpcHandlers } from './ipc.js';
 
 export interface WiringEnv {
@@ -34,11 +38,24 @@ export interface WiringEnv {
   relaunch?: (role: Role) => void;
   /** Phone controllers (host role only); main builds it because it needs Electron paths and the elevated setup. */
   controllers?: ControllerService | null;
+  /** Opens a URL in the default handler (main: shell.openExternal). The macOS host screen uses it for System Settings. */
+  openExternal?: (url: string) => Promise<void>;
+  /** The user's home folder and uid, for the macOS LaunchAgents. Default: the real ones (tests pass a temp folder). */
+  home?: string;
+  uid?: number;
 }
+
+/** WindowsHostService predates PlatformHostService and has no Sunshine-update notion, so that method is optional here. */
+export type WiredHostService = Omit<PlatformHostService, 'pendingSunshineUpdate'> & Partial<Pick<PlatformHostService, 'pendingSunshineUpdate'>>;
+
+/** What only the macOS host service can do; the Windows one has no equivalent. */
+export type MacHostControls = Pick<MacHostService, 'confirmInput' | 'restartSunshine'>;
 
 export interface Services {
   client: ClientService | null;
-  host: WindowsHostService | null;
+  host: WiredHostService | null;
+  /** The same object as `host` on a Mac host; absent everywhere else. */
+  macHost?: MacHostControls | null;
   controllers: ControllerService | null;
   diagnostics: DiagnosticsService;
   selfCheck: () => Promise<SelfCheckReport>;
@@ -51,16 +68,45 @@ export function findMoonlight(env: WiringEnv): string | null {
   return list.find((p) => env.fileExists(p)) ?? null;
 }
 
+/** Hosting needs Windows, or an Apple Silicon Mac on a macOS version Sunshine's audio capture supports. */
+export function hostSupported(platform: NodeJS.Platform, arch: string, osRelease: string): boolean {
+  if (platform === 'win32') return true;
+  return platform === 'darwin' && arch === 'arm64' && (macosMajorFromDarwin(osRelease) ?? 0) >= SUNSHINE_MAC.minMacOS;
+}
+
+const macHome = (env: WiringEnv) => env.home ?? os.homedir();
+const macUid = (env: WiringEnv) => env.uid ?? process.getuid?.() ?? 0;
+
+/** Switching a Mac to the client role must leave no Sunshine or pair agent behind (see teardownMacHost). */
+export async function releaseMacHost(env: Pick<WiringEnv, 'role' | 'platform' | 'deps' | 'home' | 'uid'>): Promise<void> {
+  if ((env.platform ?? process.platform) !== 'darwin' || env.role !== 'client') return;
+  await teardownMacHost({ runner: env.deps.runner, log: env.deps.log, home: macHome(env as WiringEnv), uid: macUid(env as WiringEnv) });
+}
+
 export function buildServices(env: WiringEnv): Services {
   const { deps } = env;
+  const platform = env.platform ?? process.platform;
+  const mac = platform === 'darwin';
   const systemRoot = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
   let client: ClientService | null = null;
-  let host: WindowsHostService | null = null;
-  const resolvedPaths: Record<string, unknown> = { selfExe: env.selfExe, role: env.role, systemRoot: env.role === 'host' ? systemRoot : null };
+  let host: WiredHostService | null = null;
+  let macHost: MacHostService | null = null;
+  const resolvedPaths: Record<string, unknown> = { selfExe: env.selfExe, role: env.role, systemRoot: env.role === 'host' && !mac ? systemRoot : null };
   if (env.role === 'client') {
     const ml = findMoonlight(env);
     resolvedPaths.moonlight = ml;
-    client = createMacClientService(deps, { moonlightBinary: ml, platform: env.platform ?? process.platform });
+    client = createMacClientService(deps, { moonlightBinary: ml, platform });
+  } else if (mac) {
+    macHost = createMacHostService(deps, {
+      selfExe: env.selfExe,
+      selfArgsPrefix: env.selfArgsPrefix,
+      home: macHome(env),
+      uid: macUid(env),
+      macOS: { major: macosMajorFromDarwin(os.release()) ?? 0, arch: process.arch },
+    });
+    host = macHost;
+    resolvedPaths.bundledSunshine = locateBundledSunshine(deps.paths.resources);
+    resolvedPaths.pinnedCert = path.join(deps.paths.sharedData, PINNED_CERT_NAME);
   } else {
     host = createWindowsHostService(deps, { selfExe: env.selfExe, selfArgsPrefix: env.selfArgsPrefix, loginItem: env.loginItem, systemRoot });
     resolvedPaths.bundledMsi = path.join(deps.paths.vendorDir, SUNSHINE.msiAsset);
@@ -80,27 +126,41 @@ export function buildServices(env: WiringEnv): Services {
       return pw ? [pw] : [];
     },
     // The elevated setup helper always logs under %ProgramData%\LanPlay\logs, even when this session fell back.
-    ...(env.role === 'host' ? { extraLogDirs: [path.join(deps.paths.sharedData, 'logs')] } : {}),
+    ...(env.role === 'host' && !mac ? { extraLogDirs: [path.join(deps.paths.sharedData, 'logs')] } : {}),
     system: async () => {
-      if (env.role === 'host') return hostSystemInfo({ runner: deps.runner, redactor: deps.log.redactor, paths: deps.paths, systemRoot });
-      return (env.platform ?? process.platform) === 'win32' ? winClientSystemInfo() : macSystemInfo(deps.runner);
+      if (env.role === 'host' && !mac) return hostSystemInfo({ runner: deps.runner, redactor: deps.log.redactor, paths: deps.paths, systemRoot });
+      return platform === 'win32' ? winClientSystemInfo() : macSystemInfo(deps.runner);
     },
-    ...(env.role === 'host' ? { listeners: () => hostListeners({ runner: deps.runner, redactor: deps.log.redactor, paths: deps.paths, systemRoot }) } : {}),
+    ...(env.role === 'host'
+      ? { listeners: () => (mac ? hostListenersMac({ runner: deps.runner }) : hostListeners({ runner: deps.runner, redactor: deps.log.redactor, paths: deps.paths, systemRoot })) }
+      : {}),
     extraFiles: async () => {
-      if (env.role === 'client') return clientDiagnosticsFiles(moonlightLogDir(env.platform ?? process.platform));
+      if (env.role === 'client') return clientDiagnosticsFiles(moonlightLogDir(platform));
       const certPath = path.join(deps.paths.sharedData, PINNED_CERT_NAME);
+      const sunshine = new LazySunshineClient(certPath, () => deps.secrets.get('sunshine-admin-password'), (r) => deps.log.rest(r));
+      if (mac) {
+        return hostDiagnosticsFilesMac({
+          runner: deps.runner,
+          redactor: deps.log.redactor,
+          paths: deps.paths,
+          fs: { exists: env.fileExists, readTail: readTailText },
+          sunshine,
+          home: macHome(env),
+          uid: macUid(env),
+        });
+      }
       return hostDiagnosticsFiles({
         runner: deps.runner,
         redactor: deps.log.redactor,
         paths: deps.paths,
         systemRoot,
         selfExe: env.selfExe,
-        sunshine: new LazySunshineClient(certPath, () => deps.secrets.get('sunshine-admin-password'), (r) => deps.log.rest(r)),
+        sunshine,
         pinnedCertPath: certPath,
       });
     },
   });
-  return { client, host, controllers: env.role === 'host' ? (env.controllers ?? null) : null, diagnostics, selfCheck, resolvedPaths };
+  return { client, host, macHost, controllers: env.role === 'host' ? (env.controllers ?? null) : null, diagnostics, selfCheck, resolvedPaths };
 }
 
 export function localAddresses(): string[] {
@@ -133,6 +193,7 @@ export function buildHandlers(
     logFile: env.deps.log.currentFile(),
     hostName: os.hostname(),
     localAddresses: localAddresses(),
+    hostSupported: hostSupported(process.platform, process.arch, os.release()),
     canChooseRole: env.roleChoice?.canChoose ?? false,
     roleStored: env.roleChoice?.stored ?? true,
   });
@@ -179,10 +240,24 @@ export function buildHandlers(
     };
   }
   const h = s.host!;
+  // The Mac host screen offers "Restart Sunshine" when the bundled copy is newer than the installed one.
+  const withUpdate = async (status: Promise<HostSetupStatus>): Promise<HostSetupStatus> => ({ ...(await status), sunshineUpdate: h.pendingSunshineUpdate?.() ?? null });
+  const macHandlers = (m: MacHostControls): IpcHandlers => ({
+    'host:open-settings': async ({ pane }) => {
+      // The validator checked the name already; the URL still comes from main's own table, never from the renderer.
+      const url = settingsUrl(pane);
+      if (!url) throw new Error('Unknown settings pane.');
+      if (!env.openExternal) throw new Error('System Settings cannot be opened from here.');
+      await env.openExternal(url);
+    },
+    'host:confirm-input': ({ ok }) => withUpdate(m.confirmInput(ok)),
+    'host:sunshine-restart': () => once('sunshine-restart', () => withUpdate(m.restartSunshine())),
+  });
   return {
     ...common,
-    'host:setup-status': () => h.setupStatus(),
-    'host:setup-run': () => once('setup', () => h.runSetup((rec) => push('host:setup-progress', rec))),
+    'host:setup-status': () => withUpdate(h.setupStatus()),
+    'host:setup-run': () => once('setup', () => withUpdate(h.runSetup((rec) => push('host:setup-progress', rec)))),
+    ...(s.macHost ? macHandlers(s.macHost) : {}),
     'host:agent-state': async () => h.agent.getState(),
     'host:agent-set-auto-approve': async ({ on }) => {
       await h.agent.setAutoApprove(on);

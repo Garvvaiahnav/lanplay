@@ -22,6 +22,27 @@
       "notes": "Bundle id com.moonlight-stream.Moonlight, CFBundleShortVersionString 6.2.0, LSMinimumSystemVersion 13.0.0, notarized Developer ID (TeamIdentifier 45U78722YL), spctl: accepted."
     },
     {
+      "id": "sunshine-macos-arm64",
+      "product": "Sunshine",
+      "license": "GPL-3.0",
+      "repo": "https://github.com/LizardByte/Sunshine",
+      "tag": "v2026.914.233613",
+      "sourceCommit": "63d35f702ee9e362e43263742981836ec0710384",
+      "sourceUrl": "https://github.com/LizardByte/Sunshine/archive/refs/tags/v2026.914.233613.tar.gz",
+      "sourceSha256": null,
+      "platform": "darwin",
+      "arch": "arm64",
+      "asset": "Sunshine-macOS-arm64.dmg",
+      "url": "https://github.com/LizardByte/Sunshine/releases/download/v2026.914.233613/Sunshine-macOS-arm64.dmg",
+      "sizeBytes": 40375035,
+      "sha256": "795f03a389c5726f9a7b15f501dc1ddf204b442cae565859ac83aae027a9e07c",
+      "bundleId": "dev.lizardbyte.app.Sunshine",
+      "teamId": "F8XQ7XCN2R",
+      "extract": "hdiutil attach -nobrowse -readonly; ditto Sunshine.app vendor/sunshine-macos-arm64/Sunshine.app",
+      "binary": "Sunshine.app/Contents/MacOS/Sunshine",
+      "notes": "CFBundleShortVersionString 2026.914.233613, Developer ID Application: LizardByte LLC (TeamIdentifier F8XQ7XCN2R), hardened runtime, notarized (spctl: accepted, source Notarized Developer ID; no ticket stapled). SHA256 from the GitHub release asset digest field and re-computed locally. Bundles Qt 6.11.1 (LGPL-3.0). scripts/fetch-vendor.mjs and scripts/after-pack.cjs check the team id. The x86_64 dmg (Sunshine-macOS-x86_64.dmg, 43417393 bytes, sha256 764b11674babac0cd838c2883359207a481c462f355ccbfd1ec91f6d44672101) is not pinned: the Mac build is arm64 only."
+    },
+    {
       "id": "sunshine-windows-msi",
       "product": "Sunshine",
       "license": "GPL-3.0",

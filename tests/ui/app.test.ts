@@ -191,3 +191,69 @@ describe('Windows role chooser (app:role-set)', () => {
     expect([...root.querySelectorAll('button')].some((b) => b.textContent === 'Change role')).toBe(true);
   });
 });
+
+describe('Mac: role chooser reachable from the client screen, never asked on first launch', () => {
+  function macApi(info: Record<string, unknown>) {
+    const a = api();
+    a.handlers['app:info'] = () => ({ role: 'client', version: '1', platform: 'darwin', arch: 'arm64', logFile: '', canChooseRole: true, roleStored: true, ...info });
+    a.handlers['app:role-set'] = () => ({ relaunching: true });
+    return a;
+  }
+  async function boot(a: ReturnType<typeof api>) {
+    const w = window as unknown as { __LANPLAY_NO_AUTOSTART__?: boolean; lanplay?: unknown };
+    document.body.innerHTML = '<div id="app"></div>';
+    w.__LANPLAY_NO_AUTOSTART__ = false;
+    w.lanplay = a;
+    try {
+      LPG.App.boot();
+      await flush();
+    } finally {
+      w.__LANPLAY_NO_AUTOSTART__ = true;
+      delete w.lanplay;
+    }
+    return document.getElementById('app')!;
+  }
+
+  it('opens the client screen straight away, even if main did not mark the role as stored', async () => {
+    const root = await boot(macApi({ roleStored: false }));
+    expect(root.querySelector('button.big')).toBeNull();
+    expect(root.querySelector('.stream-btn')).toBeTruthy();
+  });
+
+  it('Change role leads to a chooser in Mac words; choosing Host stores the role through main', async () => {
+    const a = macApi({});
+    const root = await boot(a);
+    buttonByText(root, 'Change role').click();
+    await flush();
+    const titles = [...root.querySelectorAll('button.big .big-title')].map((t) => t.textContent);
+    expect(titles).toEqual(['Play on this screen', 'This Mac hosts games']);
+    expect(root.textContent).toContain('Play games that run on this computer from another device.');
+    expect(root.textContent).not.toMatch(/gaming PC|This PC/);
+    expect(root.textContent).toContain('What is this Mac for?');
+    (root.querySelectorAll('button.big')[1] as HTMLButtonElement).click();
+    await flush();
+    expect(a.called('app:role-set')).toEqual([{ role: 'host' }]);
+    expect(root.textContent).toMatch(/Restarting LanPlay/);
+  });
+
+  it('a Mac that cannot host (older than macOS 14 or Intel) gets no way into the host role', async () => {
+    const root = await boot(macApi({ hostSupported: false }));
+    expect(root.querySelector('.stream-btn')).toBeTruthy();
+    expect([...root.querySelectorAll('button')].some((b) => b.textContent === 'Change role')).toBe(false);
+  });
+
+  it('the Mac host screen offers Change role back to the client', async () => {
+    const root = await boot(macApi({ role: 'host' }));
+    expect(root.textContent).toMatch(/Set up this Mac/);
+    expect([...root.querySelectorAll('button')].some((b) => b.textContent === 'Change role')).toBe(true);
+  });
+
+  it('Windows chooser words are unchanged', async () => {
+    const a = api();
+    a.handlers['app:info'] = () => ({ role: 'client', version: '1', platform: 'win32', arch: 'x64', logFile: '', canChooseRole: true, roleStored: true });
+    const root = await boot(a);
+    buttonByText(root, 'Change role').click();
+    await flush();
+    expect([...root.querySelectorAll('button.big .big-title')].map((t) => t.textContent)).toEqual(['Play on this screen', 'This PC hosts games']);
+  });
+});

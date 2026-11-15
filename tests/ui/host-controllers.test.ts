@@ -120,3 +120,21 @@ describe('phone controllers card', () => {
     expect(card().textContent).toContain('Port 47921 is already used');
   });
 });
+
+describe('phone controllers card per platform', () => {
+  it('is hidden on a Mac host until the Mac pad backend exists', async () => {
+    setup({ 'app:info': () => ({ role: 'host', version: '0.4.0', platform: 'darwin', arch: 'arm64', logFile: 'x.log', hostName: 'Garvs-Mac' }) });
+    await flush(12);
+    expect(card().hidden).toBe(true);
+  });
+
+  it('stays visible on Windows, and when the platform is unknown', async () => {
+    setup();
+    await flush(12);
+    expect(card().hidden).toBe(false);
+    handle.destroy();
+    setup({ 'app:info': () => { throw new Error('nope'); } });
+    await flush(12);
+    expect(card().hidden).toBe(false);
+  });
+});

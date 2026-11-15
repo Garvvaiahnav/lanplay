@@ -38,12 +38,15 @@ namespace LP.App {
   /** Windows role chooser: stores the role in main; resolves true when main is relaunching in the other role. */
   export interface RoleChooser { choose(mode: Mode): Promise<boolean> }
 
+  /** What the chooser needs to know about this computer: its wording and whether it may host at all. */
+  export interface ChooserEnv { platform?: string; hostSupported?: boolean | undefined }
+
   /**
    * fixedRole: what this computer can be in v1 (main decides: Windows = host, macOS = client, see app:info). When set,
    * the matching screen opens directly: no "what is this computer for?" question whose wrong answer leads to a screen
    * where nothing works. Without it (tests, or app:info failed) the first-run choice is shown.
    */
-  export function start(root: HTMLElement, api: T.Api, store: Store = browserStore(), fixedRole: Mode | null = null, chooser: RoleChooser | null = null): { destroy(): void } {
+  export function start(root: HTMLElement, api: T.Api, store: Store = browserStore(), fixedRole: Mode | null = null, chooser: RoleChooser | null = null, env: ChooserEnv = {}): { destroy(): void } {
     let current: { destroy(): void } | null = null;
 
     function pick(mode: Mode): void {
@@ -65,7 +68,8 @@ namespace LP.App {
       current?.destroy();
       current = null;
       if (!fixedRole) store.set(mode);
-      const opts = fixedRole ? {} : { onSwitchMode: () => show(null), switchLabel: chooser ? 'Change role' : 'Change mode' };
+      // A Mac that cannot host (macOS < 14, Intel) has nothing to switch to, so it gets no link to the chooser.
+      const opts = fixedRole || env.hostSupported === false ? {} : { onSwitchMode: () => show(null), switchLabel: chooser ? 'Change role' : 'Change mode' };
       if (mode === 'client') current = Client.mount(root, api, opts);
       else if (mode === 'host') current = Host.mount(root, api, opts);
       else firstRun();
@@ -74,11 +78,15 @@ namespace LP.App {
     function firstRun(): void {
       const big = (title: string, sub: string, mode: Mode): HTMLButtonElement =>
         h('button', { type: 'button', class: 'big', onClick: () => pick(mode) }, h('span', { class: 'big-title' }, title), h('span', { class: 'big-sub' }, sub));
-      const first = big('Play on this screen', 'This computer connects to a gaming PC and shows its games.', 'client');
+      const mac = env.platform === 'darwin';
+      const first = big('Play on this screen', mac ? 'This Mac connects to another computer and shows its games.' : 'This computer connects to a gaming PC and shows its games.', 'client');
+      const host = mac
+        ? big('This Mac hosts games', 'Play games that run on this computer from another device. LanPlay sets it up for you.', 'host')
+        : big('This PC hosts games', 'This is the gaming PC. LanPlay sets it up for you.', 'host');
       Dom.setChildren(root, [h('main', { class: 'screen first' },
         h('h1', null, 'LanPlay'),
-        h('p', { class: 'lead' }, 'Play PC games on another computer in your home. What is this computer for?'),
-        h('div', { class: 'bigs' }, first, big('This PC hosts games', 'This is the gaming PC. LanPlay sets it up for you.', 'host')))]);
+        h('p', { class: 'lead' }, mac ? 'Play games from one computer on another in your home. What is this Mac for?' : 'Play PC games on another computer in your home. What is this computer for?'),
+        h('div', { class: 'bigs' }, first, host))]);
       first.focus();
     }
 
@@ -100,10 +108,12 @@ namespace LP.App {
     api.invoke('app:info').then(
       (info) => {
         const role = info.role === 'host' || info.role === 'client' ? info.role : null;
-        // Windows: the user picks client or host (first run shows the chooser until main has a stored role).
+        // Windows and macOS: the user picks client or host. Windows shows the chooser on first run until main has a
+        // stored role; a Mac never asks (it keeps opening as a client) and reaches the chooser through "Change role".
         if (info.canChooseRole) {
           const chooser: RoleChooser = { choose: (m) => api.invoke('app:role-set', { role: m }).then((r) => r.relaunching) };
-          return start(root, api, memoryStore(info.roleStored ? role : null), null, chooser);
+          const known = info.roleStored || info.platform === 'darwin';
+          return start(root, api, memoryStore(known ? role : null), null, chooser, { platform: info.platform, hostSupported: info.hostSupported });
         }
         return start(root, api, browserStore(), role);
       },

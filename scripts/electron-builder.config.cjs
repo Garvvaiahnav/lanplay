@@ -1,6 +1,6 @@
 // electron-builder config (use: electron-builder --config scripts/electron-builder.config.cjs ...).
-// macOS: unsigned local build (dir, arm64); Moonlight.app is copied by scripts/after-pack.cjs with `ditto` so its
-//        notarized signature stays intact (no signing step touches it because identity is null).
+// macOS: unsigned local build (dir, arm64); Moonlight.app and Sunshine.app are copied by scripts/after-pack.cjs with `ditto`
+//        so their notarized signatures stay intact (no signing step touches them because identity is null).
 // Windows: portable dir + zip + one-click per-user NSIS setup. Ships Sunshine MSI (host) and portable Moonlight (client). signAndEditExecutable:false avoids rcedit/wine when building on a Mac.
 //          Also ships the phone-controller pieces: ViGEmClient.dll (loaded through koffi) and the ViGEmBus driver installer.
 // koffi (FFI, node_modules/koffi + one prebuilt-binary package per platform, @koromix/koffi-<os>-<arch>): only the Windows
@@ -45,6 +45,10 @@ module.exports = {
     category: 'public.app-category.games',
     identity: null,
     hardenedRuntime: false,
+    extraResources: [
+      // Sunshine.app carries Qt (LGPL-3.0) and other libraries; the notice says where their source and terms are.
+      { from: 'third-party-licenses/Sunshine-macOS-bundled-libraries.txt', to: 'licenses/Sunshine-macOS-bundled-libraries.txt' },
+    ],
     extendInfo: {
       // Without these, macOS silently blocks LAN discovery (Local Network privacy).
       NSLocalNetworkUsageDescription: 'LanPlay looks for your gaming PC on your home network and connects Moonlight to it.',

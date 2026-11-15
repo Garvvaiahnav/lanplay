@@ -1,14 +1,15 @@
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { SUNSHINE } from '../../src/contracts.js';
-import { SUNSHINE_MSI_SHA256 } from '../../src/core/host/vendor.js';
+import { SUNSHINE_MAC_BUNDLE_ID, SUNSHINE_MAC_DMG_SHA256, SUNSHINE_MAC_TEAM_ID, SUNSHINE_MAC_VERSION, SUNSHINE_MSI_SHA256 } from '../../src/core/host/vendor.js';
 
 const ROOT = path.resolve(__dirname, '..', '..');
 const manifest = JSON.parse(readFileSync(path.join(ROOT, 'vendor', 'manifest.json'), 'utf8')) as {
-  artifacts: Array<{ id: string; url: string; sha256: string; asset: string; extracted?: { file: string; sha256: string; sizeBytes: number; requiredExports: string[] } }>;
+  artifacts: Array<{ id: string; url: string; sha256: string; asset: string; tag?: string; sizeBytes?: number; teamId?: string; bundleId?: string; sourceUrl?: string; license?: string; extracted?: { file: string; sha256: string; sizeBytes: number; requiredExports: string[] } }>;
   devTools: Array<{ id: string; sha256: Record<string, string> }>;
 };
 
@@ -27,6 +28,19 @@ describe('vendor pinning', () => {
     const msi = manifest.artifacts.find((a) => a.id === 'sunshine-windows-msi')!;
     expect(msi.asset).toBe(SUNSHINE.msiAsset);
     expect(msi.sha256).toBe(SUNSHINE_MSI_SHA256);
+  });
+  it('the macOS Sunshine pin in code equals vendor/manifest.json', () => {
+    const mac = manifest.artifacts.find((a) => a.id === 'sunshine-macos-arm64')!;
+    expect(mac.asset).toBe('Sunshine-macOS-arm64.dmg');
+    expect(mac.url).toBe(`https://github.com/LizardByte/Sunshine/releases/download/v${SUNSHINE_MAC_VERSION}/${mac.asset}`);
+    expect(mac.tag).toBe(`v${SUNSHINE_MAC_VERSION}`);
+    expect(mac.sha256).toBe(SUNSHINE_MAC_DMG_SHA256);
+    expect(mac.teamId).toBe(SUNSHINE_MAC_TEAM_ID);
+    expect(mac.bundleId).toBe(SUNSHINE_MAC_BUNDLE_ID);
+    expect(mac.license).toBe('GPL-3.0');
+    expect(mac.sourceUrl).toContain(`v${SUNSHINE_MAC_VERSION}`);
+    // same release as the Windows MSI
+    expect(SUNSHINE_MAC_VERSION).toBe(SUNSHINE.version);
   });
   it('every artifact is an allow-listed GitHub release URL with a SHA256', () => {
     const src = readFileSync(path.join(ROOT, 'scripts', 'fetch-vendor.mjs'), 'utf8');
@@ -127,5 +141,37 @@ describe('vendor pinning', () => {
     expect(pkg.scripts['pack:mac']).toMatch(/--mac dir --arm64/);
     // a Windows build made on a Mac needs koffi's win32-x64 package installed first
     expect(pkg.scripts['pack:win']).toContain('node scripts/ensure-koffi-native.mjs win32-x64 && electron-builder');
+  });
+  it('the Mac build ships the Sunshine notices next to the GPL texts', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const cfg = require(path.join(ROOT, 'scripts', 'electron-builder.config.cjs'));
+    expect(cfg.mac.extraResources).toEqual(expect.arrayContaining([{ from: 'third-party-licenses/Sunshine-macOS-bundled-libraries.txt', to: 'licenses/Sunshine-macOS-bundled-libraries.txt' }]));
+    expect(existsSync(path.join(ROOT, 'third-party-licenses', 'Sunshine-macOS-bundled-libraries.txt'))).toBe(true);
+    expect(readFileSync(path.join(ROOT, 'SOURCE-OFFER.md'), 'utf8')).toContain('Sunshine-macOS-arm64.dmg');
+  });
+});
+
+describe('after-pack vendor bundling', () => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const afterPack = require(path.join(ROOT, 'scripts', 'after-pack.cjs')) as {
+    bundleVendorApp(o: { name: string; src: string; binary: string; destDir: string; teamId?: string }): void;
+    parseTeamId(codesignOutput: string): string | undefined;
+  };
+  const tmp = () => mkdtempSync(path.join(tmpdir(), 'lanplay-afterpack-'));
+
+  it('fails the build when Sunshine.app is missing, pointing at fetch-vendor', () => {
+    const dir = tmp();
+    try {
+      expect(() => afterPack.bundleVendorApp({ name: 'Sunshine.app', src: path.join(dir, 'Sunshine.app'), binary: 'Contents/MacOS/Sunshine', destDir: path.join(dir, 'out') })).toThrow(/Sunshine\.app missing.*fetch-vendor/);
+      mkdirSync(path.join(dir, 'Sunshine.app', 'Contents'), { recursive: true }); // present but without its executable
+      expect(() => afterPack.bundleVendorApp({ name: 'Sunshine.app', src: path.join(dir, 'Sunshine.app'), binary: 'Contents/MacOS/Sunshine', destDir: path.join(dir, 'out') })).toThrow(/Sunshine\.app missing/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('reads the team id out of codesign -dv output', () => {
+    expect(afterPack.parseTeamId('Identifier=dev.lizardbyte.app.Sunshine\nTeamIdentifier=F8XQ7XCN2R\nRuntime Version=15.2.0\n')).toBe('F8XQ7XCN2R');
+    expect(afterPack.parseTeamId('TeamIdentifier=not set\n')).toBeUndefined();
+    expect(afterPack.parseTeamId('')).toBeUndefined();
   });
 });

@@ -2,16 +2,17 @@
 // Downloads pinned third-party binaries listed in vendor/manifest.json, verifies SHA256, and extracts them.
 // Only the allow-listed URL prefixes below are accepted (GitHub release assets of five repos, one NuGet package). Nothing downloaded is executed.
 // Usage: node scripts/fetch-vendor.mjs [--ids id1,id2] [--windows] [--verify-only]
-//   default ids on macOS: moonlight-macos,pwsh-macos ; on Windows (or --windows): sunshine-windows-msi,moonlight-windows,
+//   default ids on macOS: moonlight-macos,sunshine-macos-arm64,pwsh-macos ; on Windows (or --windows): sunshine-windows-msi,moonlight-windows,
 //   vigembus-windows-installer,vigemclient-windows-x64
 // Extraction (no shell strings, argv arrays only):
 //   moonlight-macos: hdiutil attach -nobrowse -readonly -> ditto Moonlight.app (keeps the notarized signature) -> detach
+//   sunshine-macos-arm64: same, ditto Sunshine.app, then codesign --verify and the pinned TeamIdentifier (darwin only, skipped elsewhere)
 //   pwsh-macos:      tar -xzf into vendor/pwsh-macos/pwsh-7.7.0 ; chmod +x pwsh
 //   vigemclient-windows-x64: unzip the nupkg into a temp dir, read the CLR resource area of Nefarius.ViGEm.Client.dll (pure
 //                    JS, scripts/pe-tools.mjs), take the embedded x64 native PE, check machine/exports/SHA256, write ViGEmClient.dll
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, createReadStream, createWriteStream, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
@@ -33,7 +34,7 @@ const args = process.argv.slice(2);
 const verifyOnly = args.includes('--verify-only');
 const idsArg = args.indexOf('--ids') >= 0 ? args[args.indexOf('--ids') + 1] : undefined;
 const windows = args.includes('--windows') || process.platform === 'win32';
-const defaultIds = windows ? ['sunshine-windows-msi', 'moonlight-windows', 'vigembus-windows-installer', 'vigemclient-windows-x64'] : ['moonlight-macos', 'pwsh-macos'];
+const defaultIds = windows ? ['sunshine-windows-msi', 'moonlight-windows', 'vigembus-windows-installer', 'vigemclient-windows-x64'] : ['moonlight-macos', 'sunshine-macos-arm64', 'pwsh-macos'];
 const ids = idsArg ? idsArg.split(',') : defaultIds;
 
 const manifest = JSON.parse(readFileSync(join(VENDOR, 'manifest.json'), 'utf8'));
@@ -65,6 +66,31 @@ function checkExtracted(a, buf) {
   return problems;
 }
 
+/** Throws unless the .app's signature is valid and its TeamIdentifier is the pinned one. */
+function verifyAppSignature(app, teamId) {
+  execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app], { stdio: 'inherit' });
+  const info = spawnSync('/usr/bin/codesign', ['-dv', app], { encoding: 'utf8' }); // codesign -dv writes to stderr
+  const got = /^TeamIdentifier=(\S+)$/m.exec(`${info.stdout}${info.stderr}`)?.[1];
+  if (got !== teamId) throw new Error(`${app} is signed by team ${got ?? 'none'}, expected ${teamId}`);
+}
+
+/** Mounts the dmg read-only, copies <name> out with ditto (keeps the notarized signature) and always detaches. */
+function copyAppFromDmg(dmg, name, dest) {
+  const mnt = mkdtempSync(join(tmpdir(), 'lanplay-dmg-'));
+  try {
+    execFileSync('/usr/bin/hdiutil', ['attach', '-nobrowse', '-readonly', '-mountpoint', mnt, dmg], { stdio: 'inherit' });
+    try {
+      execFileSync('/usr/bin/ditto', [join(mnt, name), dest], { stdio: 'inherit' });
+    } finally {
+      // A busy volume (Spotlight, an open Finder window) refuses a plain detach.
+      if (spawnSync('/usr/bin/hdiutil', ['detach', mnt], { stdio: 'inherit' }).status !== 0) spawnSync('/usr/bin/hdiutil', ['detach', '-force', mnt], { stdio: 'inherit' });
+    }
+  } finally {
+    // Not recursive: if the volume is somehow still mounted this fails instead of reaching into it.
+    try { rmdirSync(mnt); } catch (e) { console.warn(`could not remove ${mnt}: ${e.message}`); }
+  }
+}
+
 function extract(a, dest) {
   const dir = join(VENDOR, a.id);
   if (a.id === 'vigemclient-windows-x64') {
@@ -88,15 +114,14 @@ function extract(a, dest) {
     const app = join(dir, 'Moonlight.app');
     if (existsSync(join(app, 'Contents', 'MacOS', 'Moonlight'))) return;
     if (process.platform !== 'darwin') return;
-    const mnt = mkdtempSync(join(tmpdir(), 'lanplay-moonlight-'));
-    execFileSync('/usr/bin/hdiutil', ['attach', '-nobrowse', '-readonly', '-mountpoint', mnt, dest], { stdio: 'inherit' });
-    try {
-      execFileSync('/usr/bin/ditto', [join(mnt, 'Moonlight.app'), app], { stdio: 'inherit' });
-    } finally {
-      execFileSync('/usr/bin/hdiutil', ['detach', mnt], { stdio: 'inherit' });
-    }
+    copyAppFromDmg(dest, 'Moonlight.app', app);
     execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', app], { stdio: 'inherit' });
     console.log(`${a.id}: extracted ${app} (signature verified)`);
+  } else if (a.id === 'sunshine-macos-arm64') {
+    const app = join(dir, 'Sunshine.app');
+    if (!existsSync(join(app, 'Contents', 'MacOS', 'Sunshine'))) copyAppFromDmg(dest, 'Sunshine.app', app);
+    verifyAppSignature(app, a.teamId);
+    console.log(`${a.id}: extracted ${app} (signature verified, team ${a.teamId})`);
   } else if (a.id === 'moonlight-windows') {
     const exe = join(dir, 'Moonlight.exe');
     if (existsSync(exe)) return;
@@ -127,6 +152,7 @@ for (const id of ids) {
   const a = manifest.artifacts.find((x) => x.id === id);
   if (!a) { console.error(`unknown artifact id: ${id}`); failed++; continue; }
   if (!ALLOWED_PREFIXES.some((p) => a.url.startsWith(p))) { console.error(`${id}: URL not on allow-list: ${a.url}`); failed++; continue; }
+  if (a.platform === 'darwin' && process.platform !== 'darwin') { console.log(`${id}: skipped (macOS only)`); continue; }
   const dir = join(VENDOR, id);
   const dest = join(dir, a.asset);
   mkdirSync(dir, { recursive: true });

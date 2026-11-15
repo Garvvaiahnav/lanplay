@@ -17,14 +17,14 @@ import { buildHandlers, buildServices, findMoonlight } from '../../src/main/wiri
 import type { WiringEnv } from '../../src/main/wiring.js';
 
 describe('role resolution', () => {
-  it('flag > stored > platform default; Windows can choose, macOS cannot', () => {
+  it('flag > stored > platform default; Windows and macOS can choose, only Windows is asked', () => {
     expect(defaultRole('darwin')).toBe('client');
     expect(defaultRole('win32')).toBe('host');
     expect(resolveRole({ flag: null, stored: null, platform: 'win32' })).toEqual({ role: 'host', source: 'default', canChoose: true, needsChoice: true });
     expect(resolveRole({ flag: null, stored: 'client', platform: 'win32' })).toEqual({ role: 'client', source: 'stored', canChoose: true, needsChoice: false });
     expect(resolveRole({ flag: 'host', stored: 'client', platform: 'win32' })).toMatchObject({ role: 'host', source: 'flag', canChoose: true, needsChoice: false });
     expect(resolveRole({ flag: null, stored: 'garbage', platform: 'win32' })).toMatchObject({ role: 'host', source: 'default', needsChoice: true });
-    expect(resolveRole({ flag: null, stored: null, platform: 'darwin' })).toEqual({ role: 'client', source: 'default', canChoose: false, needsChoice: false });
+    expect(resolveRole({ flag: null, stored: null, platform: 'darwin' })).toEqual({ role: 'client', source: 'default', canChoose: true, needsChoice: false });
   });
   it('stores only valid roles', () => {
     const s = new MemoryStore();

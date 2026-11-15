@@ -9,7 +9,7 @@ path has not been verified on real hardware yet**; see `SPEC.md` and `docs/WINDO
 Download the latest installer from **Releases**: `LanPlay-Setup-<version>.exe` for Windows. Run it (per-user, no admin
 prompt for LanPlay itself). Windows SmartScreen may say "Windows protected your PC" because the app is unsigned: More info,
 then Run anyway. The first time, pick **Host** on the PC that has the games and **Viewer** on the PC you play from.
-A macOS build (viewer role) is built the same way and published when ready.
+The macOS build (Apple Silicon) can be a viewer or a host: a Mac host runs the bundled Sunshine for macOS under per-user LaunchAgents (see docs/MAC-HOST-DESIGN.md and docs/MAC-HOST-TEST.md). Phone controllers need a virtual gamepad driver, which does not exist on macOS yet, so they work on a Windows host only for now.
 
 ## While streaming
 - Windows key, Alt+Tab and other system keys go to the host PC, not your own computer.
@@ -28,7 +28,7 @@ unsigned is ever run. See `docs/RELEASING.md` for how a release is signed and pu
 - **Windows host or viewer:** `npm ci`, `node scripts/fetch-vendor.mjs --windows`, then
   `npx electron-builder --config scripts/electron-builder.config.cjs --win nsis --x64 --publish never`
   (or `scripts\build-windows.ps1` on Windows).
-- **Mac viewer:** `npm ci && node scripts/fetch-vendor.mjs && npm run pack:mac`, open `release/mac-arm64/LanPlay.app`,
+- **Mac viewer or host:** `npm ci && node scripts/fetch-vendor.mjs && npm run pack:mac`, open `release/mac-arm64/LanPlay.app`,
   allow "Local Network" when macOS asks.
 - Something wrong? **Run self-check**, then **Copy diagnostics** and send the zip
   (CLI: `LanPlay --self-check`, `LanPlay --diagnostics`).

@@ -19,6 +19,7 @@ namespace LP.T {
   export type ControllersState = import('../contracts.js').ControllersState;
   export type SelfCheckReport = import('../contracts.js').SelfCheckReport;
   export type AppInfo = import('../contracts.js').AppInfo;
+  export type SettingsPane = import('../contracts.js').SettingsPane;
   export type Api = import('../contracts.js').LanPlayPreloadApi;
 }
 
@@ -210,11 +211,47 @@ namespace LP.Model {
   export function sunshineSummary(st: T.HostSetupStatus | null): SunshineSummary {
     if (!st) return { installed: null, running: null };
     const byId = (id: string): T.StepRecord | undefined => st.steps.find((s) => s.stepId === id);
-    const svc = byId('service');
+    // macOS has no Windows service: its Sunshine runs as a LaunchAgent.
+    const svc = byId('service') ?? byId('mac-launch-agent');
     const web = byId('web-ui');
     const installed = st.install !== null;
     const running = svc || web ? svc?.status === 'pass' && web?.status !== 'fail' : st.lastRunAt === null ? null : false;
     return { installed, running: running ?? null };
+  }
+
+  /** Button text per System Settings pane. Main owns the deep links; the renderer only ever sends the pane name. */
+  const PANE_LABELS: Record<T.SettingsPane, string> = {
+    'screen-recording': 'Open Screen Recording settings',
+    accessibility: 'Open Accessibility settings',
+    microphone: 'Open Microphone settings',
+    'local-network': 'Open Local Network settings',
+    'login-items': 'Open Login Items settings',
+    firewall: 'Open Firewall settings',
+  };
+
+  export interface StepAction { pane: T.SettingsPane | null; paneLabel: string; confirmInput: boolean; restartSunshine: boolean }
+
+  /** What the user can do about a macOS step (StepRecord.data convention). A step that passed needs nothing. */
+  export function stepAction(s: T.StepRecord): StepAction | null {
+    if (s.status === 'pass') return null;
+    const raw = s.data?.['settingsPane'];
+    const pane = typeof raw === 'string' && Object.prototype.hasOwnProperty.call(PANE_LABELS, raw) ? (raw as T.SettingsPane) : null;
+    const confirmInput = s.data?.['userAction'] === 'confirm-input';
+    const restartSunshine = s.data?.['userAction'] === 'restart-sunshine';
+    return pane || confirmInput || restartSunshine ? { pane, paneLabel: pane ? PANE_LABELS[pane] : '', confirmInput, restartSunshine } : null;
+  }
+
+  /** The screen keeps asking for status while a step is failing on a permission the user can grant in System Settings. */
+  export function waitingForGrant(st: T.HostSetupStatus | null): boolean {
+    return st?.steps.some((s) => s.status === 'fail' && stepAction(s)?.pane) ?? false;
+  }
+
+  export interface SunshineUpdate { installed: string; bundled: string }
+
+  /** HostSetupStatus.sunshineUpdate (macOS): a newer bundled Sunshine than the running copy. Read defensively, it comes over IPC. */
+  export function sunshineUpdate(st: T.HostSetupStatus | null): SunshineUpdate | null {
+    const u = (st as { sunshineUpdate?: Partial<SunshineUpdate> } | null)?.sunshineUpdate;
+    return u && typeof u.installed === 'string' && typeof u.bundled === 'string' ? { installed: u.installed, bundled: u.bundled } : null;
   }
 
   export function statusWord(s: T.StepRecord['status']): string {

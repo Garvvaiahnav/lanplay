@@ -4,6 +4,32 @@ namespace LP.Host {
 
   export interface Handle { destroy(): void }
 
+  /** Wording that differs per platform. Windows is the default until app:info says otherwise. */
+  const WORDS = {
+    win: {
+      nameTitle: 'This PC is called',
+      nameHint: 'The other computer finds this PC by itself. If it cannot, type this name or the IP address there.',
+      sunTitle: 'Sunshine',
+      sunHint: 'Windows will ask for permission once. This installs Sunshine, opens the firewall for your home network and starts it at login. If Sunshine was already installed, its web page login is replaced by one only LanPlay knows.',
+      pairHint: 'You can close this window: LanPlay keeps running in the background so the other computer can connect. To stop it completely, use File > Exit.',
+      install: 'Install and set up',
+      running: 'Setting up. Approve the Windows prompt if it appears.',
+      ready: 'Setup finished. This PC is ready.',
+    },
+    mac: {
+      nameTitle: 'This Mac is called',
+      nameHint: 'The other computer finds this Mac by itself. If it cannot, type this name or the IP address there.',
+      sunTitle: 'Set up this Mac',
+      sunHint: 'This installs a copy of Sunshine for LanPlay and starts it at login. macOS then asks you to let Sunshine record the screen (Screen Recording) and control the keyboard and mouse (Accessibility). The buttons for both appear below.',
+      pairHint: 'You can close this window: LanPlay keeps running in the background so the other computer can connect. To stop it completely, choose LanPlay > Quit LanPlay.',
+      install: 'Set up this Mac',
+      running: 'Setting up. macOS may say "Background items added": that is Sunshine and LanPlay starting at login.',
+      ready: 'Setup finished. This Mac is ready.',
+    },
+  } as const;
+  /** How often to re-read the setup status while a permission is being granted in System Settings. */
+  const GRANT_POLL_MS = 2000;
+
   export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode?: () => void; switchLabel?: string } = {}): Handle {
     let info: T.AppInfo | null = null;
     let status: T.HostSetupStatus | null = null;
@@ -21,6 +47,9 @@ namespace LP.Host {
     let confirmUuid: string | null = null;
     let confirmTimer: ReturnType<typeof setTimeout> | undefined;
     let destroyed = false;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+    let pollBusy = false;
+    let restartBusy = false;
     const unsubs: Array<() => void> = [];
 
     const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -36,6 +65,10 @@ namespace LP.Host {
     const sunshineEl = h('ul', { class: 'chips', 'aria-label': 'Sunshine status' });
     const setupBtn = h('button', { type: 'button', class: 'btn primary' }, 'Set up / Repair');
     const stepsEl = h('ol', { class: 'steps', 'aria-label': 'Setup steps' });
+    const sunHint = h('p', { class: 'hint' });
+    const updateText = h('span', null);
+    const restartBtn = h('button', { type: 'button', class: 'btn primary' }, 'Restart Sunshine');
+    const updateBanner = h('div', { class: 'banner', role: 'status', hidden: true }, updateText, restartBtn);
     const adminWarn = h('p', { class: 'hint err', role: 'status', hidden: true }, 'LanPlay was started with "Run as administrator". That is not needed and can lock its settings files for normal starts. Close LanPlay and start it normally (double-click); setup asks Windows for permission by itself.');
     const autoSwitch = Dom.toggle('Auto-approve devices on my network', (on) => {
       api.invoke('host:agent-set-auto-approve', { on }).then(setAgent, (e: unknown) => {
@@ -62,21 +95,27 @@ namespace LP.Host {
     const diagBtn = h('button', { type: 'button', class: 'btn' }, 'Copy diagnostics');
     const diagEl = h('p', { class: 'hint', role: 'status', 'aria-live': 'polite' });
 
-    const card = (id: string, title: string, ...kids: Dom.Child[]): HTMLElement =>
-      h('section', { class: 'card', 'aria-labelledby': id }, h('h2', { id }, title), ...kids);
+    // The headings that read differently per platform are kept so render() can reword them.
+    const nameTitle = h('h2', { id: 'h-name' }, 'This PC is called');
+    const nameHint = h('p', { class: 'hint' });
+    const sunTitle = h('h2', { id: 'h-sun' }, 'Sunshine');
+    const pairHint = h('p', { class: 'hint' });
+    const card = (id: string, title: string | HTMLElement, ...kids: Dom.Child[]): HTMLElement =>
+      h('section', { class: 'card', 'aria-labelledby': id }, typeof title === 'string' ? h('h2', { id }, title) : title, ...kids);
+    const padCard = card('h-pad', 'Phone controllers', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Let phones act as game controllers'), padSwitch.el), padLine,
+      h('div', { class: 'row' }, padDriverBtn, padNewLinkBtn), padLinksEl, padPlayersEl,
+      h('p', { class: 'hint' }, 'Open the link on each phone (same Wi-Fi) or scan the code. Each phone becomes its own Xbox controller on this PC. On the phone, tap Edit to move buttons, change sensitivity and save layouts; they are kept on this PC. "New link" stops old links from working.'));
 
     const screen = h('main', { class: 'screen' },
       h('header', { class: 'top' }, h('h1', null, 'LanPlay host'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, opts.switchLabel ?? 'Change mode') : null),
       noteEl,
-      card('h-name', 'This PC is called', h('div', { class: 'row' }, hostNameEl, copyNameBtn), h('p', { class: 'hint' }, 'The other computer finds this PC by itself. If it cannot, type this name or the IP address there.')),
-      card('h-sun', 'Sunshine', sunshineEl, h('div', { class: 'row' }, setupBtn), h('p', { class: 'hint' }, 'Windows will ask for permission once. This installs Sunshine, opens the firewall for your home network and starts it at login. If Sunshine was already installed, its web page login is replaced by one only LanPlay knows.'), adminWarn, stepsEl),
+      card('h-name', nameTitle, h('div', { class: 'row' }, hostNameEl, copyNameBtn), nameHint),
+      card('h-sun', sunTitle, sunshineEl, h('div', { class: 'row' }, setupBtn), sunHint, updateBanner, adminWarn, stepsEl),
       card('h-pair', 'Pairing', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Auto-approve devices on my network'), autoSwitch.el),
         h('p', { class: 'hint' }, 'On: any computer on your home network can pair without a code. Off: you approve each one here.'), agentLine,
-        h('p', { class: 'hint' }, 'You can close this window: LanPlay keeps running in the background so the other computer can connect. To stop it completely, use File > Exit.'), pendingEl),
+        pairHint, pendingEl),
       card('h-dev', 'Paired devices', devicesEl),
-      card('h-pad', 'Phone controllers', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Let phones act as game controllers'), padSwitch.el), padLine,
-        h('div', { class: 'row' }, padDriverBtn, padNewLinkBtn), padLinksEl, padPlayersEl,
-        h('p', { class: 'hint' }, 'Open the link on each phone (same Wi-Fi) or scan the code. Each phone becomes its own Xbox controller on this PC. On the phone, tap Edit to move buttons, change sensitivity and save layouts; they are kept on this PC. "New link" stops old links from working.')),
+      padCard,
       card('h-health', 'Health', h('div', { class: 'row' }, checkBtn, diagBtn), h('p', { class: 'hint' }, 'If something does not work, press Copy diagnostics and send the zip file.'), diagEl, checkEl));
     Dom.setChildren(root, [screen]);
 
@@ -86,15 +125,29 @@ namespace LP.Host {
       return h('li', { class: 'chip' }, h('span', { class: 'dot ' + dot, 'aria-hidden': 'true' }), label + ': ' + word);
     }
 
-    function stepRow(s: T.StepRecord): HTMLElement {
+    /** `actionable`: macOS setup steps that the user has to finish in System Settings get their buttons. */
+    function stepRow(s: T.StepRecord, actionable = false): HTMLElement {
+      const act = actionable ? Model.stepAction(s) : null;
       return h('li', { class: 'step ' + s.status },
         h('span', { class: 'badge ' + s.status }, Model.statusWord(s.status)),
         h('span', { class: 'stitle' }, s.title),
-        s.message ? h('span', { class: 'smsg' }, s.message) : null);
+        s.message ? h('span', { class: 'smsg' }, s.message) : null,
+        act ? h('span', { class: 'sactions' },
+          act.pane ? h('button', { type: 'button', class: 'btn', onClick: () => openSettings(act.pane as T.SettingsPane) }, act.paneLabel) : null,
+          act.confirmInput ? h('button', { type: 'button', class: 'btn primary', onClick: confirmInput }, 'I did this') : null,
+          act.restartSunshine ? h('button', { type: 'button', class: 'btn primary', disabled: restartBusy, onClick: () => void restartSunshine() }, 'Restart Sunshine') : null) : null);
     }
 
     function render(): void {
       if (destroyed) return;
+      const mac = isMac();
+      const w = mac ? WORDS.mac : WORDS.win;
+      nameTitle.textContent = w.nameTitle;
+      nameHint.textContent = w.nameHint;
+      sunTitle.textContent = w.sunTitle;
+      sunHint.textContent = w.sunHint;
+      pairHint.textContent = w.pairHint;
+      padCard.hidden = mac; // the Mac has no virtual gamepad backend yet
       noteEl.textContent = note;
       noteEl.className = 'status' + (noteIsError ? ' error-text' : '');
       hostNameEl.textContent = info?.hostName ?? '(unknown)';
@@ -103,10 +156,17 @@ namespace LP.Host {
       // No "Administrator rights" chip: LanPlay should NOT be run as administrator (setup asks Windows once); a yellow
       // "no" there only invites people to do exactly that. Admin status is still recorded in self-check and diagnostics.
       Dom.setChildren(sunshineEl, [chip('Installed', sum.installed), chip('Running', sum.running)]);
-      adminWarn.hidden = status?.isAdmin !== true;
+      adminWarn.hidden = mac || status?.isAdmin !== true;
       setupBtn.disabled = setupBusy;
-      setupBtn.textContent = setupBusy ? 'Working...' : sum.installed ? 'Set up / Repair' : 'Install and set up';
-      Dom.setChildren(stepsEl, (setupBusy || live.length > 0 ? live : []).map(stepRow));
+      setupBtn.textContent = setupBusy ? 'Working...' : sum.installed ? 'Set up / Repair' : w.install;
+      // On a Mac the permission buttons must be there after a relaunch too, so the last stored run is shown, not only a live one.
+      const shown = mac && !setupBusy ? status?.steps ?? [] : setupBusy || live.length > 0 ? live : [];
+      Dom.setChildren(stepsEl, shown.map((s) => stepRow(s, mac)));
+      const update = mac ? Model.sunshineUpdate(status) : null;
+      updateBanner.hidden = !update;
+      if (update) updateText.textContent = 'Sunshine update ready. Version ' + update.bundled + ' is waiting; this Mac still runs ' + update.installed + '. Restarting Sunshine ends a stream that is running.';
+      restartBtn.disabled = restartBusy;
+      restartBtn.textContent = restartBusy ? 'Restarting...' : 'Restart Sunshine';
       autoSwitch.set(agent?.autoApprove ?? true);
       agentLine.textContent = agent ? (agent.listening ? 'Pair agent is listening on port ' + agent.port + '.' : 'Pair agent is not running.' + (agent.lastError ? ' ' + agent.lastError : '')) : '';
       Dom.setChildren(pendingEl, (agent?.pending ?? []).map((p) =>
@@ -121,10 +181,50 @@ namespace LP.Host {
       renderPad();
       checkBtn.disabled = checkBusy;
       checkBtn.textContent = checkBusy ? 'Checking...' : 'Run self-check';
-      Dom.setChildren(checkEl, report ? [h('li', { class: 'step ' + (report.ok ? 'pass' : 'fail') }, h('span', { class: 'stitle' }, report.ok ? 'All checks passed' : 'Some checks failed')), ...report.steps.map(stepRow)] : []);
+      Dom.setChildren(checkEl, report ? [h('li', { class: 'step ' + (report.ok ? 'pass' : 'fail') }, h('span', { class: 'stitle' }, report.ok ? 'All checks passed' : 'Some checks failed')), ...report.steps.map((s) => stepRow(s))] : []);
       diagBtn.disabled = diagBusy;
       diagBtn.textContent = diagBusy ? 'Collecting...' : 'Copy diagnostics';
       Dom.setChildren(diagEl, diagPath ? ['Saved: ' + diagPath + ' ', h('button', { type: 'button', class: 'link', onClick: () => void reveal() }, 'Show file')] : []);
+      syncPoll();
+    }
+
+    function isMac(): boolean {
+      return info?.platform === 'darwin';
+    }
+
+    function adopt(s: T.HostSetupStatus): void {
+      status = s;
+      render();
+    }
+
+    /** Sunshine only gets the Screen Recording grant after macOS restarts it, so the screen re-reads the status until the step passes. */
+    function syncPoll(): void {
+      const want = isMac() && Model.waitingForGrant(status);
+      if (want && pollTimer === undefined) pollTimer = setInterval(() => void poll(), GRANT_POLL_MS);
+      else if (!want && pollTimer !== undefined) {
+        clearInterval(pollTimer);
+        pollTimer = undefined;
+      }
+    }
+
+    async function poll(): Promise<void> {
+      if (pollBusy || setupBusy) return;
+      pollBusy = true;
+      try {
+        adopt(await api.invoke('host:setup-status'));
+      } catch {
+        /* Sunshine may be restarting; the next tick tries again. */
+      } finally {
+        pollBusy = false;
+      }
+    }
+
+    function openSettings(pane: T.SettingsPane): void {
+      api.invoke('host:open-settings', { pane }).catch((e: unknown) => say('Could not open System Settings: ' + msg(e), true));
+    }
+
+    function confirmInput(): void {
+      api.invoke('host:confirm-input', { ok: true }).then(adopt, (e: unknown) => say('Could not save that: ' + msg(e), true));
     }
 
     function renderPad(): void {
@@ -208,11 +308,14 @@ namespace LP.Host {
     setupBtn.addEventListener('click', async () => {
       setupBusy = true;
       live = [];
-      say('Setting up. Approve the Windows prompt if it appears.');
+      say((isMac() ? WORDS.mac : WORDS.win).running);
       try {
         status = await api.invoke('host:setup-run');
         live = status.steps;
-        say(status.ok ? 'Setup finished. This PC is ready.' : 'Setup finished with problems. See the steps below, then press Copy diagnostics.', !status.ok);
+        const todo = status.steps.some((s) => Model.stepAction(s));
+        const broken = status.steps.some((s) => s.status === 'fail' && !Model.stepAction(s));
+        if (isMac() && todo && !broken) say('Setup finished. Allow Sunshine in System Settings with the buttons below to finish.');
+        else say(status.ok ? (isMac() ? WORDS.mac : WORDS.win).ready : 'Setup finished with problems. See the steps below, then press Copy diagnostics.', !status.ok);
       } catch (e) {
         say('Setup failed: ' + msg(e), true);
       } finally {
@@ -220,6 +323,21 @@ namespace LP.Host {
         render();
       }
     });
+    async function restartSunshine(): Promise<void> {
+      if (restartBusy) return;
+      restartBusy = true;
+      render();
+      try {
+        adopt(await api.invoke('host:sunshine-restart'));
+        say('Sunshine restarted.');
+      } catch (e) {
+        say('Could not restart Sunshine: ' + msg(e), true);
+      } finally {
+        restartBusy = false;
+        render();
+      }
+    }
+    restartBtn.addEventListener('click', () => void restartSunshine());
     checkBtn.addEventListener('click', async () => {
       checkBusy = true;
       render();
@@ -300,6 +418,7 @@ namespace LP.Host {
     return {
       destroy() {
         destroyed = true;
+        if (pollTimer !== undefined) clearInterval(pollTimer);
         if (confirmTimer) clearTimeout(confirmTimer);
         for (const u of unsubs) u();
         Dom.clear(root);
