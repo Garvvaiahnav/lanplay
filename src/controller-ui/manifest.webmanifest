@@ -1,0 +1,10 @@
+{
+  "name": "LanPlay Controller",
+  "short_name": "LanPlay",
+  "description": "Use your phone as a game controller for your PC.",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#0b0d12",
+  "theme_color": "#0b0d12",
+  "icons": [{ "src": "apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any" }]
+}

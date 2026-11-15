@@ -36,9 +36,11 @@ const STATIC: Record<string, { file: string; type: string }> = {
   '/controller.js': { file: 'controller.js', type: 'text/javascript; charset=utf-8' },
   '/controller.css': { file: 'controller.css', type: 'text/css; charset=utf-8' },
   '/apple-touch-icon.png': { file: 'apple-touch-icon.png', type: 'image/png' },
+  // Home-screen install info; contains no token, so it is served like the other static files.
+  '/manifest.webmanifest': { file: 'manifest.webmanifest', type: 'application/manifest+json; charset=utf-8' },
 };
 
-const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; manifest-src 'self'; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const HELLO_TIMEOUT_MS = 5000;
 const MAX_SOCKETS = 8;
 const MAX_SOCKETS_PER_IP = 6;

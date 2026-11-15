@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; manifest-src 'self'">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#0b0d12">
   <meta name="color-scheme" content="dark">
@@ -14,6 +14,7 @@
   <title>LanPlay Controller</title>
   <link rel="icon" href="data:,">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
   <link rel="stylesheet" href="controller.css">
   <script src="controller.js" defer></script>
 </head>
@@ -40,6 +41,25 @@
   <div id="notice" class="overlay" role="alert" hidden>
     <p id="notice-text" class="overlay-title"></p>
     <button type="button" id="retry" class="action" hidden>Try again</button>
+  </div>
+
+  <!-- Shown once on an iPhone that has not added the page yet, and again from the settings card. Above the rotate overlay: the
+       steps are easiest in portrait. -->
+  <div id="a2hs" class="overlay sheet" role="dialog" aria-modal="true" aria-labelledby="a2hs-title" hidden>
+    <h2 id="a2hs-title" class="overlay-title">Add to Home Screen</h2>
+    <ol class="sheet-steps">
+      <li>Tap the Share button
+        <svg class="share-glyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path d="M12 15V3M8 7l4-4 4 4M7 10H6a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-9a1 1 0 0 0-1-1h-1"></path>
+        </svg>
+        (on iOS 26 it is in the &#x22ef; menu)
+      </li>
+      <li>Choose &ldquo;Add to Home Screen&rdquo;</li>
+      <li>Tap Add</li>
+    </ol>
+    <p class="overlay-sub">Opens full screen with no address bar. If you make a New link on the PC, add it again.</p>
+    <p class="overlay-sub">In landscape Safari may hide its toolbar, so do this in portrait or from the address-bar menu.</p>
+    <button type="button" id="a2hs-close" class="action">Close</button>
   </div>
 
   <div id="rotate" class="overlay rotate-overlay">

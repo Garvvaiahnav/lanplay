@@ -165,6 +165,7 @@ function installFetch(): void {
 }
 
 let portraitNow = false;
+let standaloneNow = false;
 let mqListeners = new Set<() => void>();
 function setPortrait(v: boolean): void {
   portraitNow = v;
@@ -257,9 +258,10 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date', 'performance'] });
   installFetch();
   vi.stubGlobal('WebSocket', FakeSocket);
-  vi.stubGlobal('matchMedia', () => ({
+  standaloneNow = false;
+  vi.stubGlobal('matchMedia', (query: string) => ({
     get matches() {
-      return portraitNow;
+      return query.includes('standalone') ? standaloneNow : portraitNow;
     },
     addEventListener: (_t: string, cb: () => void) => mqListeners.add(cb),
     removeEventListener: (_t: string, cb: () => void) => mqListeners.delete(cb),
@@ -278,6 +280,7 @@ afterEach(() => {
   delete (document as Any).visibilityState;
   delete (navigator as Any).vibrate;
   delete (navigator as Any).userAgent;
+  delete (navigator as Any).standalone;
   document.body.innerHTML = '';
   document.body.className = '';
 });
@@ -322,7 +325,7 @@ describe('index.html, controller.css and the emitted script', () => {
 
   it('has the CSP, the iPhone meta tags and the icon link; no inline script, style or handlers', () => {
     expect(/Content-Security-Policy" content="([^"]+)"/.exec(html)?.[1]).toBe(
-      "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'",
+      "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; manifest-src 'self'",
     );
     const viewport = /name="viewport" content="([^"]+)"/.exec(html)?.[1] ?? '';
     expect(viewport).toMatch(/viewport-fit=cover/);
@@ -333,7 +336,7 @@ describe('index.html, controller.css and the emitted script', () => {
     expect(html).toMatch(/name="apple-mobile-web-app-status-bar-style" content="black-translucent"/);
     expect(html).toMatch(/name="apple-mobile-web-app-title" content="LanPlay"/);
     expect(html).toMatch(/<link rel="apple-touch-icon" href="apple-touch-icon\.png">/);
-    expect(html).not.toMatch(/rel="manifest"/);
+    expect(html).toMatch(/<link rel="manifest" href="manifest\.webmanifest">/);
     expect(html).toMatch(/<link rel="stylesheet" href="controller\.css">/);
     expect([...html.matchAll(/<script\b[^>]*>/g)].map((m) => m[0])).toEqual(['<script src="controller.js" defer>']);
     expect(html).not.toMatch(/<style|\sstyle=|\son[a-z]+\s*=|https?:\/\//i);
@@ -439,19 +442,16 @@ describe('coerceStore', () => {
     expect(s.layouts[0].controls[0]).toMatchObject({ type: 'button', button: 'A', x: 100, w: LIMITS.size.min });
     expect(s.layouts[0].controls[1]).toMatchObject({ type: 'dpad', size: 26 });
   });
-  it('forces the fixed values and keeps everything the simple editor does not touch', () => {
+  it('keeps every stored value: nothing is forced back to a default, and the store stays a sanitizer fixed point', () => {
     const s = T.coerceStore(oldStore()) as LayoutStore;
-    expect(s.layouts).toHaveLength(LIMITS.layouts); // extras are kept, untouched
+    expect(s).toEqual(oldStore());
+    expect(s.layouts).toHaveLength(LIMITS.layouts);
     expect(s.activeId).toBe('old-1');
-    for (const l of s.layouts) {
-      for (const c of l.controls) {
-        if (c.type === 'button') expect(c).toMatchObject({ latch: false, turbo: false, value: 255 });
-        if (c.type === 'stick') expect(c).toMatchObject({ mode: 'fixed', curve: 'linear', invertX: false, invertY: false, deadzone: 0.1, doubleTapClick: true, sensitivity: 2.5 });
-        if (c.type === 'dpad') expect(c.diagonals).toBe(true);
-      }
-    }
-    const a = s.layouts[0]?.controls.find((c) => c.id === 'btn-a');
-    expect(a).toMatchObject({ label: 'Jump', shape: 'circle', w: 16, h: 16 }); // shape and label render as stored
+    const c = (id: string) => s.layouts[0]?.controls.find((x) => x.id === id);
+    expect(c('btn-lt')).toMatchObject({ latch: true, turbo: true, value: 90 });
+    expect(c('stick-left')).toMatchObject({ mode: 'floating', curve: 'aggressive', invertX: true, invertY: true, deadzone: 0.4, doubleTapClick: false, sensitivity: 2.5 });
+    expect(c('dpad')).toMatchObject({ diagonals: false });
+    expect(c('btn-a')).toMatchObject({ label: 'Jump', shape: 'circle', w: 16, h: 16 });
     fixedPoint(s);
   });
 });
@@ -567,6 +567,126 @@ describe('layout operations', () => {
     let many = base();
     while (many.layouts.length < LIMITS.layouts) many = T.addSlot(many, planStore().layouts[0]);
     expect(T.addSlot(many, planStore().layouts[0])).toBe(many);
+  });
+});
+
+describe('control operations behind the More panel', () => {
+  const ctl = (st: LayoutStore, id: string): Any => T.activeLayout(st).controls.find((c: { id: string }) => c.id === id);
+
+  it('setProps writes validated values (clamped, unknown keys ignored) and every result is a sanitizer fixed point', () => {
+    let st = T.setProps(planStore(), 'btn-a', { latch: true, shape: 'pill', w: 3, label: 'Jumping!', bogus: 1 });
+    expect(ctl(st, 'btn-a')).toMatchObject({ latch: true, shape: 'pill', w: LIMITS.size.min, label: 'Jumpin' });
+    expect(ctl(st, 'btn-a').bogus).toBeUndefined();
+    fixedPoint(st);
+    st = T.setProps(st, 'stick-left', { deadzone: 0.9, sensitivity: 9, curve: 'nope', invertX: true, mode: 'floating', stick: 'right', doubleTapClick: false });
+    expect(ctl(st, 'stick-left')).toMatchObject({ deadzone: 0.5, sensitivity: 3, curve: 'linear', invertX: true, mode: 'floating', stick: 'right', doubleTapClick: false });
+    st = T.setProps(st, 'dpad', { diagonals: false });
+    expect(ctl(st, 'dpad').diagonals).toBe(false);
+    st = T.setProps(st, 'btn-lt', { value: 1000 });
+    expect(ctl(st, 'btn-lt').value).toBe(255);
+    fixedPoint(st);
+  });
+
+  it('is a no-op (the same store) for nothing to change, an unknown control or a wrong kind of property', () => {
+    const st = planStore();
+    expect(T.setProps(st, 'btn-a', { latch: false })).toBe(st);
+    expect(T.setProps(st, 'nope', { latch: true })).toBe(st);
+    expect(T.setProps(st, 'dpad', { latch: true, label: 'x' })).toBe(st);
+    expect(T.setProps(st, 'btn-a', { shape: 'blob' })).toBe(st);
+  });
+
+  it('a new mapping renames the button, unless the player gave it a label of their own', () => {
+    let st = T.setProps(planStore(), 'btn-a', { button: 'B' });
+    expect(ctl(st, 'btn-a')).toMatchObject({ button: 'B', label: 'B' });
+    st = T.setProps(T.setProps(planStore(), 'btn-a', { label: 'Jump' }), 'btn-a', { button: 'X' });
+    expect(ctl(st, 'btn-a')).toMatchObject({ button: 'X', label: 'Jump' });
+    st = T.setProps(planStore(), 'btn-start', { button: 'BACK' });
+    expect(ctl(st, 'btn-start')).toMatchObject({ button: 'BACK', label: 'Back' });
+    st = T.setProps(planStore(), 'btn-a', { button: 'Y', label: 'Fire' });
+    expect(ctl(st, 'btn-a').label).toBe('Fire');
+    st = T.setProps(T.setProps(planStore(), 'btn-a', { label: 'Jump' }), 'btn-a', { label: '' });
+    expect(ctl(st, 'btn-a').label).toBe('A'); // an empty label is the button's own name
+    fixedPoint(st);
+  });
+
+  it('a circle is always round: choosing it squares the button to its height', () => {
+    const st = T.setProps(planStore(), 'btn-lt', { shape: 'circle' });
+    expect(ctl(st, 'btn-lt')).toMatchObject({ shape: 'circle', w: 13, h: 13 });
+    const pill = T.setProps(planStore(), 'btn-a', { shape: 'pill' });
+    expect(ctl(pill, 'btn-a')).toMatchObject({ shape: 'pill', w: 16, h: 16 });
+  });
+
+  it('a wider control is pulled back on screen', () => {
+    const st = T.setProps(planStore(), 'btn-rt', { w: 40 }, 2);
+    expect(ctl(st, 'btn-rt').x).toBeLessThanOrEqual(100 - 40 / 2 / 2);
+  });
+
+  it('Mode is one of Hold / Toggle / Rapid fire, and the stored flags map onto it', () => {
+    expect(T.modePatch('hold')).toEqual({ latch: false, turbo: false });
+    expect(T.modePatch('toggle')).toEqual({ latch: true, turbo: false });
+    expect(T.modePatch('rapid')).toEqual({ latch: false, turbo: true });
+    expect(T.buttonMode({ latch: false, turbo: false })).toBe('hold');
+    expect(T.buttonMode({ latch: true, turbo: false })).toBe('toggle');
+    expect(T.buttonMode({ latch: false, turbo: true })).toBe('rapid');
+    expect(T.buttonMode({ latch: true, turbo: true })).toBe('toggle'); // both stored: the toggle shows, picking any one normalises
+  });
+
+  it('addControl puts a new control in the middle: the first free button, the free side of a stick; null when the layout is full', () => {
+    const base = planStore();
+    const b = T.addControl(base, 'button');
+    expect(ctl(b.store, b.id)).toMatchObject({ type: 'button', x: 50, y: 50, button: 'L3' }); // the ten stock buttons are taken; L3 is the first free name
+    expect(T.activeLayout(b.store).controls).toHaveLength(14);
+    const s = T.addControl(T.setProps(base, 'stick-right', { stick: 'left' }), 'stick');
+    expect(ctl(s.store, s.id)).toMatchObject({ type: 'stick', stick: 'right', x: 50, y: 50 }); // the left one is taken
+    const d = T.addControl(base, 'dpad');
+    expect(ctl(d.store, d.id)).toMatchObject({ type: 'dpad', size: 26, diagonals: true });
+    expect(new Set(T.activeLayout(d.store).controls.map((c: Any) => c.id)).size).toBe(14); // unique ids
+    for (const r of [b, s, d]) fixedPoint(r.store);
+    let full = base;
+    for (let i = T.activeLayout(base).controls.length; i < LIMITS.controls; i++) full = T.addControl(full, 'dpad').store;
+    expect(T.activeLayout(full).controls).toHaveLength(LIMITS.controls);
+    expect(T.addControl(full, 'button')).toBeNull();
+    expect(T.duplicateControl(full, 'dpad')).toBeNull();
+    fixedPoint(full);
+  });
+
+  it('duplicateControl copies a control a little aside under a new id; deleteControl removes it', () => {
+    const base = planStore();
+    const r = T.duplicateControl(base, 'btn-a');
+    expect(r.id).not.toBe('btn-a');
+    expect(ctl(r.store, r.id)).toMatchObject({ ...ctl(base, 'btn-a'), id: r.id, x: 89, y: 82.5 });
+    fixedPoint(r.store);
+    const again = T.duplicateControl(r.store, 'btn-a');
+    expect(new Set(T.activeLayout(again.store).controls.map((c: Any) => c.id)).size).toBe(15);
+    expect(T.duplicateControl(base, 'nope')).toBeNull();
+    const gone = T.deleteControl(r.store, r.id);
+    expect(T.activeLayout(gone).controls).toHaveLength(13);
+    expect(T.deleteControl(base, 'nope')).toBe(base);
+    expect(T.deleteControl(base, 'btn-a')).not.toBe(base);
+  });
+
+  it('the Width / Height range keeps a stored value, a wrapped choice row is a label plus lines of chips, a floating stick has a bigger touch area', () => {
+    expect(T.dimRange(20)).toEqual({ min: 8, max: 40 });
+    expect(T.dimRange(5)).toEqual({ min: 5, max: 40 });
+    expect(T.dimRange(60)).toEqual({ min: 8, max: 60 });
+    expect(T.gridHeight(12)).toBe(24 + 2 * 44 + 6);
+    expect(T.gridHeight(6)).toBe(24 + 44);
+    const stick = ctl(planStore(), 'stick-left');
+    expect(T.controlBox(stick)).toEqual([38, 38]);
+    expect(T.controlBox({ ...stick, mode: 'floating' })).toEqual([38 * T.FLOATING_ZONE, 38 * T.FLOATING_ZONE]);
+  });
+
+  it('cardHeight is the padding plus the rows, never taller than the room (the card scrolls then)', () => {
+    expect(T.cardHeight([44, 44, 44], 1000)).toBe(T.CARD_PAD + 132);
+    expect(T.cardHeight([44, 44, 44, 44, 44, 44, 44, 44], 300)).toBe(300);
+    expect(T.cardHeight([44], -50)).toBe(44);
+  });
+
+  it('floatingCentre follows the finger but keeps the whole base inside the touch area', () => {
+    expect(T.floatingCentre(110, 100, 60, 40)).toBe(110);
+    expect(T.floatingCentre(500, 100, 60, 40)).toBe(120);
+    expect(T.floatingCentre(-500, 100, 60, 40)).toBe(80);
+    expect(T.floatingCentre(500, 100, 30, 40)).toBe(100); // a base bigger than its area stays put
   });
 });
 
@@ -763,28 +883,27 @@ describe('haptic decisions', () => {
     expect(T.androidStickStep(r.s, 0.05, 1130)).toMatchObject({ vibrate: null, wait: null });
   });
 
-  it('iOS strength is rate: none under 0.2, 4 Hz rising to 18 Hz, never faster than every 55 ms', () => {
-    expect(T.iosStickInterval(0.19)).toBeNull();
-    expect(T.iosStickInterval(0.2)).toBeCloseTo(250, 5);
-    expect(T.iosStickInterval(1)).toBeCloseTo(1000 / 18, 0);
-    expect(T.iosStickInterval(1)).toBeGreaterThanOrEqual(55);
-    let prev = Infinity;
-    for (let d = 0.2; d <= 1; d += 0.05) {
-      const iv = T.iosStickInterval(d) as number;
-      expect(iv).toBeLessThanOrEqual(prev);
-      expect(iv).toBeGreaterThanOrEqual(55);
-      prev = iv;
-    }
+  it('knows iOS devices, including an iPad that says it is a Mac', () => {
+    expect(T.isIosDevice(IPHONE_UA, 5)).toBe(true);
+    expect(T.isIosDevice('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15', 5)).toBe(true);
+    expect(T.isIosDevice('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15', 0)).toBe(false);
+    expect(T.isIosDevice('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5)).toBe(false);
   });
 
-  it('iOS gate: sticks wait for their interval and the global 25 ms; buttons obey only the 25 ms', () => {
-    const gate = { lastAny: 1000, nextStickDue: 1100 };
-    expect(T.iosStickDecision(gate, 0.1, 2000)).toEqual({ fire: false, wait: null });
-    expect(T.iosStickDecision(gate, 1, 1050)).toMatchObject({ fire: false, wait: 50 });
-    expect(T.iosStickDecision(gate, 1, 1100).fire).toBe(true);
-    expect(T.iosStickDecision({ lastAny: 1090, nextStickDue: 1000 }, 1, 1100)).toMatchObject({ fire: false, wait: 15 });
-    expect(T.buttonTickAllowed(gate, 1024)).toBe(false);
-    expect(T.buttonTickAllowed(gate, 1025)).toBe(true);
+  it('Add to Home Screen: the steps on iOS, the install prompt where Chrome gave one, nothing when installed or elsewhere', () => {
+    expect(T.homeScreenMode(IPHONE_UA, 5, false, false)).toBe('sheet');
+    expect(T.homeScreenMode(IPHONE_UA, 5, true, false)).toBeNull(); // already opened from the home screen
+    expect(T.homeScreenMode('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5, false, true)).toBe('prompt');
+    expect(T.homeScreenMode('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5, true, true)).toBeNull();
+    expect(T.homeScreenMode('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5, false, false)).toBeNull();
+    expect(T.homeScreenMode('Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0', 0, false, false)).toBeNull();
+  });
+
+  it('describes when a switch click arrived relative to the touch', () => {
+    expect(T.describeSwitchClick(1000, 1004)).toBe('click 4 ms after touch (on press)');
+    expect(T.describeSwitchClick(1000, 1087)).toBe('click 87 ms after touch (on release)');
+    expect(T.describeSwitchClick(null, 1087)).toBe('click, touch time unknown');
+    expect(T.describeSwitchClick(2000, 1087)).toBe('click, touch time unknown');
   });
 });
 
@@ -795,7 +914,6 @@ describe('createHaptics with fake sinks', () => {
       mode,
       enabled: () => enabled(),
       vibrate: (ms: number) => calls.push(['vibrate', ms]),
-      iosTick: () => calls.push(['tick', Date.now()]),
       now: () => Date.now(),
       setTimer: (fn: () => void, ms: number) => setTimeout(fn, ms),
       clearTimer: (hd: unknown) => clearTimeout(hd as ReturnType<typeof setTimeout>),
@@ -872,16 +990,6 @@ describe('createHaptics with fake sinks', () => {
     expect(calls).toEqual([['vibrate', 24]]);
   });
 
-  it('iOS: a tick per press, capped at one per 25 ms', () => {
-    const { hz, calls } = rig('ios');
-    hz.tick();
-    hz.tick();
-    expect(calls).toHaveLength(1);
-    vi.advanceTimersByTime(25);
-    hz.tick();
-    expect(calls).toHaveLength(2);
-  });
-
   /** A finger streaming pointermoves at 120 Hz (iPhone 17 ProMotion) for `ms`, at deflection d. */
   function stream(hz: { setStick(d: number): void }, d: number, ms: number): void {
     for (let t = 0; t < ms; t += 8) {
@@ -890,44 +998,23 @@ describe('createHaptics with fake sinks', () => {
     }
   }
 
-  it('iOS stick: nothing under 0.2; 4 Hz at 0.2 rising to about 18 Hz at full, ticked only from input events', () => {
-    const slow = rig('ios');
-    slow.hz.setStick(0.1);
-    stream(slow.hz, 0.1, 1000);
-    expect(slow.calls).toEqual([]);
-    slow.hz.setStick(0.2);
-    expect(slow.calls).toHaveLength(1); // synchronous when due
-    stream(slow.hz, 0.2, 1000);
-    expect(slow.calls.length).toBeGreaterThanOrEqual(4);
-    expect(slow.calls.length).toBeLessThanOrEqual(6);
-
-    const fast = rig('ios');
-    stream(fast.hz, 1, 1000);
-    expect(fast.calls.length).toBeGreaterThanOrEqual(15);
-    expect(fast.calls.length).toBeLessThanOrEqual(19);
-    const times = fast.calls.map((c) => c[1]);
-    for (let i = 1; i < times.length; i++) expect((times[i] as number) - (times[i - 1] as number)).toBeGreaterThanOrEqual(55);
-  });
-
-  it('iOS arms NO timer: WebKit plays the switch haptic only inside a user gesture, so a timer tick could never be felt', () => {
+  it('iOS: nothing is made from script (no tick, no stick ramp, no timer): the ticks are real touches on the overlays', () => {
     const timers: number[] = [];
     const calls: string[] = [];
     const hz = T.createHaptics({
       mode: 'ios',
       enabled: () => true,
       vibrate: () => calls.push('vibrate'),
-      iosTick: () => calls.push('tick'),
       now: () => Date.now(),
       setTimer: (_fn: () => void, ms: number) => timers.push(ms),
       clearTimer: () => undefined,
     });
+    hz.tick();
     hz.setStick(1);
     stream(hz, 1, 500);
-    hz.tick();
+    hz.stop();
+    expect(calls).toEqual([]);
     expect(timers).toEqual([]);
-    const n = calls.length;
-    vi.advanceTimersByTime(2000); // a still finger: no events, so no ticks
-    expect(calls).toHaveLength(n);
   });
 
   it('Android keeps ONE timer while a stick streams moves (no clear/set per pointermove)', () => {
@@ -936,7 +1023,6 @@ describe('createHaptics with fake sinks', () => {
       mode: 'android',
       enabled: () => true,
       vibrate: () => undefined,
-      iosTick: () => undefined,
       now: () => Date.now(),
       setTimer: (fn: () => void, ms: number) => {
         sets++;
@@ -950,30 +1036,11 @@ describe('createHaptics with fake sinks', () => {
     hz.stop();
   });
 
-  it('iOS: moves that arrive before the next tick is due do not tick; a button tick pushes the stick back', () => {
-    const { hz, calls } = rig('ios');
-    hz.setStick(1);
-    expect(calls).toHaveLength(1);
-    for (let i = 0; i < 10; i++) {
-      vi.advanceTimersByTime(3);
-      hz.setStick(1); // pointermove storm
-    }
-    expect(calls).toHaveLength(1);
-    vi.advanceTimersByTime(30);
-    hz.tick(); // a button press, allowed (more than 25 ms since the last tick)
-    expect(calls).toHaveLength(2);
-    vi.advanceTimersByTime(24);
-    expect(calls).toHaveLength(2); // the stick waited for the global 25 ms
-  });
-
   it('never throws when a sink throws or when the platform has no haptics', () => {
     const bad = T.createHaptics({
       mode: 'android',
       enabled: () => true,
       vibrate: () => {
-        throw new Error('blocked');
-      },
-      iosTick: () => {
         throw new Error('blocked');
       },
       now: () => Date.now(),
@@ -1362,15 +1429,18 @@ describe('play: sticks', () => {
     expect(last()).toEqual(NEUTRAL);
   });
 
-  it('sensitivity comes from the layout; the other stick values are forced defaults', async () => {
+  it('dead zone, curve, sensitivity and inversion come from the layout', async () => {
     host.store = sanitizeStore({ version: 1, activeId: 'default', layouts: [{ ...planLayoutRaw(), controls: planLayoutRaw().controls.map((c: Any) => (c.type === 'stick' ? { ...c, sensitivity: 2, curve: 'aggressive', invertY: true, deadzone: 0.4 } : c)) }] });
     h = await mount();
     const c = h.at('stick-left');
     const r = R('stick-left');
     ptr(h.ctl('stick-left'), 'pointerdown', 1, c.x, c.y);
     vi.advanceTimersByTime(10);
-    ptr(h.ctl('stick-left'), 'pointermove', 1, c.x, c.y - r / 4); // r = 0.25: dead zone 0.1 -> m = 0.1667, linear, x2
-    expect(last().ly).toBe(Math.round(Math.min(1, ((0.25 - 0.1) / 0.9) * 2) * 32767));
+    ptr(h.ctl('stick-left'), 'pointermove', 1, c.x, c.y - r / 4); // r = 0.25 is inside the 0.4 dead zone
+    expect(last().ly).toBe(0);
+    vi.advanceTimersByTime(10);
+    ptr(h.ctl('stick-left'), 'pointermove', 1, c.x, c.y - r * 0.7); // m = 0.5, sqrt = 0.7071, x2 -> full, up inverted to negative
+    expect(last().ly).toBe(-32767);
   });
 
   it('a "right" stick control writes the right axes; a second finger on the same stick is ignored; sticks are independent', async () => {
@@ -1439,6 +1509,132 @@ describe('play: d-pad', () => {
     ptr(dp, 'pointerup', 1);
     expect(h.ws().states().at(-1)?.buttons).toBe(0);
     expect(dp.querySelector('.is-down')).toBeNull();
+  });
+});
+
+/** The stock store with some properties of some controls changed (through the host's own sanitizer). */
+function customStore(patches: Record<string, Record<string, unknown>>): LayoutStore {
+  const raw = planLayoutRaw();
+  raw.controls = raw.controls.map((c: { id: string }) => (patches[c.id] ? { ...c, ...patches[c.id] } : c));
+  return sanitizeStore({ version: 1, activeId: 'default', layouts: [raw] });
+}
+
+describe('play: the More options really change how a control plays', () => {
+  const last = (): PadState => h.ws().states().at(-1) as PadState;
+  const stateCount = (): number => h.ws().states().length;
+
+  it('Toggle: one tap holds the button, the next tap lets go; lifting the finger changes nothing', async () => {
+    host.store = customStore({ 'btn-a': { latch: true } });
+    h = await mount();
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    expect(last().buttons).toBe(BTN.A);
+    expect(h.ctl('btn-a').getAttribute('aria-pressed')).toBe('true');
+    vi.advanceTimersByTime(100);
+    ptr(h.ctl('btn-a'), 'pointerup', 1);
+    vi.advanceTimersByTime(300);
+    expect(last().buttons).toBe(BTN.A);
+    expect(h.ctl('btn-a').classList.contains('is-down')).toBe(true);
+    ptr(h.ctl('btn-a'), 'pointerdown', 2);
+    expect(last().buttons).toBe(0);
+    expect(h.ctl('btn-a').classList.contains('is-down')).toBe(false);
+    ptr(h.ctl('btn-a'), 'pointerup', 2);
+    vi.advanceTimersByTime(300);
+    expect(last().buttons).toBe(0);
+  });
+
+  it('a held toggle is let go by every safety release (a switched-on button must never be stuck)', async () => {
+    host.store = customStore({ 'btn-a': { latch: true } });
+    h = await mount();
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    expect(last().buttons).toBe(BTN.A);
+    window.dispatchEvent(new Event('blur'));
+    expect(last().buttons).toBe(0);
+    expect(h.ctl('btn-a').classList.contains('is-down')).toBe(false);
+    vi.advanceTimersByTime(300);
+    ptr(h.ctl('btn-a'), 'pointerdown', 2); // a fresh tap switches it on again, it does not toggle "off"
+    expect(last().buttons).toBe(BTN.A);
+  });
+
+  it('Rapid fire: the button blinks 50 ms on, 50 ms off while held, and the blinking stops with the finger', async () => {
+    host.store = customStore({ 'btn-x': { turbo: true } });
+    h = await mount();
+    ptr(h.ctl('btn-x'), 'pointerdown', 1);
+    expect(last().buttons).toBe(BTN.X);
+    const seen: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      vi.advanceTimersByTime(50);
+      seen.push(last().buttons);
+    }
+    expect(seen).toEqual([0, BTN.X, 0, BTN.X, 0, BTN.X]);
+    expect(h.ctl('btn-x').classList.contains('is-down')).toBe(true); // it stays lit: only the output blinks
+    ptr(h.ctl('btn-x'), 'pointerup', 1);
+    vi.advanceTimersByTime(5); // the frame may wait out the 1/240 s gap behind the blink that was just sent
+    expect(last().buttons).toBe(0);
+    const n = stateCount();
+    vi.advanceTimersByTime(1000);
+    expect(stateCount()).toBe(n); // no timer left running
+    ptr(h.ctl('btn-x'), 'pointerdown', 2); // and the next press starts on, not mid-blink
+    expect(last().buttons).toBe(BTN.X);
+  });
+
+  it('a plain button does not blink, and rapid fire on one button leaves the others alone', async () => {
+    host.store = customStore({ 'btn-x': { turbo: true } });
+    h = await mount();
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    ptr(h.ctl('btn-x'), 'pointerdown', 2);
+    vi.advanceTimersByTime(50);
+    expect(last().buttons).toBe(BTN.A);
+    vi.advanceTimersByTime(50);
+    expect(last().buttons).toBe(BTN.A | BTN.X);
+  });
+
+  it('Trigger strength: LT and RT send the stored value instead of 255; the stronger of two LT buttons wins', async () => {
+    host.store = customStore({ 'btn-lt': { value: 128 }, 'btn-rt': { value: 1 }, 'btn-lb': { button: 'LT', value: 200 } });
+    h = await mount();
+    ptr(h.ctl('btn-lt'), 'pointerdown', 1);
+    expect(last().lt).toBe(128);
+    vi.advanceTimersByTime(10);
+    ptr(h.ctl('btn-lb'), 'pointerdown', 2);
+    expect(last().lt).toBe(200);
+    ptr(h.ctl('btn-rt'), 'pointerdown', 3);
+    vi.advanceTimersByTime(10);
+    expect(last().rt).toBe(1);
+  });
+
+  it('Floating stick: the base appears under the finger (kept inside the touch area) and the stick is measured from there', async () => {
+    host.store = customStore({ 'stick-left': { mode: 'floating' } });
+    h = await mount();
+    const el = h.ctl('stick-left');
+    expect(el.classList.contains('is-floating')).toBe(true);
+    expect(el.style.getPropertyValue('--w')).toBe(String(38 * T.FLOATING_ZONE)); // the touch area is bigger than the base
+    const c = h.at('stick-left');
+    const r = ((38 * FH) / 100) / 2;
+    ptr(el, 'pointerdown', 1, c.x + 20, c.y - 10); // the first touch is the middle: nothing is pulled
+    expect(last()).toMatchObject({ lx: 0, ly: 0 });
+    const base = el.querySelector('.stick-base') as HTMLElement;
+    expect(base.style.transform).toBe('translate3d(20.0px,-10.0px,0)');
+    vi.advanceTimersByTime(10);
+    ptr(el, 'pointermove', 1, c.x + 20 + r, c.y - 10);
+    expect(last().lx).toBe(32767);
+    ptr(el, 'pointerup', 1);
+    expect(base.style.transform).toBe(''); // the base goes back to the middle of its area
+    vi.advanceTimersByTime(300);
+    // a touch at the very edge of the area: the base stops inside it, so the same finger is already pulling
+    const slack = r * T.FLOATING_ZONE - r;
+    ptr(el, 'pointerdown', 2, c.x + slack + r / 2, c.y);
+    expect(base.style.transform).toBe('translate3d(' + slack.toFixed(1) + 'px,0.0px,0)');
+    expect(last().lx).toBeGreaterThan(0);
+    expect(last().lx).toBeLessThan(32767);
+  });
+
+  it('a fixed stick is unchanged: measured from the middle of the control', async () => {
+    h = await mount();
+    const el = h.ctl('stick-left');
+    expect(el.classList.contains('is-floating')).toBe(false);
+    const c = h.at('stick-left');
+    ptr(el, 'pointerdown', 1, c.x + 30, c.y);
+    expect(last().lx).toBeGreaterThan(0);
+    expect((el.querySelector('.stick-base') as HTMLElement).style.transform).toBe('');
   });
 });
 
@@ -1786,90 +1982,191 @@ describe('haptics in the page (Android: navigator.vibrate)', () => {
   });
 });
 
-describe('haptics in the page (iOS: the hidden switch)', () => {
-  const iosPage = async (): Promise<HTMLLabelElement> => {
+describe('haptics in the page (iOS: a real touch on a switch laid over the control)', () => {
+  const iosPage = async (opts: Parameters<typeof mount>[0] = {}): Promise<void> => {
     Object.defineProperty(navigator, 'userAgent', { configurable: true, value: IPHONE_UA });
-    h = await mount();
-    const label = document.querySelector<HTMLLabelElement>('label.haptic-switch');
-    if (!label) throw new Error('no haptic switch label');
-    return label;
+    h = await mount(opts);
   };
+  const overlayOf = (id: string): HTMLInputElement | undefined => [...h.ctl(id).children].find((c) => c.classList.contains('haptic-switch')) as HTMLInputElement | undefined;
+  const overlays = (): HTMLInputElement[] => [...document.querySelectorAll<HTMLInputElement>('input.haptic-switch')];
 
-  it('creates one hidden checkbox switch, and a tick is a click on its label', async () => {
-    const label = await iosPage();
-    const input = label.querySelector('input') as HTMLInputElement;
-    expect(input.type).toBe('checkbox');
-    expect(input.hasAttribute('switch')).toBe(true);
-    expect(label.getAttribute('aria-hidden')).toBe('true');
-    const click = vi.spyOn(label, 'click');
-    ptr(h.ctl('btn-a'), 'pointerdown', 1);
-    expect(click).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(40);
-    ptr(h.ctl('btn-a'), 'pointerup', 1);
-    vi.advanceTimersByTime(40);
-    ptr(h.ctl('btn-b'), 'pointerdown', 2);
-    expect(click).toHaveBeenCalledTimes(2);
+  it('every button and the d-pad carry one transparent checkbox switch as a child; sticks and the page body carry none', async () => {
+    await iosPage();
+    const ids = BUTTON_SPECS.map(([id]) => id).concat('dpad');
+    for (const id of ids) {
+      const sw = overlayOf(id);
+      expect(sw, id).toBeTruthy();
+      expect(sw?.type).toBe('checkbox');
+      expect(sw?.hasAttribute('switch')).toBe(true);
+      expect(sw?.getAttribute('tabindex')).toBe('-1');
+      expect(sw?.getAttribute('aria-hidden')).toBe('true');
+      expect([...h.ctl(id).children].filter((c) => c.classList.contains('haptic-switch'))).toHaveLength(1);
+    }
+    expect(overlays()).toHaveLength(ids.length);
+    expect(overlayOf('stick-left')).toBeUndefined();
+    expect(overlayOf('stick-right')).toBeUndefined();
+    expect(document.querySelector('label.haptic-switch')).toBeNull(); // the old hidden label is gone
+    expect(h.ctl('btn-a').textContent).toBe('A'); // the label text is still the label
   });
 
-  it('ticks no faster than every 25 ms, and a stick ticks at a rate that grows with the pull', async () => {
-    const label = await iosPage();
-    const click = vi.spyOn(label, 'click');
+  it('there are none on Android, on a desktop, or with haptics off in the layout', async () => {
+    stubVibrate();
+    h = await mount();
+    expect(overlays()).toHaveLength(0);
+    h.destroy();
+    delete (navigator as Any).vibrate;
+    vibrate = null;
+    h = await mount();
+    expect(overlays()).toHaveLength(0); // jsdom-like user agent: no platform haptics
+    h.destroy();
+    host.store = T.setHaptics(planStore(), false);
+    await iosPage();
+    expect(overlays()).toHaveLength(0);
+  });
+
+  it('a touch that lands on the switch still plays the control: the press is sent, the control is lit, the switch is not captured away', async () => {
+    await iosPage();
+    const sw = overlayOf('btn-a') as HTMLInputElement;
+    const capture = vi.fn();
+    (h.ctl('btn-a') as Any).setPointerCapture = capture;
+    ptr(sw, 'pointerdown', 1);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.A);
+    expect(h.ctl('btn-a').classList.contains('is-down')).toBe(true);
+    expect(capture).not.toHaveBeenCalled(); // capturing it to the control would aim the browser's click away from the switch
+    vi.advanceTimersByTime(40);
+    ptr(sw, 'pointerup', 1);
+    expect(h.ws().states().at(-1)?.buttons).toBe(0);
+    ptr(h.ctl('btn-b'), 'pointerdown', 2); // a touch on the control itself (not the switch) is captured as before
+    expect((h.ctl('btn-b') as Any).setPointerCapture).toBeTypeOf('function');
+    const cap2 = vi.fn();
+    (h.ctl('btn-x') as Any).setPointerCapture = cap2;
+    ptr(h.ctl('btn-x'), 'pointerdown', 3);
+    expect(cap2).toHaveBeenCalledWith(3);
+  });
+
+  it('the d-pad keeps working through its switch: the finger slides between directions', async () => {
+    await iosPage();
+    const dp = h.at('dpad');
+    const half = (26 * FH) / 100 / 2;
+    const sw = overlayOf('dpad') as HTMLInputElement;
+    ptr(sw, 'pointerdown', 1, dp.x + half * 0.7, dp.y);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.DPAD_RIGHT);
+    vi.advanceTimersByTime(10); // past the 1/240 s send gap
+    ptr(sw, 'pointermove', 1, dp.x, dp.y - half * 0.7);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.DPAD_UP);
+    vi.advanceTimersByTime(10);
+    ptr(sw, 'pointerup', 1);
+    expect(h.ws().states().at(-1)?.buttons).toBe(0);
+  });
+
+  it('never cancels touchstart or touchmove on a switch (that would stop the click and so the tick); everything else is still cancelled', async () => {
+    await iosPage();
+    for (const type of ['touchstart', 'touchmove']) {
+      const e = new Event(type, { bubbles: true, cancelable: true });
+      (overlayOf('btn-a') as HTMLInputElement).dispatchEvent(e);
+      expect(e.defaultPrevented, type + ' on the switch').toBe(false);
+    }
+    const onControl = new Event('touchstart', { bubbles: true, cancelable: true });
+    h.ctl('stick-left').dispatchEvent(onControl);
+    expect(onControl.defaultPrevented).toBe(true);
+    const move = new Event('touchmove', { bubbles: true, cancelable: true });
+    document.body.dispatchEvent(move);
+    expect(move.defaultPrevented).toBe(true);
+    const pointer = new PointerEvent('pointerdown', { bubbles: true, cancelable: true, pointerId: 4, pointerType: 'touch' });
+    (overlayOf('btn-a') as HTMLInputElement).dispatchEvent(pointer);
+    expect(pointer.defaultPrevented).toBe(false); // the pointer handlers are passive and never cancel
+  });
+
+  it('a click on a switch is its own business: it stays off the control, and the switch is switched off again before the next touch', async () => {
+    await iosPage();
+    const sw = overlayOf('btn-a') as HTMLInputElement;
+    const seen = vi.fn();
+    h.ctl('btn-a').addEventListener('click', seen);
+    document.body.addEventListener('click', seen);
+    ptr(sw, 'pointerdown', 1);
+    sw.click(); // the browser's own click: the switch turns on
+    expect(sw.checked).toBe(true);
+    expect(seen).not.toHaveBeenCalled();
+    ptr(sw, 'pointerup', 1);
+    ptr(sw, 'pointerdown', 2);
+    expect(sw.checked).toBe(false); // so its state never matters
+  });
+
+  it('nothing is ticked from script any more: no click on any input or label, whatever is pressed', async () => {
+    await iosPage();
+    const click = vi.spyOn(HTMLElement.prototype, 'click');
     ptr(h.ctl('btn-a'), 'pointerdown', 1);
-    ptr(h.ctl('btn-b'), 'pointerdown', 2); // same instant: the global cap swallows it
-    expect(click).toHaveBeenCalledTimes(1);
-    ptr(h.ctl('btn-a'), 'pointerup', 1);
-    ptr(h.ctl('btn-b'), 'pointerup', 2);
-    vi.advanceTimersByTime(100);
-    click.mockClear();
     const c = h.at('stick-left');
-    const r = ((38 * FH) / 100) / 2;
-    ptr(h.ctl('stick-left'), 'pointerdown', 3, c.x, c.y); // touch-down tick
-    expect(click).toHaveBeenCalledTimes(1);
-    vi.advanceTimersByTime(30);
-    click.mockClear();
-    // Ticks come only from input events (a 120 Hz move stream here), never from a timer: see createHaptics.
-    const hold = (dx: number): void => {
-      for (let t = 0; t < 1000; t += 8) {
-        vi.advanceTimersByTime(8);
-        ptr(h.ctl('stick-left'), 'pointermove', 3, c.x + dx + (t % 16 ? 0.2 : 0), c.y);
-      }
-    };
-    hold(r * 0.3); // 0.3: slow
-    const slow = click.mock.calls.length;
-    click.mockClear();
-    hold(r); // full: fast
-    const fast = click.mock.calls.length;
-    click.mockClear();
-    vi.advanceTimersByTime(1000); // a perfectly still finger sends no events: no ticks
-    expect(click).not.toHaveBeenCalled();
-    expect(slow).toBeGreaterThanOrEqual(3);
-    expect(fast).toBeGreaterThan(slow * 2);
-    expect(fast).toBeLessThanOrEqual(19);
-    ptr(h.ctl('stick-left'), 'pointerup', 3);
-    click.mockClear();
+    ptr(h.ctl('stick-left'), 'pointerdown', 2, c.x, c.y);
+    ptr(h.ctl('stick-left'), 'pointermove', 2, c.x + 60, c.y);
     vi.advanceTimersByTime(1000);
     expect(click).not.toHaveBeenCalled();
+    click.mockRestore();
   });
 
-  it('a click that throws never breaks the pad', async () => {
-    const label = await iosPage();
-    vi.spyOn(label, 'click').mockImplementation(() => {
-      throw new Error('blocked');
-    });
-    expect(() => {
-      ptr(h.ctl('btn-a'), 'pointerdown', 1);
-      vi.advanceTimersByTime(100);
-    }).not.toThrow();
-    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.A);
+  it('the overlays are gone while editing and back after Done; switching haptics off removes them', async () => {
+    await iosPage();
+    tapAt(menuEl());
+    await settle();
+    expect(overlays()).toHaveLength(0); // a touch in the editor selects and drags, it must not tick
+    tapAt(cardEl().querySelector('.switch') as Element); // haptics off
+    tapAt(doneEl());
+    await settle();
+    expect(overlays()).toHaveLength(0);
+    tapAt(menuEl());
+    await settle();
+    tapAt(cardEl().querySelector('.switch') as Element); // haptics on again
+    tapAt(doneEl());
+    await settle();
+    expect(overlays()).toHaveLength(11);
+  });
+
+  it('a cancelled touch on a switch releases only that control: the stick under the other thumb keeps playing', async () => {
+    // The touch on a switch is not cancelled at touchstart, so iOS may still claim it for a native gesture (pointercancel).
+    await iosPage();
+    const c = h.at('stick-left');
+    ptr(h.ctl('stick-left'), 'pointerdown', 1, c.x, c.y);
+    vi.advanceTimersByTime(10);
+    ptr(h.ctl('stick-left'), 'pointermove', 1, c.x, c.y - 200);
+    vi.advanceTimersByTime(10);
+    const sw = overlayOf('btn-a') as HTMLInputElement;
+    ptr(sw, 'pointerdown', 2);
+    expect(h.ws().states().at(-1)).toMatchObject({ buttons: BTN.A, ly: 32767 });
+    vi.advanceTimersByTime(40);
+    ptr(sw, 'pointercancel', 2);
+    expect(h.ws().states().at(-1)).toMatchObject({ buttons: 0, ly: 32767 });
+    vi.advanceTimersByTime(10);
+    ptr(h.ctl('stick-left'), 'pointermove', 1, c.x + 200, c.y);
+    expect(h.ws().states().at(-1)).toMatchObject({ buttons: 0, lx: 32767, ly: 0 });
+    ptr(h.ctl('btn-b'), 'pointercancel', 1); // a cancel anywhere else still releases everything
+    expect(h.ws().states().at(-1)).toMatchObject(NEUTRAL);
+  });
+
+  it('a button re-labelled in the editor keeps its overlay', async () => {
+    await iosPage();
+    tapAt(menuEl());
+    await settle();
+    const c = h.at('btn-a');
+    ptr(h.ctl('btn-a'), 'pointerdown', 20, c.x, c.y);
+    ptr(h.ctl('btn-a'), 'pointerup', 20, c.x, c.y);
+    tapAt(cardEl().querySelector('.more') as Element);
+    const input = cardEl().querySelector('.card-input') as HTMLInputElement;
+    input.value = 'Jump';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    tapAt(doneEl());
+    await settle();
+    expect(h.ctl('btn-a').textContent).toBe('Jump');
+    expect(overlayOf('btn-a')).toBeTruthy();
   });
 });
 
 describe('?diag=1', () => {
-  it('shows four buttons; 1 ticks from click, 2 from pointerdown, 3 while dragging, 4 ten times from a timer', async () => {
+  it('Android: the switch test and four vibrate buttons; 1 from click, 2 from pointerdown, 3 while dragging, 4 ten times from a timer', async () => {
     stubVibrate();
     h = await mount({ search: '&diag=1' });
     const b = (n: number): HTMLElement => document.getElementById('diag-' + n) as HTMLElement;
     expect([1, 2, 3, 4].map((n) => !!document.getElementById('diag-' + n))).toEqual([true, true, true, true]);
+    expect(document.querySelector('.diag-test input.haptic-switch')).toBeTruthy();
     b(1).click();
     expect(vibrate).toHaveBeenCalledTimes(1);
     vibrate?.mockClear();
@@ -1887,9 +2184,32 @@ describe('?diag=1', () => {
     vi.advanceTimersByTime(1500);
     expect(vibrate).toHaveBeenCalledTimes(10);
   });
+
+  it('iOS: a big test switch reports whether its click arrived and how long after the touch; a second line counts the controls\' clicks', async () => {
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: IPHONE_UA });
+    h = await mount({ search: '&diag=1' });
+    expect([1, 2, 3, 4].map((n) => document.getElementById('diag-' + n))).toEqual([null, null, null, null]); // script ticks cannot work there
+    const out = (): string => document.querySelector('.diag-out')?.textContent ?? '';
+    expect(out()).toBe('test switch: no click yet\ncontrols: no click yet');
+    const test = document.querySelector('.diag-test input.haptic-switch') as HTMLInputElement;
+    ptr(test, 'pointerdown', 1);
+    vi.advanceTimersByTime(80);
+    test.click();
+    expect(out()).toBe('test switch: 1 click, click 80 ms after touch (on release)\ncontrols: no click yet');
+    ptr(test, 'pointerdown', 2);
+    test.click();
+    expect(out().split('\n')[0]).toBe('test switch: 2 clicks, click 0 ms after touch (on press)');
+    const sw = [...h.ctl('btn-a').children].find((c) => c.classList.contains('haptic-switch')) as HTMLInputElement;
+    ptr(sw, 'pointerdown', 3);
+    vi.advanceTimersByTime(55);
+    sw.click();
+    expect(out().split('\n')[1]).toBe('controls: 1 click, click 55 ms after touch (on release)');
+  });
+
   it('is absent without the parameter', async () => {
     h = await mount();
     expect(document.getElementById('diag-1')).toBeNull();
+    expect(document.querySelector('.diag')).toBeNull();
   });
 });
 
@@ -1976,8 +2296,8 @@ describe('edit mode', () => {
     ptr(h.ctl(id), 'pointerup', 20, c.x, c.y);
   };
   const cardBox = (): { l: number; r: number; t: number; b: number } => {
-    const w = cardEl().classList.contains('is-settings') ? 300 : 280;
-    const hh = cardEl().classList.contains('is-settings') ? 168 : 136;
+    const w = parseFloat(cardEl().style.width);
+    const hh = parseFloat(cardEl().style.height);
     const x = parseFloat(cardEl().style.left);
     const y = parseFloat(cardEl().style.top);
     return { l: x - w / 2, r: x + w / 2, t: y - hh / 2, b: y + hh / 2 };
@@ -2347,53 +2667,565 @@ describe('edit mode', () => {
   });
 });
 
-describe('an old store from the complicated editor', () => {
-  it('loads, plays with the forced defaults, and saves cleanly with the extra layouts untouched', async () => {
-    host.store = oldStore();
-    h = await mount();
-    // latch and turbo are off: a tap is a plain press that releases
+describe('Add to Home Screen', () => {
+  const sheet = (): HTMLElement => document.getElementById('a2hs') as HTMLElement;
+  const iosUa = (): void => void Object.defineProperty(navigator, 'userAgent', { configurable: true, value: IPHONE_UA });
+  const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36';
+  const homeRow = (): HTMLElement | undefined => [...cardEl().querySelectorAll<HTMLElement>('.card-btn')].find((b) => b.textContent === 'Add to Home Screen');
+  const dismiss = (): void => tapAt(document.getElementById('a2hs-close') as Element);
+
+  it('the sheet markup: three short steps with an inline share glyph, the two notes, a big Close; no inline styles', () => {
+    document.body.innerHTML = BODY;
+    expect(sheet().hidden).toBe(true);
+    expect(sheet().getAttribute('role')).toBe('dialog');
+    expect(sheet().querySelector('#a2hs-title')?.textContent).toBe('Add to Home Screen');
+    const steps = [...sheet().querySelectorAll('li')].map((li) => (li.textContent ?? '').replace(/\s+/g, ' ').trim());
+    // iOS 26 Safari keeps Share inside the \u22ef menu of its compact toolbar, so the first step names both.
+    expect(steps).toEqual(['Tap the Share button (on iOS 26 it is in the \u22ef menu)', 'Choose \u201cAdd to Home Screen\u201d', 'Tap Add']);
+    expect(sheet().querySelector('li svg.share-glyph')).toBeTruthy();
+    const notes = [...sheet().querySelectorAll('.overlay-sub')].map((p) => p.textContent);
+    expect(notes).toEqual([
+      'Opens full screen with no address bar. If you make a New link on the PC, add it again.',
+      'In landscape Safari may hide its toolbar, so do this in portrait or from the address-bar menu.',
+    ]);
+    expect(sheet().querySelectorAll('[style]')).toHaveLength(0);
+    const css = read('controller.css').replace(/\/\*[\s\S]*?\*\//g, '');
+    const decl = (sel: string): string => [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].filter((m) => (m[1] as string).split(',').some((x) => x.trim() === sel)).map((m) => m[2]).join(';');
+    const z = (sel: string): number => Number([...decl(sel).matchAll(/z-index:\s*(\d+)/g)].pop()?.[1]);
+    expect(z('.sheet')).toBeGreaterThan(z('.rotate-overlay')); // usable in portrait, where the rotate overlay is up
+    expect(decl('.sheet')).toMatch(/overflow-y:\s*auto/);
+    expect(decl('.sheet')).toMatch(/env\(safe-area-inset-bottom\)/);
+    expect(Number(/min-height:\s*(\d+)px/.exec(decl('.action'))?.[1])).toBeGreaterThanOrEqual(44);
+    expect(css).toMatch(/\[hidden\]\s*\{[^}]*display:\s*none\s*!important/); // dismissed means gone: it cannot cover the field
+  });
+
+  it('the haptic switch css: rendered (never display none or visibility hidden), nearly transparent, on top, no touch gestures', () => {
+    const css = read('controller.css').replace(/\/\*[\s\S]*?\*\//g, '');
+    const rule = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].filter((m) => (m[1] as string).trim() === '.haptic-switch').map((m) => m[2]).join(';');
+    expect(rule).toMatch(/position:\s*absolute/);
+    expect(rule).toMatch(/inset:\s*0/);
+    expect(rule).toMatch(/width:\s*100%/);
+    expect(rule).toMatch(/height:\s*100%/);
+    expect(rule).toMatch(/opacity:\s*0\.011/);
+    expect(rule).toMatch(/touch-action:\s*none/);
+    expect(rule).toMatch(/z-index:\s*[1-9]/);
+    expect(rule).not.toMatch(/display:\s*none|visibility:\s*hidden|pointer-events:\s*none/);
+  });
+
+  it('iPhone Safari that is not standalone: the sheet shows once the connection is up; Close hides it for good', async () => {
+    iosUa();
+    h = await mount({ welcome: false });
+    expect(sheet().hidden).toBe(true); // not before the connection is up
+    h.ws().open();
+    h.ws().receive({ t: 'welcome', slot: 2 });
+    expect(sheet().hidden).toBe(false);
+    dismiss();
+    expect(sheet().hidden).toBe(true);
+    expect(storage.get('lanplay.home.seen')).toBe('1');
+    // the field plays as normal afterwards
+    await vi.advanceTimersByTimeAsync(10);
     ptr(h.ctl('btn-a'), 'pointerdown', 1);
     expect(h.ws().states().at(-1)?.buttons).toBe(BTN.A);
-    vi.advanceTimersByTime(40);
-    ptr(h.ctl('btn-a'), 'pointerup', 1);
+    // a reconnect does not bring it back, and neither does a new page load
+    h.ws().drop();
+    await vi.advanceTimersByTimeAsync(600);
+    h.ws().open();
+    h.ws().receive({ t: 'welcome', slot: 2 });
+    expect(sheet().hidden).toBe(true);
+    h.destroy();
+    h = await mount();
+    expect(sheet().hidden).toBe(true);
+  });
+
+  it('stays up across a reconnect until it is closed', async () => {
+    iosUa();
+    h = await mount();
+    expect(sheet().hidden).toBe(false);
+    h.ws().drop();
+    await vi.advanceTimersByTimeAsync(600);
+    h.ws().open();
+    h.ws().receive({ t: 'welcome', slot: 2 });
+    expect(sheet().hidden).toBe(false);
+  });
+
+  it('never on Android or a desktop, never when the page runs from the home screen', async () => {
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: ANDROID_UA });
+    h = await mount();
+    expect(sheet().hidden).toBe(true);
+    h.destroy();
+    iosUa();
+    Object.defineProperty(navigator, 'standalone', { configurable: true, value: true }); // iOS: opened from the home screen
+    h = await mount();
+    expect(sheet().hidden).toBe(true);
+    h.destroy();
+    delete (navigator as Any).standalone;
+    standaloneNow = true; // display-mode: standalone
+    h = await mount();
+    expect(sheet().hidden).toBe(true);
+  });
+
+  it('never while editing: a connection that comes up in the editor leaves the sheet alone', async () => {
+    iosUa();
+    h = await mount({ welcome: false });
+    await settle();
+    tapAt(menuEl());
+    expect(editing()).toBe(true);
+    h.ws().open();
+    h.ws().receive({ t: 'welcome', slot: 2 });
+    expect(sheet().hidden).toBe(true);
+  });
+
+  it('works when storage is blocked: it shows, and Close still closes', async () => {
+    iosUa();
+    vi.stubGlobal('localStorage', {
+      getItem: () => {
+        throw new Error('denied');
+      },
+      setItem: () => {
+        throw new Error('denied');
+      },
+    });
+    h = await mount();
+    expect(sheet().hidden).toBe(false);
+    expect(() => dismiss()).not.toThrow();
+    expect(sheet().hidden).toBe(true);
+  });
+
+  it('opening it releases anything held under it', async () => {
+    iosUa();
+    storage.set('lanplay.home.seen', '1');
+    h = await mount();
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.A);
+    tapAt(menuEl());
+    await settle();
+    tapAt(homeRow() as Element);
+    expect(sheet().hidden).toBe(false);
     expect(h.ws().states().at(-1)?.buttons).toBe(0);
-    vi.advanceTimersByTime(10);
-    ptr(h.ctl('btn-lt'), 'pointerdown', 2); // value was 90: forced to 255
-    expect(h.ws().states().at(-1)?.lt).toBe(255);
-    vi.advanceTimersByTime(40);
-    ptr(h.ctl('btn-lt'), 'pointerup', 2);
-    // floating, inverted, aggressive, dead zone 0.4 and no double tap are all forced back; sensitivity 2.5 is kept
+  });
+
+  it('settings card: an "Add to Home Screen" row on iOS that re-opens the sheet even after it was dismissed; hidden once standalone', async () => {
+    iosUa();
+    storage.set('lanplay.home.seen', '1');
+    h = await mount();
+    tapAt(menuEl());
+    await settle();
+    const row = homeRow() as HTMLElement;
+    expect(row).toBeTruthy();
+    expect(cardEl().querySelectorAll('.card-btn.wide')).toHaveLength(1);
+    expect(parseFloat(cardEl().style.height)).toBe(T.CARD_PAD + 5 * T.ROW_H);
+    tapAt(row);
+    expect(sheet().hidden).toBe(false);
+    expect(editing()).toBe(true);
+    dismiss();
+    expect(sheet().hidden).toBe(true);
+    expect(editing()).toBe(true); // back in the editor
+    expect(cardEl().hidden).toBe(false);
+    tapAt(doneEl());
+    await settle();
+    h.destroy();
+    Object.defineProperty(navigator, 'standalone', { configurable: true, value: true });
+    h = await mount();
+    tapAt(menuEl());
+    await settle();
+    expect(homeRow()).toBeUndefined();
+    expect(parseFloat(cardEl().style.height)).toBe(T.CARD_PAD + 4 * T.ROW_H);
+  });
+
+  it('Android Chrome: the install prompt it hands over backs the same row, once', async () => {
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: ANDROID_UA });
+    stubVibrate();
+    h = await mount();
+    tapAt(menuEl());
+    await settle();
+    expect(homeRow()).toBeUndefined(); // nothing to offer until the browser says the page is installable
+    tapAt(doneEl());
+    await settle();
+    const prompt = vi.fn(async () => ({ outcome: 'dismissed' }));
+    const ev = Object.assign(new Event('beforeinstallprompt', { cancelable: true }), { prompt });
+    window.dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true); // no mini-infobar: the row is the way in
+    tapAt(menuEl());
+    await settle();
+    expect(homeRow()).toBeTruthy();
+    expect(sheet().hidden).toBe(true);
+    tapAt(homeRow() as Element);
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(sheet().hidden).toBe(true); // the browser's own prompt, not the iOS steps
+    expect(homeRow()).toBeUndefined(); // a prompt can be used once
+  });
+
+  it('Android: appinstalled takes the row away', async () => {
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: ANDROID_UA });
+    stubVibrate();
+    h = await mount();
+    window.dispatchEvent(Object.assign(new Event('beforeinstallprompt', { cancelable: true }), { prompt: vi.fn(async () => ({})) }));
+    window.dispatchEvent(new Event('appinstalled'));
+    tapAt(menuEl());
+    await settle();
+    expect(homeRow()).toBeUndefined();
+  });
+});
+
+describe('edit mode: More, Add control, Duplicate, Delete', () => {
+  const enter = async (): Promise<void> => {
+    tapAt(menuEl());
+    await settle();
+  };
+  const selectCtl = (id: string): void => {
+    const c = h.at(id);
+    ptr(h.ctl(id), 'pointerdown', 20, c.x, c.y);
+    ptr(h.ctl(id), 'pointerup', 20, c.x, c.y);
+  };
+  const more = (): HTMLElement => cardEl().querySelector('.more') as HTMLElement;
+  const openMore = (): void => tapAt(more());
+  const labels = (): string[] => [...cardEl().querySelectorAll('.slider-label, .choice > .card-label, .card-row > .card-label')].map((e) => e.textContent ?? '');
+  const row = (label: string): HTMLElement => {
+    const hit = [...cardEl().children].find((c) => c.querySelector(':scope > .card-label, :scope > .slider-label')?.textContent === label);
+    if (!hit) throw new Error('no row ' + label + ' in ' + labels().join(', '));
+    return hit as HTMLElement;
+  };
+  const chip = (label: string, text: string): HTMLElement => {
+    const b = [...row(label).querySelectorAll<HTMLElement>('.opt')].find((o) => o.textContent === text);
+    if (!b) throw new Error('no chip ' + text);
+    return b;
+  };
+  const chips = (label: string): string[] => [...row(label).querySelectorAll('.opt')].map((o) => o.textContent ?? '');
+  const checked = (label: string): string | undefined => [...row(label).querySelectorAll('.opt')].find((o) => o.getAttribute('aria-checked') === 'true')?.textContent ?? undefined;
+  const flip = (label: string): void => tapAt(row(label).querySelector('.switch') as Element);
+  const dragSlider = (label: string, ratio: number): void => {
+    const track = row(label).querySelector('.slider-track') as HTMLElement;
+    rect(track, 100, 100, 200, 44);
+    ptr(track, 'pointerdown', 70, 100 + 200 * ratio, 120);
+    ptr(track, 'pointerup', 70, 100 + 200 * ratio, 120);
+  };
+  const saved = async (): Promise<LayoutStore> => {
+    tapAt(doneEl(), 437, 28); // inside the stubbed Done rect
+    await settle();
+    return host.puts().at(-1) as LayoutStore;
+  };
+  const ctlOf = (st: LayoutStore, id: string): Any => T.activeLayout(st).controls.find((c: { id: string }) => c.id === id);
+  const cardBox = (): { l: number; r: number; t: number; b: number } => {
+    const w = parseFloat(cardEl().style.width);
+    const hh = parseFloat(cardEl().style.height);
+    const x = parseFloat(cardEl().style.left);
+    const y = parseFloat(cardEl().style.top);
+    return { l: x - w / 2, r: x + w / 2, t: y - hh / 2, b: y + hh / 2 };
+  };
+
+  beforeEach(async () => {
+    h = await mount();
+    rect(doneEl(), 383, 2, 108, 52);
+    await enter();
+  });
+
+  it('the default card stays as simple as before: a title, Size, Opacity and one More button; nothing else', () => {
+    selectCtl('btn-a');
+    expect([...cardEl().querySelectorAll('.slider-label')].map((e) => e.textContent)).toEqual(['Size', 'Opacity']);
+    expect(cardEl().querySelector('.card-title')?.textContent).toBe('A button');
+    expect(more().textContent).toBe('More');
+    expect(more().getAttribute('aria-expanded')).toBe('false');
+    expect(cardEl().querySelector('.choice, .card-input, .switch')).toBeNull();
+    expect(cardBox().b - cardBox().t).toBe(T.CARD_PAD + 3 * T.ROW_H);
+  });
+
+  it('More opens the button options; Less closes them; the choice is remembered for the session, across controls', () => {
+    selectCtl('btn-lt');
+    openMore();
+    expect(more().textContent).toBe('Less');
+    expect(more().getAttribute('aria-expanded')).toBe('true');
+    expect(labels()).toEqual(['Size', 'Opacity', 'Label', 'Sends', 'Shape', 'Width', 'Height', 'Mode', 'Trigger']);
+    selectCtl('btn-a'); // another control: still open; a circle has no Width / Height
+    expect(labels()).toEqual(['Size', 'Opacity', 'Label', 'Sends', 'Shape', 'Mode']);
+    tapAt(more());
+    expect(labels()).toEqual(['Size', 'Opacity']);
+    selectCtl('btn-b');
+    expect(more().textContent).toBe('More');
+  });
+
+  it('a card taller than the room is capped and scrolls instead of growing off the screen, and never covers its control', () => {
+    selectCtl('stick-left');
+    openMore();
+    const b = cardBox();
+    expect(b.t).toBeGreaterThanOrEqual(60); // below Done
+    expect(b.b).toBeLessThanOrEqual(FH);
+    expect(b.r - b.l).toBe(T.CARD_W.more);
+    const c = h.at('stick-left');
+    const r = (38 * FH) / 200;
+    expect(b.l < c.x + r && c.x - r < b.r && b.t < c.y + r && c.y - r < b.b).toBe(false);
+    for (const id of ['btn-a', 'btn-lt', 'btn-start', 'dpad', 'stick-right']) {
+      selectCtl(id);
+      const bb = cardBox();
+      const p = h.at(id);
+      const [bw, bh] = T.controlBox(ctlOf(host.store, id)) as [number, number];
+      expect(bb.l < p.x + (bw * FH) / 200 && p.x - (bw * FH) / 200 < bb.r && bb.t < p.y + (bh * FH) / 200 && p.y - (bh * FH) / 200 < bb.b, id).toBe(false);
+      expect(bb.b - bb.t).toBeLessThanOrEqual(FH - 60);
+    }
+  });
+
+  it('button: Label, Sends (12 buttons), Shape, Mode, Trigger; every change is saved with Done like Size and Opacity', async () => {
+    selectCtl('btn-lt');
+    openMore();
+    // label
+    const input = cardEl().querySelector('.card-input') as HTMLInputElement;
+    expect(input.maxLength).toBe(LIMITS.labelChars);
+    expect(input.value).toBe('LT');
+    input.value = 'Aim';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(h.ctl('btn-lt').textContent).toBe('Aim');
+    expect(document.contains(input)).toBe(true); // typing does not rebuild the card (the keyboard would drop)
+    // the 12 buttons
+    expect(chips('Sends')).toEqual(['A', 'B', 'X', 'Y', 'LB', 'RB', 'LT', 'RT', 'Start', 'Back', 'L3', 'R3']);
+    expect(checked('Sends')).toBe('LT');
+    tapAt(chip('Sends', 'RT'));
+    expect(h.ctl('btn-lt').dataset['button']).toBe('RT');
+    expect(h.ctl('btn-lt').textContent).toBe('Aim'); // a label of their own stays
+    expect(cardEl().querySelector('.card-title')?.textContent).toBe('Right trigger');
+    expect(checked('Sends')).toBe('RT');
+    // shape: a pill, then a circle (round again)
+    tapAt(chip('Shape', 'Pill'));
+    expect(h.ctl('btn-lt').className).toContain('shape-pill');
+    tapAt(chip('Shape', 'Circle'));
+    expect(h.ctl('btn-lt').className).toContain('shape-circle');
+    expect(labels()).not.toContain('Width');
+    tapAt(chip('Shape', 'Rect'));
+    expect(labels()).toContain('Width');
+    dragSlider('Width', 1);
+    expect(h.ctl('btn-lt').style.getPropertyValue('--w')).toBe('40');
+    dragSlider('Height', 0);
+    expect(h.ctl('btn-lt').style.getPropertyValue('--h')).toBe('8');
+    // mode
+    expect(checked('Mode')).toBe('Hold');
+    tapAt(chip('Mode', 'Toggle'));
+    expect(checked('Mode')).toBe('Toggle');
+    tapAt(chip('Mode', 'Rapid'));
+    expect(checked('Mode')).toBe('Rapid');
+    // trigger strength is a percentage of 255
+    expect(row('Trigger').querySelector('.slider-value')?.textContent).toBe('100%');
+    dragSlider('Trigger', 0.5);
+    expect(row('Trigger').querySelector('.slider-value')?.textContent).toBe('55%');
+    tapAt(chip('Sends', 'A'));
+    expect(labels()).not.toContain('Trigger'); // only LT and RT have a strength
+    const st = await saved();
+    expect(ctlOf(st, 'btn-lt')).toMatchObject({ button: 'A', label: 'Aim', shape: 'rect', w: 40, h: 8, latch: false, turbo: true });
+    expect(ctlOf(st, 'btn-lt').value).toBe(Math.round(0.55 * 255));
+    fixedPoint(st);
+  });
+
+  it('clearing the label gives the button its own name back', () => {
+    selectCtl('btn-start');
+    openMore();
+    const input = cardEl().querySelector('.card-input') as HTMLInputElement;
+    expect(input.value).toBe('Start');
+    input.value = '';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(h.ctl('btn-start').textContent).toBe('Start');
+    input.value = 'Pause2';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(h.ctl('btn-start').textContent).toBe('Pause2');
+  });
+
+  it('stick: side, Mode, Dead zone, Sensitivity, Curve, Invert X / Y, Double-tap; saved and playable', async () => {
+    selectCtl('stick-left');
+    openMore();
+    expect(labels()).toEqual(['Size', 'Opacity', 'Stick', 'Mode', 'Dead zone', 'Sensitivity', 'Curve', 'Invert X', 'Invert Y', 'Double-tap = click']);
+    expect(checked('Stick')).toBe('Left');
+    tapAt(chip('Stick', 'Right'));
+    tapAt(chip('Mode', 'Floating'));
+    expect(h.ctl('stick-left').classList.contains('is-floating')).toBe(true);
+    tapAt(chip('Curve', 'Precise'));
+    expect(checked('Curve')).toBe('Precise');
+    dragSlider('Dead zone', 0.4);
+    expect(row('Dead zone').querySelector('.slider-value')?.textContent).toBe('20%');
+    dragSlider('Sensitivity', 1);
+    expect(row('Sensitivity').querySelector('.slider-value')?.textContent).toBe('2.0');
+    flip('Invert X');
+    flip('Invert Y');
+    flip('Double-tap = click');
+    expect(row('Invert X').querySelector('.switch')?.getAttribute('aria-checked')).toBe('true');
+    expect(row('Double-tap = click').querySelector('.switch')?.getAttribute('aria-checked')).toBe('false'); // it was on
+    const st = await saved();
+    expect(ctlOf(st, 'stick-left')).toMatchObject({ stick: 'right', mode: 'floating', curve: 'precise', deadzone: 0.2, sensitivity: 2, invertX: true, invertY: true, doubleTapClick: false });
+    fixedPoint(st);
+    // and it plays that way
     const c = h.at('stick-left');
     const r = ((38 * FH) / 100) / 2;
-    ptr(h.ctl('stick-left'), 'pointerdown', 3, c.x, c.y);
+    ptr(h.ctl('stick-left'), 'pointerdown', 1, c.x, c.y);
     vi.advanceTimersByTime(10);
-    ptr(h.ctl('stick-left'), 'pointermove', 3, c.x, c.y - r * 0.2); // r 0.2: m = 0.111, x 2.5 = 0.278 (linear, up positive)
-    expect(h.ws().states().at(-1)?.ly).toBe(Math.round(((0.2 - 0.1) / 0.9) * 2.5 * 32767));
-    ptr(h.ctl('stick-left'), 'pointerup', 3);
-    // d-pad diagonals are back on
+    ptr(h.ctl('stick-left'), 'pointermove', 1, c.x + r, c.y);
+    expect(h.ws().states().at(-1)).toMatchObject({ rx: -32767, ry: 0, lx: 0 }); // right stick, X inverted
+  });
+
+  it('d-pad: Diagonals', async () => {
+    selectCtl('dpad');
+    openMore();
+    expect(labels()).toEqual(['Size', 'Opacity', 'Diagonals']);
+    expect(row('Diagonals').querySelector('.switch')?.getAttribute('aria-checked')).toBe('true');
+    flip('Diagonals');
+    expect(row('Diagonals').querySelector('.switch')?.getAttribute('aria-checked')).toBe('false');
+    expect(ctlOf(await saved(), 'dpad').diagonals).toBe(false);
+  });
+
+  it('every row of the More panel is a 44 pt target, and the chips stay at least 44 pt wide', () => {
+    const css = read('controller.css').replace(/\/\*[\s\S]*?\*\//g, '');
+    const decl = (sel: string): string => [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].filter((m) => (m[1] as string).split(',').some((x) => x.trim() === sel)).map((m) => m[2]).join(';');
+    expect(decl('.card-row')).toMatch(/height:\s*44px/);
+    expect(decl('.choice')).toMatch(/height:\s*44px/);
+    expect(decl('.card-input')).toMatch(/height:\s*44px/);
+    expect(decl('.card-input')).toMatch(/font-size:\s*16px/); // iOS zooms the page for anything smaller
+    expect(decl('.card-input')).toMatch(/user-select:\s*text/); // the page is user-select: none, which would stop typing
+    expect(decl('.opt')).toMatch(/min-width:\s*44px/);
+    expect(decl('.card')).toMatch(/overflow-y:\s*auto/);
+    expect(decl('.card')).toMatch(/overscroll-behavior:\s*contain/);
+    expect(T.CARD_W.more - 24 - 3 - 5 * 6).toBeGreaterThanOrEqual(6 * 44); // six chips of 44 pt fit a wrapped row
+  });
+
+  it('the label field can be typed in: the page does not cancel its selection, and a resize (the keyboard) does not rebuild the card', () => {
+    selectCtl('btn-a');
+    openMore();
+    const input = cardEl().querySelector('.card-input') as HTMLInputElement;
+    const sel = new Event('selectstart', { bubbles: true, cancelable: true });
+    input.dispatchEvent(sel);
+    expect(sel.defaultPrevented).toBe(false);
+    const other = new Event('selectstart', { bubbles: true, cancelable: true });
+    h.ctl('btn-a').dispatchEvent(other);
+    expect(other.defaultPrevented).toBe(true);
+    window.dispatchEvent(new Event('resize'));
+    expect(cardEl().querySelector('.card-input')).toBe(input);
+    // the card and the sheet scroll; the rest of the page does not
+    const inCard = new Event('touchmove', { bubbles: true, cancelable: true });
+    cardEl().dispatchEvent(inCard);
+    expect(inCard.defaultPrevented).toBe(false);
+    const elsewhere = new Event('touchmove', { bubbles: true, cancelable: true });
+    h.ctl('btn-a').dispatchEvent(elsewhere);
+    expect(elsewhere.defaultPrevented).toBe(true);
+  });
+
+  it('Add control: Button, Stick and D-pad each appear in the middle, selected, with their card; Done saves them', async () => {
+    const add = (name: string): HTMLElement => cardEl().querySelector(`[aria-label="Add ${name}"]`) as HTMLElement;
+    expect([...cardEl().querySelectorAll('.card-row')].map((r) => r.querySelector('.card-label')?.textContent ?? '')).toContain('Add');
+    tapAt(add('button'));
+    let sel = document.querySelector('.is-selected') as HTMLElement;
+    expect(sel.dataset['type']).toBe('button');
+    expect(sel.style.left).toBe('50%');
+    expect(sel.style.top).toBe('50%');
+    expect(sel.dataset['button']).toBe('L3');
+    expect(cardEl().querySelector('.card-title')?.textContent).toBe('Left stick click (L3)');
+    expect(cardEl().classList.contains('is-settings')).toBe(false);
+    ptr(document.getElementById('field') as Element, 'pointerdown', 40, 440, 395); // empty: back to the settings
+    tapAt(add('stick'));
+    sel = document.querySelector('.is-selected') as HTMLElement;
+    expect(sel.dataset['type']).toBe('stick');
+    ptr(document.getElementById('field') as Element, 'pointerdown', 41, 440, 395);
+    tapAt(add('D-pad'));
+    expect((document.querySelector('.is-selected') as HTMLElement).dataset['type']).toBe('dpad');
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(16);
+    const st = await saved();
+    expect(T.activeLayout(st).controls).toHaveLength(16);
+    fixedPoint(st);
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(16);
+  });
+
+  it('Add control respects the limit: a full layout shows a message and adds nothing', () => {
+    const add = (): HTMLElement => cardEl().querySelector('[aria-label="Add D-pad"]') as HTMLElement;
+    for (let i = 13; i < LIMITS.controls; i++) {
+      tapAt(add());
+      ptr(document.getElementById('field') as Element, 'pointerdown', 50 + i, 440, 395);
+    }
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(LIMITS.controls);
+    tapAt(add());
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(LIMITS.controls);
+    expect(cardEl().querySelector('.card-msg')?.textContent).toBe('Layout is full');
+    selectCtl('btn-a');
+    openMore();
+    tapAt(cardEl().querySelector('.card-btn.grow') as Element); // Duplicate
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(LIMITS.controls);
+    expect(cardEl().querySelector('.card-msg')?.textContent).toBe('Layout is full');
+  });
+
+  it('Duplicate copies the selected control a little aside and selects the copy', async () => {
+    selectCtl('btn-a');
+    openMore();
+    const buttons = [...cardEl().querySelectorAll('.card-btn.grow')];
+    expect(buttons.map((b) => b.textContent)).toEqual(['Duplicate', 'Delete']);
+    tapAt(buttons[0] as Element);
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(14);
+    const sel = document.querySelector('.is-selected') as HTMLElement;
+    expect(sel.dataset['cid']).not.toBe('btn-a');
+    expect(sel.dataset['button']).toBe('A');
+    expect(sel.style.left).toBe('89%');
+    const st = await saved();
+    expect(T.activeLayout(st).controls).toHaveLength(14);
+    fixedPoint(st);
+  });
+
+  it('Delete needs a second tap within 2 s: the first only arms it, a pause disarms it, a new card starts disarmed', async () => {
+    selectCtl('btn-a');
+    openMore();
+    const del = (): HTMLElement => [...cardEl().querySelectorAll<HTMLElement>('.card-btn.grow')][1] as HTMLElement;
+    tapAt(del());
+    expect(del().textContent).toBe('Tap again');
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(13);
+    vi.advanceTimersByTime(2100);
+    expect(del().textContent).toBe('Delete');
+    tapAt(del()); // a tap after the pause is a first tap again
+    expect(del().textContent).toBe('Tap again');
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(13);
+    vi.advanceTimersByTime(1900);
+    tapAt(del()); // inside the 2 s window
+    await settle();
+    expect(document.querySelectorAll('[data-cid]')).toHaveLength(12);
+    expect(document.querySelector('[data-cid="btn-a"]')).toBeNull();
+    expect(cardEl().classList.contains('is-settings')).toBe(true); // nothing is selected any more
+    const st = await saved();
+    expect(ctlOf(st, 'btn-a')).toBeUndefined();
+    fixedPoint(st);
+  });
+
+  it('the settings card has 4 rows (slots and Reset, Add, Stick sensitivity, Haptics) and no home screen row off iOS', () => {
+    expect(cardBox().b - cardBox().t).toBe(T.CARD_PAD + 4 * T.ROW_H);
+    expect(cardEl().textContent).not.toContain('Home Screen');
+    expect(cardBox().r - cardBox().l).toBe(T.CARD_W.settings);
+  });
+});
+
+describe('an old store from the complicated editor', () => {
+  it('loads, plays with the values it stored (toggle, rapid fire, trigger strength), and saves cleanly with the extra layouts untouched', async () => {
+    host.store = oldStore();
+    h = await mount();
+    // every button of the old store has latch AND turbo. The editor shows that as "Toggle" (latch wins), so it plays as a plain
+    // toggle: one tap switches it on and it stays on without blinking (no endless rapid fire), the next tap switches it off.
+    const sent = h.ws().states().length;
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.A);
+    ptr(h.ctl('btn-a'), 'pointerup', 1);
+    vi.advanceTimersByTime(1000);
+    expect(h.ws().states().slice(sent).map((s) => s.buttons)).toEqual([BTN.A]);
+    ptr(h.ctl('btn-a'), 'pointerdown', 2);
+    vi.advanceTimersByTime(300);
+    ptr(h.ctl('btn-a'), 'pointerup', 2);
+    expect(h.ws().states().at(-1)?.buttons).toBe(0);
+    expect(h.ctl('btn-a').classList.contains('is-down')).toBe(false);
+    // the trigger sends the strength it was given (value 90), not 255
+    ptr(h.ctl('btn-lt'), 'pointerdown', 3);
+    expect(h.ws().states().at(-1)?.lt).toBe(90);
+    ptr(h.ctl('btn-lt'), 'pointerdown', 4);
+    // the d-pad was stored without diagonals: strictly four-way
     const dp = h.at('dpad');
     const half = (26 * FH) / 100 / 2;
-    vi.advanceTimersByTime(300);
-    ptr(h.ctl('dpad'), 'pointerdown', 4, dp.x + half * 0.7, dp.y + half * 0.7);
-    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.DPAD_RIGHT | BTN.DPAD_DOWN);
-    ptr(h.ctl('dpad'), 'pointerup', 4);
+    vi.advanceTimersByTime(10);
+    ptr(h.ctl('dpad'), 'pointerdown', 5, dp.x + half * 0.7, dp.y + half * 0.7);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.DPAD_RIGHT); // right only: a diagonal would add DOWN
+    ptr(h.ctl('dpad'), 'pointerup', 5);
     // a label is rendered as stored
     expect(h.ctl('btn-a').textContent).toBe('Jump');
-    // Done saves cleanly
+    // Done saves what was loaded, unchanged
     tapAt(menuEl());
     tapAt(doneEl());
     await settle();
     const saved = host.puts()[0] as LayoutStore;
-    expect(saved.layouts).toHaveLength(LIMITS.layouts);
-    expect(saved.activeId).toBe('old-1');
+    expect(saved).toEqual(oldStore());
     fixedPoint(saved);
-    for (const l of saved.layouts) {
-      for (const ctl of l.controls) {
-        if (ctl.type === 'button') expect(ctl).toMatchObject({ latch: false, turbo: false, value: 255 });
-        if (ctl.type === 'stick') expect(ctl).toMatchObject({ mode: 'fixed', curve: 'linear', invertX: false, invertY: false, deadzone: 0.1, doubleTapClick: true });
-        if (ctl.type === 'dpad') expect(ctl.diagonals).toBe(true);
-      }
-    }
   });
 });
 

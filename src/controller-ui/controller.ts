@@ -12,18 +12,24 @@
  *
  * Design notes
  *  - Layouts live on the HOST (per phone IP). The page loads them with GET /api/layouts, edits a local copy, and saves the whole
- *    store with ONE PUT /api/layouts when the user taps Done. Nothing is kept on the phone except the player-name digits.
+ *    store with ONE PUT /api/layouts when the user taps Done. The phone keeps only the player-name digits and a "home screen
+ *    sheet was shown" flag (both through storageGet/storageSet, which survive blocked storage).
  *  - Input first: a pointer event updates the held state and sends the frame from inside the handler; painting happens after, with
  *    transforms only, and no layout is read while a finger is down (geometry is measured on resize, not on touch).
  *  - There is no animation-frame loop: Safari drops rAF to 30 fps in Low Power Mode. Sends are event-driven with timers only for
- *    the 8 ms stick gap, the 24 ms minimum press, the 500 ms keepalive and the Android vibration clock (iOS has none: see
- *    createHaptics). A send from inside a handler cancels any trailing send that was armed before it.
+ *    the 8 ms stick gap, the 24 ms minimum press, the 500 ms keepalive, the 50 ms rapid-fire blink while a rapid-fire button is
+ *    held, and the Android vibration clock (iOS has none: see createHaptics). A send from inside a handler cancels any trailing
+ *    send that was armed before it.
  *  - Anything that could leave a control stuck (page hidden, window blur, socket closed, cancelled pointer, portrait, entering the
- *    editor) releases every control and sends one neutral state.
- *  - Haptics: Android/Chrome have navigator.vibrate (a duration, no amplitude). iOS Safari has NO Vibration API, so there the page
- *    tries the system tick of a hidden <input type=checkbox switch>; strength is emulated as tick RATE, and ticks are only attempted
- *    from inside input handlers. This is best effort: WebKit requires a user gesture for that haptic (288403@main, Jan 2025) and
- *    since WebKit commit fc1ef83eae (May 2026) also a TRUSTED click, which a script-driven label.click() is not. See createHaptics.
+ *    editor) releases every control (toggled buttons too) and sends one neutral state.
+ *  - Haptics: Android/Chrome have navigator.vibrate (a duration, no amplitude). iOS Safari has NO Vibration API. Its only haptic
+ *    from a web page is the system tick of a real <input type=checkbox switch> that the finger itself touches: since WebKit commit
+ *    fc1ef83 (iOS 26.5) a script-driven label.click() or a timer no longer plays it. So on iOS every button and the d-pad carry a
+ *    transparent switch laid over them (see syncOverlay); the finger lands on it, the browser generates the click, the Taptic
+ *    Engine ticks. That means ONE tick per tap and no stick ramp, and the tick may come on release rather than on press.
+ *    UNVERIFIED on a real iPhone: ?diag=1 has a test switch that shows whether and when the click arrives.
+ *  - Home screen: iOS Safari that is not running standalone gets a one-time "Add to Home Screen" sheet and a permanent row in the
+ *    settings card (full screen, no address bar). Android Chrome's beforeinstallprompt, when it fires, backs the same row.
  *  - Nothing is logged: the page URL carries the session token.
  */
 (() => {
@@ -156,11 +162,20 @@
   const MAX_SLOT = 99;
   const WS_OPEN = 1;
   const NAME_KEY = 'lanplay.pad.number';
+  const HOME_SEEN_KEY = 'lanplay.home.seen';
+  const TURBO_HALF_MS = 50; // rapid fire: 50 ms down, 50 ms up (10 presses a second)
+  const CONFIRM_MS = 2000; // a second tap on Delete within this long confirms it
+  const FLOATING_ZONE = 1.5; // a floating stick's touch area is this many times its base size (the CSS base is 1 / 1.5 of it)
   const SENSITIVITY_RANGE = { min: 0.5, max: 2 } as const;
   const OPACITY_MIN = 0.2;
   const SIZE_RANGE = { stick: { min: 24, max: 60 }, dpad: { min: 18, max: 45 }, button: { min: 8, max: 30 } } as const;
-  const CARD_CONTROL = { w: 280, h: 136 } as const;
-  const CARD_SETTINGS = { w: 300, h: 168 } as const;
+  const DIM_RANGE = { min: 8, max: 40 } as const; // the Width / Height sliders of a rect or pill button
+  const DEADZONE_RANGE = { min: 0, max: 0.5 } as const;
+  // The card is 44 pt rows inside 8 pt padding and a 1.5 pt border; its height is worked out from the rows, not measured (see cardHeight).
+  const ROW_H = 44;
+  const CARD_PAD = 19;
+  const CARD_W = { settings: 300, control: 280, more: 328 } as const; // the wide one fits six 44 pt chips in a row
+  const CHOICE_COLS = 6;
 
   // ================================================================================================================
   // 2. Pure logic (reachable from tests through the hook at the bottom)
@@ -243,7 +258,7 @@
   const flag: Validator = (v) => (typeof v === 'boolean' ? v : undefined);
   const dimension = numberIn(LIMITS.size.min, LIMITS.size.max, 2);
   const COMMON_PROPS: Record<string, Validator> = { x: numberIn(0, 100, 2), y: numberIn(0, 100, 2), opacity: numberIn(LIMITS.opacity.min, LIMITS.opacity.max, 2) };
-  /** What a control may carry. The editor only ever writes x, y, opacity, size (w/h) and stick sensitivity; the rest is read tolerantly. */
+  /** What a control may carry: everything layout.ts stores. Unknown keys and invalid values are ignored. */
   const PROPS: Record<Control['type'], Record<string, Validator>> = {
     stick: {
       ...COMMON_PROPS,
@@ -292,16 +307,6 @@
     return changed ? (next as unknown as Control) : c;
   }
 
-  /**
-   * The simple editor does not expose these, so a store written by the old editor must not change how the pad plays: they are
-   * forced on load (and the cleaned store is what gets saved). Shape, label and size of other controls render as stored.
-   */
-  function forceFixed(c: Control): Control {
-    if (c.type === 'button') return { ...c, latch: false, turbo: false, value: 255 };
-    if (c.type === 'stick') return { ...c, mode: 'fixed', curve: 'linear', invertX: false, invertY: false, deadzone: 0.1, doubleTapClick: true };
-    return { ...c, diagonals: true };
-  }
-
   /** Tolerant read of a control from host JSON: anything missing or invalid falls back to the defaults. Never throws. */
   function coerceControl(raw: unknown, used: Set<string>, index: number): Control | null {
     if (!isObj(raw)) return null;
@@ -313,7 +318,7 @@
     const wanted = typeof raw['id'] === 'string' ? raw['id'] : `${kind.toLowerCase()}-${index}`;
     const id = freshId(wanted, used);
     used.add(id);
-    return forceFixed(applyProps(newControl(kind, id, 50, 50), raw));
+    return applyProps(newControl(kind, id, 50, 50), raw);
   }
 
   /** Tolerant read of a store from host JSON, or null when it has no usable layout. Layouts beyond the three slots are kept as they are. */
@@ -345,7 +350,18 @@
 
   /** Touch-area size of a control as [width, height], in percent of the field HEIGHT. */
   function controlBox(c: Control): [number, number] {
-    return c.type === 'button' ? [c.w, c.h] : [c.size, c.size];
+    if (c.type === 'button') return [c.w, c.h];
+    const s = c.type === 'stick' && c.mode === 'floating' ? c.size * FLOATING_ZONE : c.size;
+    return [s, s];
+  }
+
+  /**
+   * Where a floating stick's base is drawn on one axis: under the first touch, but kept inside the touch area so the whole base
+   * stays visible. `centre` is the touch area's centre, `zone` its half size and `radius` that of the base (all pixels).
+   */
+  function floatingCentre(touch: number, centre: number, zone: number, radius: number): number {
+    const slack = Math.max(0, zone - radius);
+    return clampTo(touch, centre - slack, centre + slack);
   }
 
   /** Half extent of a control as [percent of width, percent of height]; `aspect` = field width / height. */
@@ -421,6 +437,11 @@
     return { x, y: best.y };
   }
 
+  /** Card height from its rows (each a number of pixels): padding and border plus rows, never taller than `max` (the card scrolls then). */
+  function cardHeight(rows: readonly number[], max: number): number {
+    return Math.min(Math.max(max, ROW_H), CARD_PAD + rows.reduce((a, b) => a + b, 0));
+  }
+
   // ---- Layout store operations (pure: each returns a new store, or the SAME store when it is a no-op) ------------------
 
   function activeLayout(store: LayoutStore): Layout {
@@ -475,6 +496,32 @@
   function opacityRange(c: Control): { min: number; max: number } {
     return { min: Math.min(OPACITY_MIN, c.opacity), max: 1 };
   }
+  /** Range of the Width / Height sliders, widened to include a stored value outside it. */
+  function dimRange(v: number): { min: number; max: number } {
+    return { min: Math.min(DIM_RANGE.min, v), max: Math.max(DIM_RANGE.max, v) };
+  }
+  /** Height (px) of a wrapped choice row: a label line and `count` chips in rows of CHOICE_COLS. */
+  function gridHeight(count: number): number {
+    const lines = Math.max(1, Math.ceil(count / CHOICE_COLS));
+    return 24 + lines * ROW_H + (lines - 1) * 6;
+  }
+
+  /** The three ways a button can behave, as the "Mode" choice shows them (latch wins if a stored button has both flags). */
+  type ButtonMode = 'hold' | 'toggle' | 'rapid';
+  function buttonMode(c: ButtonControl): ButtonMode {
+    return c.latch ? 'toggle' : c.turbo ? 'rapid' : 'hold';
+  }
+  function modePatch(m: ButtonMode): { latch: boolean; turbo: boolean } {
+    return { latch: m === 'toggle', turbo: m === 'rapid' };
+  }
+
+  /** `c` with `patch` applied and, when that changed it, its centre pulled back so the whole control is on screen. */
+  function patchControl(c: Control, patch: Readonly<Record<string, unknown>>, aspect: number): Control {
+    const next = applyProps(c, patch);
+    if (next === c) return c;
+    const [hx, hy] = halfExtent(next, aspect);
+    return { ...next, x: clampCentre(next.x, hx), y: clampCentre(next.y, hy) };
+  }
 
   /**
    * Set the Size of a control. Buttons scale width and height together: `ratio` (width / height) is the one the control had when
@@ -485,17 +532,64 @@
     return mapControl(store, id, (c) => {
       const r = sizeRange(c);
       const v = round(clampTo(value, r.min, r.max), 2);
-      let next: Control;
-      if (c.type === 'button') {
-        const k = ratio !== undefined && ratio > 0 ? ratio : c.h > 0 ? c.w / c.h : 1;
-        next = applyProps(c, { h: v, w: round(v * k, 2) });
-      } else {
-        next = applyProps(c, { size: v });
-      }
-      if (next === c) return c;
-      const [hx, hy] = halfExtent(next, aspect);
-      return { ...next, x: clampCentre(next.x, hx), y: clampCentre(next.y, hy) };
+      if (c.type !== 'button') return patchControl(c, { size: v }, aspect);
+      const k = ratio !== undefined && ratio > 0 ? ratio : c.h > 0 ? c.w / c.h : 1;
+      return patchControl(c, { h: v, w: round(v * k, 2) }, aspect);
     });
+  }
+
+  /**
+   * Set any properties the "More" panel offers (validated and clamped by applyProps; unknown keys are ignored). Two rules the panel
+   * relies on: giving a button a new mapping renames it too, unless the player gave it a label of their own; and a circle is
+   * always round, so choosing it squares the button off to its height.
+   */
+  function setProps(store: LayoutStore, id: string, patch: Readonly<Record<string, unknown>>, aspect = 2): LayoutStore {
+    return mapControl(store, id, (c) => {
+      let p = patch;
+      if (c.type === 'button') {
+        const to = patch['button'];
+        if (typeof to === 'string' && (BUTTON_NAMES as readonly string[]).includes(to) && c.label === BUTTON_LOOK[c.button].label && !('label' in patch)) p = { ...p, label: BUTTON_LOOK[to as ButtonName].label };
+        if (patch['shape'] === 'circle') p = { ...p, w: c.h };
+      }
+      return patchControl(c, p, aspect);
+    });
+  }
+
+  /** Which control kinds the editor can add. */
+  type AddKind = 'button' | 'stick' | 'dpad';
+
+  /**
+   * Put a new control in the middle of the active layout. A button gets the first button name the layout does not have yet, a
+   * stick the side it does not have yet. Null when the layout is full (LIMITS.controls).
+   */
+  function addControl(store: LayoutStore, kind: AddKind): { store: LayoutStore; id: string } | null {
+    const layout = activeLayout(store);
+    if (layout.controls.length >= LIMITS.controls) return null;
+    const id = freshId(kind === 'button' ? 'btn' : kind, new Set(layout.controls.map((c) => c.id)));
+    let made: Control;
+    if (kind === 'button') {
+      const used = new Set(layout.controls.flatMap((c) => (c.type === 'button' ? [c.button] : [])));
+      made = newControl(BUTTON_NAMES.find((n) => !used.has(n)) ?? 'A', id, 50, 50);
+    } else {
+      made = newControl(kind, id, 50, 50);
+      if (made.type === 'stick' && layout.controls.some((c) => c.type === 'stick' && c.stick === 'left')) made = { ...made, stick: 'right' };
+    }
+    return { store: mapActive(store, (l) => ({ ...l, controls: [...l.controls, made] })), id };
+  }
+
+  /** A copy of a control, a little down and to the right so it can be told from the original. Null when the layout is full. */
+  function duplicateControl(store: LayoutStore, id: string, aspect = 2): { store: LayoutStore; id: string } | null {
+    const layout = activeLayout(store);
+    const src = layout.controls.find((c) => c.id === id);
+    if (!src || layout.controls.length >= LIMITS.controls) return null;
+    const copyId = freshId(src.id, new Set(layout.controls.map((c) => c.id)));
+    const [hx, hy] = halfExtent(src, aspect);
+    const copy: Control = { ...src, id: copyId, x: clampCentre(src.x + 4, hx), y: clampCentre(src.y + 6, hy) };
+    return { store: mapActive(store, (l) => ({ ...l, controls: [...l.controls, copy] })), id: copyId };
+  }
+
+  function deleteControl(store: LayoutStore, id: string): LayoutStore {
+    return mapActive(store, (l) => (l.controls.some((c) => c.id === id) ? { ...l, controls: l.controls.filter((c) => c.id !== id) } : l));
   }
 
   function setOpacity(store: LayoutStore, id: string, value: number): LayoutStore {
@@ -617,14 +711,14 @@
     return m;
   }
 
-  /** The wire state for the buttons currently down. LT and RT are digital: 255. */
-  function buildPad(buttons: Iterable<ButtonName>, dpad: number, ls: Readonly<Axes>, rs: Readonly<Axes>): Pad {
+  /** The wire state for the buttons currently down. LT and RT send `trigger` (the control's strength, 255 unless the player lowered it). */
+  function buildPad(buttons: Iterable<ButtonName>, dpad: number, ls: Readonly<Axes>, rs: Readonly<Axes>, trigger: Readonly<{ LT: number; RT: number }> = { LT: 255, RT: 255 }): Pad {
     let b = dpad & DPAD_BITS;
     let lt = 0;
     let rt = 0;
     for (const name of buttons) {
-      if (name === 'LT') lt = 255;
-      else if (name === 'RT') rt = 255;
+      if (name === 'LT') lt = trigger.LT;
+      else if (name === 'RT') rt = trigger.RT;
       else b |= BUTTON_BITS[name] ?? 0;
     }
     const axis = (v: number): number => clampTo(Math.round(v) || 0, -32768, AXIS_MAX);
@@ -649,11 +743,14 @@
 
   type HapticMode = 'android' | 'ios' | 'none';
 
-  /** Android and desktop Chrome have navigator.vibrate; iOS Safari does not (it gets the switch tick); anything else stays silent. */
+  function isIosDevice(ua: string, maxTouchPoints: number): boolean {
+    return /iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && maxTouchPoints > 1);
+  }
+
+  /** Android and desktop Chrome have navigator.vibrate; iOS Safari does not (its tick comes from the switch overlays); anything else stays silent. */
   function hapticMode(ua: string, maxTouchPoints: number, hasVibrate: boolean): HapticMode {
     if (hasVibrate) return 'android';
-    if (/iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && maxTouchPoints > 1)) return 'ios';
-    return 'none';
+    return isIosDevice(ua, maxTouchPoints) ? 'ios' : 'none';
   }
 
   /** Android stick feedback by deflection d: a pulse of `pulse` ms every `period` ms, stronger (longer, more often) the farther it is pulled. */
@@ -684,43 +781,12 @@
     return { s, vibrate: null, wait: s.nextAt - now };
   }
 
-  const IOS_STICK_MIN_D = 0.2;
-  const IOS_STICK_MIN_MS = 55; // a stick never ticks faster than this
-  const IOS_ANY_MIN_MS = 25; // nothing ticks faster than this
-
-  /** iOS stick strength is the tick RATE: nothing under d = 0.2, then 4 Hz rising to 18 Hz at full deflection. */
-  function iosStickInterval(d: number): number | null {
-    if (!(d >= IOS_STICK_MIN_D)) return null;
-    const hz = 4 + (14 * (Math.min(1, d) - IOS_STICK_MIN_D)) / (1 - IOS_STICK_MIN_D);
-    return Math.max(IOS_STICK_MIN_MS, 1000 / hz);
-  }
-
-  interface TickGate {
-    /** Time of the last tick of any kind. */
-    lastAny: number;
-    /** Earliest time of the next stick tick. */
-    nextStickDue: number;
-  }
-  /** A button/d-pad tick takes priority over the stick cadence but still obeys the global 25 ms spacing. */
-  function buttonTickAllowed(g: TickGate, now: number): boolean {
-    return now - g.lastAny >= IOS_ANY_MIN_MS;
-  }
-  /** Whether a stick tick is due now, and how long until it will be (the interval at the current deflection). */
-  function iosStickDecision(g: TickGate, d: number, now: number): { fire: boolean; wait: number | null } {
-    const iv = iosStickInterval(d);
-    if (iv === null) return { fire: false, wait: null };
-    const due = Math.max(g.nextStickDue, g.lastAny + IOS_ANY_MIN_MS);
-    return now >= due ? { fire: true, wait: iv } : { fire: false, wait: due - now };
-  }
-
   interface HapticDeps {
     mode: HapticMode;
     /** Layout setting: false means no vibration anywhere. */
     enabled(): boolean;
     /** Android sink: navigator.vibrate. */
     vibrate(ms: number): void;
-    /** iOS sink: one switch tick. */
-    iosTick(): void;
     now(): number;
     setTimer(fn: () => void, ms: number): unknown;
     clearTimer(handle: unknown): void;
@@ -734,9 +800,12 @@
     stop(): void;
   }
 
-  /** Android: a 10 ms vibrate per press, a pulse train for sticks. iOS: switch ticks, stick strength as rate. Never throws. */
+  /**
+   * Android: a 10 ms vibrate per press and a pulse train that follows the stick pull. Everything else does nothing here: iOS has no
+   * programmatic haptic any more (a script-made switch click or a timer is not a trusted gesture), its ticks are real touches on
+   * the overlays. Never throws.
+   */
   function createHaptics(deps: HapticDeps): Haptics {
-    let gate: TickGate = { lastAny: -1e9, nextStickDue: 0 };
     let android: AndroidStick = { active: false, nextAt: 0, pulse: 0 };
     let timer: unknown = null;
     let timerDue = 0;
@@ -763,24 +832,13 @@
     };
     function step(): void {
       const now = deps.now();
-      if (deps.mode === 'android') {
-        const r = androidStickStep(android, lastD, now);
-        android = r.s;
-        if (r.vibrate !== null) {
-          const ms = r.vibrate;
-          safe(() => deps.vibrate(ms));
-        }
-        arm(r.wait, now);
-      } else if (deps.mode === 'ios') {
-        // iOS: WebKit only plays the switch haptic while it is processing a user gesture (CheckboxInputType.cpp,
-        // performSwitchVisuallyOnAnimation), so a tick from a timer can never be felt. Ticks are therefore only attempted
-        // synchronously from an input event (setStick is called from pointerdown/pointermove); no timer is armed.
-        const dec = iosStickDecision(gate, lastD, now);
-        if (dec.fire) {
-          gate = { lastAny: now, nextStickDue: now + (iosStickInterval(lastD) ?? IOS_STICK_MIN_MS) };
-          safe(deps.iosTick);
-        }
+      const r = androidStickStep(android, lastD, now);
+      android = r.s;
+      if (r.vibrate !== null) {
+        const ms = r.vibrate;
+        safe(() => deps.vibrate(ms));
       }
+      arm(r.wait, now);
     }
     function onTimer(): void {
       timer = null;
@@ -790,22 +848,17 @@
     function stop(): void {
       clearTimer();
       lastD = 0;
-      if (deps.mode === 'android' && android.active) {
+      if (android.active) {
         android = { active: false, nextAt: 0, pulse: 0 };
         safe(() => deps.vibrate(0));
       }
     }
     return {
       tick(): void {
-        if (deps.mode === 'none' || !deps.enabled()) return;
-        if (deps.mode === 'android') return safe(() => deps.vibrate(10));
-        const now = deps.now();
-        if (!buttonTickAllowed(gate, now)) return;
-        gate = { ...gate, lastAny: now };
-        safe(deps.iosTick);
+        if (deps.mode === 'android' && deps.enabled()) safe(() => deps.vibrate(10));
       },
       setStick(d: number): void {
-        if (deps.mode === 'none') return;
+        if (deps.mode !== 'android') return;
         if (!deps.enabled()) return stop();
         lastD = d;
         if (d <= 0) return stop();
@@ -813,6 +866,31 @@
       },
       stop,
     };
+  }
+
+  // ---- Switch overlay diagnostics (pure) ---------------------------------------------------------------------------------
+
+  /**
+   * One line for ?diag=1: how long after the finger touched the switch its click arrived. A click within a few ms of the touch
+   * means the browser fires it on press, otherwise it fires on release (the finger was down for about that long).
+   */
+  function describeSwitchClick(downAt: number | null, clickAt: number): string {
+    if (downAt === null || clickAt < downAt) return 'click, touch time unknown';
+    const ms = Math.round(clickAt - downAt);
+    return 'click ' + ms + ' ms after touch (' + (ms < 30 ? 'on press' : 'on release') + ')';
+  }
+
+  // ---- Add to Home Screen (pure) -----------------------------------------------------------------------------------------
+
+  type HomeMode = 'sheet' | 'prompt';
+  /**
+   * What the "Add to Home Screen" row does: 'prompt' calls the install prompt Chrome handed over, 'sheet' shows the steps (iOS has
+   * no API for it), null hides the row (already installed and running standalone, or nothing to offer).
+   */
+  function homeScreenMode(ua: string, maxTouchPoints: number, standalone: boolean, hasPrompt: boolean): HomeMode | null {
+    if (standalone) return null;
+    if (hasPrompt) return 'prompt';
+    return isIosDevice(ua, maxTouchPoints) ? 'sheet' : null;
   }
 
   // ---- Protocol helpers --------------------------------------------------------------------------------------------
@@ -963,6 +1041,8 @@
     const noticeEl = must('notice');
     const noticeText = must('notice-text');
     const retryBtn = must('retry');
+    const sheet = must('a2hs');
+    const sheetClose = must('a2hs-close');
 
     // Monotonic: a wall-clock step (NTP, manual time change) must not stall the send gap or the minimum-press timer.
     const now = (): number => performance.now();
@@ -985,6 +1065,8 @@
 
     // ---- Page state ----
     const params = new URLSearchParams(location.search);
+    const ua = navigator.userAgent;
+    const hmode = hapticMode(ua, navigator.maxTouchPoints ?? 0, typeof navigator.vibrate === 'function');
     const token = params.get('t');
     let phase: Phase = token ? 'connecting' : 'notoken';
     let slot: number | null = null;
@@ -1024,10 +1106,10 @@
     function createEl(c: Control): HTMLElement {
       let el: HTMLElement;
       if (c.type === 'button') {
-        const b = document.createElement('button');
-        b.type = 'button';
-        b.setAttribute('aria-pressed', 'false');
-        el = b;
+        // Not a <button>: on iOS it holds the haptic switch overlay, and an input inside a button is invalid HTML.
+        el = div('');
+        el.setAttribute('role', 'button');
+        el.setAttribute('aria-pressed', 'false');
       } else if (c.type === 'stick') {
         el = div('ctl ctl-stick');
         el.setAttribute('role', 'group');
@@ -1060,10 +1142,62 @@
         el.className = 'ctl key ctl-btn shape-' + c.shape; // resets the state classes, re-applied below
         el.classList.toggle('is-down', isOn(c.id));
         el.dataset['button'] = c.button;
-        if (el.textContent !== c.label) el.textContent = c.label;
+        if (el.textContent !== c.label) el.textContent = c.label; // replaces the children, so the overlay is added after
         // Text size follows the button height but shrinks for long labels (units of 1% of the field height).
         el.style.setProperty('--fs', Math.max(2.2, Math.min(c.h * 0.42, (c.w * 1.4) / Math.max(1, c.label.length))).toFixed(2));
+      } else if (c.type === 'stick') {
+        el.classList.toggle('is-floating', c.mode === 'floating');
       }
+      syncOverlay(el, c);
+    }
+
+    // ---- iOS haptics: a transparent switch over every button and the d-pad ----
+    /**
+     * iOS plays its tick for a real finger on a real <input type=checkbox switch> and, since WebKit fc1ef83, for nothing a script
+     * does. So the switch lies over the control (a child, so the control's pointer handlers still see the events) and the finger
+     * lands on it. It is nearly transparent, not hidden: WebKit must render it. UNVERIFIED on a real iPhone; see ?diag=1.
+     */
+    const switchLog = { control: { n: 0, text: '' }, test: { n: 0, text: '' } };
+    let showDiag: (() => void) | null = null;
+    const isSwitch = (t: EventTarget | null): boolean => t instanceof Element && t.classList.contains('haptic-switch');
+
+    function makeSwitch(which: 'control' | 'test'): HTMLInputElement {
+      const sw = document.createElement('input');
+      sw.type = 'checkbox';
+      sw.setAttribute('switch', '');
+      sw.className = 'haptic-switch';
+      sw.tabIndex = -1;
+      sw.setAttribute('aria-hidden', 'true');
+      let touchedAt: number | null = null;
+      sw.addEventListener(
+        'pointerdown',
+        () => {
+          touchedAt = now();
+          sw.checked = false; // reset before the gesture, not inside its click: the tick may still be running after the click event
+        },
+        on,
+      );
+      sw.addEventListener(
+        'click',
+        (e) => {
+          e.stopPropagation(); // nothing on the control or the field listens to click, and a tick must not trigger one that does
+          const log = switchLog[which];
+          log.n += 1;
+          log.text = describeSwitchClick(touchedAt, now());
+          touchedAt = null;
+          showDiag?.();
+        },
+        on,
+      );
+      return sw;
+    }
+
+    /** Add or remove the overlay of one control: only on iOS, only while playing, only with haptics on, never on sticks. */
+    function syncOverlay(el: HTMLElement, c: Control): void {
+      const want = hmode === 'ios' && mode === 'play' && c.type !== 'stick' && !!store && activeLayout(store).haptics;
+      const have = [...el.children].find((ch) => ch.classList.contains('haptic-switch'));
+      if (want && !have) el.appendChild(makeSwitch('control'));
+      else if (!want && have) have.remove();
     }
 
     /** Make the DOM match the active layout without recreating elements (so a drag keeps its pointer capture). */
@@ -1102,24 +1236,7 @@
       for (const [id, el] of elems) el.classList.toggle('is-selected', mode === 'edit' && id === selectedId);
     }
 
-    // ---- Haptics wiring ----
-    const ua = navigator.userAgent;
-    const hasVibrate = typeof navigator.vibrate === 'function';
-    const hmode = hapticMode(ua, navigator.maxTouchPoints ?? 0, hasVibrate);
-    let iosLabel: HTMLLabelElement | null = null;
-    if (hmode === 'ios') {
-      // The system "switch" haptic: toggling a hidden <input type=checkbox switch> from a touch handler plays a tick (iOS 17.4+).
-      iosLabel = document.createElement('label');
-      iosLabel.className = 'haptic-switch';
-      iosLabel.setAttribute('aria-hidden', 'true');
-      const input = document.createElement('input');
-      input.type = 'checkbox';
-      input.setAttribute('switch', '');
-      input.tabIndex = -1;
-      iosLabel.appendChild(input);
-      document.body.appendChild(iosLabel);
-    }
-    const rawIosTick = (): void => iosLabel?.click();
+    // ---- Haptics wiring (iOS ticks are the overlays above; this is Android's vibrate) ----
     const rawVibrate = (ms: number): void => {
       if (typeof navigator.vibrate === 'function') navigator.vibrate(ms);
     };
@@ -1127,7 +1244,6 @@
       mode: hmode,
       enabled: () => !!store && activeLayout(store).haptics,
       vibrate: rawVibrate,
-      iosTick: rawIosTick,
       now,
       setTimer: (fn, ms) => setTimeout(fn, ms),
       clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
@@ -1139,8 +1255,37 @@
     const pressedAt = new Map<string, number>(); // button control id -> when it went down
     const pendingRelease = new Map<string, ReturnType<typeof setTimeout>>(); // releases waiting out the minimum press time
     const lastTapEnd = new Map<string, number>(); // stick control id -> when its last tap ended
+    const latched = new Set<string>(); // toggle buttons that are switched on
+    let turboOn = true; // the blink phase of rapid fire
+    let turboTimer: ReturnType<typeof setInterval> | null = null;
 
-    const isOn = (cid: string): boolean => (fingers.get(cid) ?? 0) > 0 || pendingRelease.has(cid);
+    const isOn = (cid: string): boolean => (fingers.get(cid) ?? 0) > 0 || pendingRelease.has(cid) || latched.has(cid);
+    /** Rapid fire, as the Mode choice shows it: a stored button with both latch and turbo is a plain toggle (see buttonMode). */
+    const isRapid = (c: Control | undefined): boolean => !!c && c.type === 'button' && buttonMode(c) === 'rapid';
+
+    /** Ids of the buttons that count as held right now: a finger on them, a release still waiting, or switched on. */
+    function* pressedIds(): Generator<string> {
+      for (const [cid, n] of fingers) if (n > 0) yield cid;
+      for (const cid of pendingRelease.keys()) yield cid;
+      for (const cid of latched) yield cid;
+    }
+
+    /** Rapid fire blinks the output 50 ms on, 50 ms off, but only while a rapid-fire button is held. */
+    function syncTurbo(): void {
+      let any = false;
+      for (const cid of pressedIds()) if (isRapid(controls.get(cid))) any = true;
+      if (any && turboTimer === null) {
+        turboOn = true;
+        turboTimer = setInterval(() => {
+          turboOn = !turboOn;
+          requestSend(0);
+        }, TURBO_HALF_MS);
+      } else if (!any && turboTimer !== null) {
+        clearInterval(turboTimer);
+        turboTimer = null;
+        turboOn = true;
+      }
+    }
 
     function paintButton(cid: string): void {
       const el = elems.get(cid);
@@ -1152,12 +1297,13 @@
 
     function readPad(): Pad {
       const names: ButtonName[] = [];
-      const add = (cid: string): void => {
+      const trigger = { LT: 0, RT: 0 }; // the strongest pressed LT / RT control wins
+      for (const cid of pressedIds()) {
         const c = controls.get(cid);
-        if (c && c.type === 'button') names.push(c.button);
-      };
-      for (const [cid, n] of fingers) if (n > 0) add(cid);
-      for (const cid of pendingRelease.keys()) add(cid);
+        if (!c || c.type !== 'button' || (!turboOn && isRapid(c))) continue;
+        names.push(c.button);
+        if (c.button === 'LT' || c.button === 'RT') trigger[c.button] = Math.max(trigger[c.button], c.value);
+      }
       let dpad = 0;
       let ls: Readonly<Axes> = ZERO;
       let rs: Readonly<Axes> = ZERO;
@@ -1170,7 +1316,7 @@
           dpad |= h.bits;
         }
       }
-      return buildPad(names, dpad, ls, rs);
+      return buildPad(names, dpad, ls, rs, trigger);
     }
 
     function paintDpad(el: HTMLElement, bits: number): void {
@@ -1183,6 +1329,8 @@
       el.classList.remove('is-active');
       const knob = el.querySelector<HTMLElement>('.stick-knob');
       if (knob) knob.style.transform = '';
+      const base = el.querySelector<HTMLElement>('.stick-base');
+      if (base) base.style.transform = '';
     }
 
     /** Larger deflection of the sticks held right now. */
@@ -1204,14 +1352,25 @@
       const el = target?.closest<HTMLElement>('[data-cid]');
       const c = el ? controls.get(el.dataset['cid'] ?? '') : undefined;
       if (!el || !c) return;
-      try {
-        el.setPointerCapture(e.pointerId);
-      } catch {
-        /* the pointer is already gone; lostpointercapture cleans up */
+      // A touch is implicitly captured by the element it lands on. On the haptic switch that must stay so: capturing it to the
+      // control would aim the browser's click at the control, and then the switch never toggles and never ticks.
+      if (!isSwitch(target)) {
+        try {
+          el.setPointerCapture(e.pointerId);
+        } catch {
+          /* the pointer is already gone; lostpointercapture cleans up */
+        }
       }
       const t = now();
 
-      if (c.type === 'button') {
+      if (c.type === 'button' && c.latch) {
+        // Toggle: tap to hold, tap again to release. No finger is tracked, so the lift changes nothing.
+        if (!latched.delete(c.id)) latched.add(c.id);
+        requestSend(0);
+        paintButton(c.id);
+        syncTurbo();
+        haptics.tick();
+      } else if (c.type === 'button') {
         holds.set(e.pointerId, { kind: 'btn', cid: c.id });
         const n = (fingers.get(c.id) ?? 0) + 1;
         fingers.set(c.id, n);
@@ -1224,19 +1383,25 @@
           pressedAt.set(c.id, t);
           requestSend(0);
           paintButton(c.id);
+          syncTurbo();
           haptics.tick();
         }
       } else if (c.type === 'stick') {
         if (zoneBusy((h) => h.kind === 'stick' && h.cid === c.id)) return;
         const click = c.doubleTapClick && isDoubleTap(lastTapEnd.get(c.id) ?? null, t);
         lastTapEnd.delete(c.id);
+        const areaX = fm.left + (c.x / 100) * fm.w;
+        const areaY = fm.top + (c.y / 100) * fm.h;
+        const radius = (c.size * unit) / 2;
+        const zone = c.mode === 'floating' ? radius * FLOATING_ZONE : radius;
         const hold: StickHold = {
           kind: 'stick',
           cid: c.id,
           side: c.stick,
-          cx: fm.left + (c.x / 100) * fm.w,
-          cy: fm.top + (c.y / 100) * fm.h,
-          radius: (c.size * unit) / 2,
+          // a floating stick's centre is where the finger landed (kept inside the touch area), a fixed one's the control's
+          cx: c.mode === 'floating' ? floatingCentre(e.clientX, areaX, zone, radius) : areaX,
+          cy: c.mode === 'floating' ? floatingCentre(e.clientY, areaY, zone, radius) : areaY,
+          radius,
           params: { deadzone: c.deadzone, sensitivity: c.sensitivity, curve: c.curve, invertX: c.invertX, invertY: c.invertY },
           downAt: t,
           click,
@@ -1248,6 +1413,10 @@
         updateStick(hold, e);
         requestSend(STICK_SEND_MS);
         el.classList.add('is-active');
+        if (c.mode === 'floating') {
+          const base = el.querySelector<HTMLElement>('.stick-base');
+          if (base) base.style.transform = 'translate3d(' + (hold.cx - areaX).toFixed(1) + 'px,' + (hold.cy - areaY).toFixed(1) + 'px,0)';
+        }
         paintKnob(hold, e);
         haptics.tick();
         pushStickHaptics();
@@ -1314,6 +1483,7 @@
       pressedAt.delete(cid);
       requestSend(0);
       paintButton(cid);
+      syncTurbo();
     }
 
     function endHold(h: Hold): void {
@@ -1335,6 +1505,7 @@
           pressedAt.delete(h.cid);
           requestSend(0);
           paintButton(h.cid);
+          syncTurbo();
         }
       } else if (h.kind === 'stick') {
         const el = elems.get(h.cid);
@@ -1364,6 +1535,8 @@
       for (const t of pendingRelease.values()) clearTimeout(t);
       pendingRelease.clear();
       lastTapEnd.clear();
+      latched.clear();
+      syncTurbo();
       haptics.stop();
       for (const el of fieldEl.querySelectorAll('.is-down')) {
         el.classList.remove('is-down');
@@ -1541,6 +1714,7 @@
           lastSent = null;
           setPhase('connected');
           flushNow();
+          offerSheet();
           retrySave(); // the layout did not reach the host last time: try again now that we are back (not while editing)
         } else {
           // 'full' and 'kicked' are final: no reconnect until the user asks (full) or the host re-adds the phone.
@@ -1752,7 +1926,7 @@
       document.body.classList.remove('editing');
       fieldEl.classList.remove('is-editing');
       selectedId = null;
-      disarmReset();
+      disarmConfirm();
       card.hidden = true;
       card.textContent = '';
       syncField(false);
@@ -1819,7 +1993,7 @@
       showCard();
     }
 
-    // ---- The card (the only editor surface): control card (Size, Opacity) or settings card (nothing selected) ----
+    // ---- The card (the only editor surface): Size, Opacity and More for a selected control; the settings when nothing is ----
     const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''): HTMLElementTagNameMap[K] => {
       const n = document.createElement(tag);
       if (cls) n.className = cls;
@@ -1896,12 +2070,25 @@
       return root;
     }
 
-    function placeCardNow(size: { w: number; h: number }): void {
+    /** Heights (px) of the rows in the card being built: its own height is worked out from them, never measured (see cardHeight). */
+    let rows: number[] = [];
+    const addRow = (node: HTMLElement, px = ROW_H): void => {
+      card.appendChild(node);
+      rows.push(px);
+    };
+    /** Whether the "More" panel is open on the control card. It stays as the player left it until the page is reloaded. */
+    let moreOpen = false;
+
+    function placeCardNow(): void {
       const c = selectedId ? controls.get(selectedId) : undefined;
       const field = { w: fm.w, h: fm.h };
       // Keep the card's top edge below Done (edit mode only, so this layout read never happens while playing).
       const d = done.getBoundingClientRect();
       const top = Math.max(8, d.height > 0 ? d.bottom - fm.top + 6 : 8);
+      // A card taller than the room under Done scrolls instead of growing over the screen.
+      const size = { w: Math.min(c ? (moreOpen ? CARD_W.more : CARD_W.control) : CARD_W.settings, Math.max(ROW_H, field.w - 16)), h: cardHeight(rows, field.h - top - 8) };
+      card.style.width = size.w + 'px';
+      card.style.height = size.h + 'px';
       const boxOf = (x: Control): Box => {
         const [bw, bh] = controlBox(x);
         return { cx: (x.x / 100) * field.w, cy: (x.y / 100) * field.h, hw: (bw * unit) / 2, hh: (bh * unit) / 2 };
@@ -1920,21 +2107,112 @@
 
     function showCard(): void {
       if (mode !== 'edit' || !store) return;
+      const scrolled = card.scrollTop; // a rebuild after a tap in the More panel must not jump back to the top
+      disarmConfirm(); // a fresh card shows "Reset" and "Delete": the first tap on it only arms it
       card.textContent = '';
+      rows = [];
       const c = selectedId ? controls.get(selectedId) : undefined;
       if (c) buildControlCard(c);
       else buildSettingsCard();
+      card.appendChild(el('p', 'card-msg'));
       card.classList.toggle('is-settings', !c);
       card.hidden = false;
-      placeCardNow(c ? CARD_CONTROL : CARD_SETTINGS);
+      placeCardNow();
+      card.scrollTop = scrolled;
+    }
+
+    /** Write properties of one control through the same edit() path as Size and Opacity; `rebuild` redraws the card (choices do, sliders must not). */
+    function put(id: string, patch: Readonly<Record<string, unknown>>, rebuild: boolean): void {
+      if (store) edit(setProps(store, id, patch, aspect()));
+      if (rebuild) showCard();
+    }
+
+    /** A labelled On/Off switch row. `value` is read again after every tap, so the row repaints from the store, not from itself. */
+    function makeToggle(label: string, value: () => boolean, flip: () => void): HTMLElement {
+      const row = el('div', 'card-row');
+      row.appendChild(el('span', 'card-label', label));
+      const sw = el('button', 'switch');
+      sw.type = 'button';
+      sw.setAttribute('role', 'switch');
+      sw.setAttribute('aria-label', label);
+      const paint = (): void => {
+        const on2 = value();
+        sw.setAttribute('aria-checked', on2 ? 'true' : 'false');
+        sw.textContent = on2 ? 'On' : 'Off';
+      };
+      paint();
+      tap(
+        sw,
+        () => {
+          flip();
+          paint();
+        },
+        false,
+      );
+      row.appendChild(sw);
+      return row;
+    }
+
+    /** One of several exclusive choices ("segmented control"); a tap on another one calls `pick`. `grid` wraps long lists under their label. */
+    function makeChoice<T extends string>(label: string, options: ReadonlyArray<readonly [T, string]>, current: T, pick: (v: T) => void, grid = false): HTMLElement {
+      const row = el('div', grid ? 'choice is-grid' : 'choice');
+      row.setAttribute('role', 'radiogroup');
+      row.setAttribute('aria-label', label);
+      row.appendChild(el('span', 'card-label', label));
+      const opts = el('div', 'opts');
+      for (const [value, text] of options) {
+        const b = el('button', 'card-btn opt', text);
+        b.type = 'button';
+        b.setAttribute('role', 'radio');
+        b.setAttribute('aria-checked', value === current ? 'true' : 'false');
+        tap(b, () => pick(value), false);
+        opts.appendChild(b);
+      }
+      row.appendChild(opts);
+      return row;
+    }
+
+    /** A short text field (the button label). 16 px text so iOS does not zoom the page when it takes focus. */
+    function makeText(label: string, value: string, max: number, onInput: (v: string) => void): HTMLElement {
+      const row = el('label', 'card-row');
+      row.appendChild(el('span', 'card-label', label));
+      const input = el('input', 'card-input');
+      input.type = 'text';
+      input.value = value;
+      input.maxLength = max;
+      input.spellcheck = false;
+      input.setAttribute('autocomplete', 'off');
+      input.setAttribute('autocapitalize', 'off');
+      input.setAttribute('enterkeyhint', 'done');
+      input.setAttribute('aria-label', label);
+      input.addEventListener('input', () => onInput(input.value));
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') input.blur();
+      });
+      row.appendChild(input);
+      return row;
     }
 
     function buildControlCard(c: Control): void {
       const id = c.id;
       const ratio = c.type === 'button' && c.h > 0 ? c.w / c.h : 1; // kept for the whole drag of the slider, so rounding cannot drift
-      card.appendChild(el('h2', 'card-title', controlName(c)));
+      const head = el('div', 'card-row card-head');
+      head.appendChild(el('h2', 'card-title', controlName(c)));
+      const more = el('button', 'card-btn more', moreOpen ? 'Less' : 'More');
+      more.type = 'button';
+      more.setAttribute('aria-expanded', moreOpen ? 'true' : 'false');
+      tap(
+        more,
+        () => {
+          moreOpen = !moreOpen;
+          showCard();
+        },
+        false,
+      );
+      head.appendChild(more);
+      addRow(head);
       const sr = sizeRange(c);
-      card.appendChild(
+      addRow(
         makeSlider({
           label: 'Size',
           min: sr.min,
@@ -1948,7 +2226,7 @@
         }),
       );
       const or = opacityRange(c);
-      card.appendChild(
+      addRow(
         makeSlider({
           label: 'Opacity',
           min: or.min,
@@ -1961,9 +2239,95 @@
           },
         }),
       );
+      if (moreOpen) buildMore(c);
     }
 
-    let resetArmed: ReturnType<typeof setTimeout> | null = null;
+    /** Everything else a control stores, one tap away and out of the way of the simple card. */
+    function buildMore(c: Control): void {
+      const id = c.id;
+      const flag = (key: string) => (): boolean => (controls.get(id) as unknown as Record<string, unknown> | undefined)?.[key] === true;
+      const toggle = (label: string, key: string): void => addRow(makeToggle(label, flag(key), () => put(id, { [key]: !flag(key)() }, false)));
+      const slide = (label: string, min: number, max: number, step: number, value: number, fmt: (v: number) => string, key: string, scale = 1): void =>
+        addRow(makeSlider({ label, min, max, step, value, fmt, onInput: (v) => put(id, { [key]: round(v * scale, 3) }, false) }));
+      if (c.type === 'button') {
+        addRow(makeText('Label', c.label, LIMITS.labelChars, (v) => put(id, { label: v }, false)));
+        addRow(
+          makeChoice('Sends', BUTTON_NAMES.map((n) => [n, BUTTON_LOOK[n].label] as const), c.button, (v) => put(id, { button: v }, true), true),
+          gridHeight(BUTTON_NAMES.length),
+        );
+        addRow(makeChoice('Shape', [['circle', 'Circle'], ['rect', 'Rect'], ['pill', 'Pill']] as const, c.shape, (v) => put(id, { shape: v }, true)));
+        if (c.shape !== 'circle') {
+          const wr = dimRange(c.w);
+          const hr = dimRange(c.h);
+          slide('Width', wr.min, wr.max, 1, c.w, (v) => String(Math.round(v)), 'w');
+          slide('Height', hr.min, hr.max, 1, c.h, (v) => String(Math.round(v)), 'h');
+        }
+        addRow(makeChoice('Mode', [['hold', 'Hold'], ['toggle', 'Toggle'], ['rapid', 'Rapid']] as const, buttonMode(c), (v) => put(id, modePatch(v), true)));
+        if (c.button === 'LT' || c.button === 'RT') {
+          slide('Trigger', 5, 100, 5, clampTo(Math.round((c.value / 255) * 20) * 5, 5, 100), (v) => Math.round(v) + '%', 'value', 2.55);
+        }
+      } else if (c.type === 'stick') {
+        addRow(makeChoice('Stick', [['left', 'Left'], ['right', 'Right']] as const, c.stick, (v) => put(id, { stick: v }, true)));
+        addRow(makeChoice('Mode', [['fixed', 'Fixed'], ['floating', 'Floating']] as const, c.mode, (v) => put(id, { mode: v }, true)));
+        slide('Dead zone', DEADZONE_RANGE.min * 100, DEADZONE_RANGE.max * 100, 1, round(c.deadzone * 100, 0), (v) => Math.round(v) + '%', 'deadzone', 0.01);
+        const sr = { min: Math.min(SENSITIVITY_RANGE.min, c.sensitivity), max: Math.max(SENSITIVITY_RANGE.max, c.sensitivity) };
+        slide('Sensitivity', sr.min, sr.max, 0.1, c.sensitivity, (v) => v.toFixed(1), 'sensitivity');
+        addRow(makeChoice('Curve', [['linear', 'Linear'], ['precise', 'Precise'], ['aggressive', 'Sharp']] as const, c.curve, (v) => put(id, { curve: v }, true)));
+        toggle('Invert X', 'invertX');
+        toggle('Invert Y', 'invertY');
+        toggle('Double-tap = click', 'doubleTapClick');
+      } else {
+        toggle('Diagonals', 'diagonals');
+      }
+      const actions = el('div', 'card-row');
+      const dup = el('button', 'card-btn grow', 'Duplicate');
+      dup.type = 'button';
+      tap(dup, () => addAndSelect(store ? duplicateControl(store, id, aspect()) : null), false);
+      const del = el('button', 'card-btn grow', 'Delete');
+      del.type = 'button';
+      confirmButton(del, 'Delete', CONFIRM_MS, () => {
+        if (!store) return;
+        edit(deleteControl(store, id));
+        select(null);
+        showCard();
+      });
+      actions.append(dup, del);
+      addRow(actions);
+    }
+
+    /** Make a freshly added or duplicated control the selected one (null: the layout is full). */
+    function addAndSelect(r: { store: LayoutStore; id: string } | null): void {
+      if (!r) return say('Layout is full');
+      edit(r.store);
+      select(r.id);
+      showCard();
+    }
+
+    let confirmTimer: ReturnType<typeof setTimeout> | null = null;
+    function disarmConfirm(): void {
+      if (confirmTimer !== null) clearTimeout(confirmTimer);
+      confirmTimer = null;
+    }
+    /** A button that needs a second tap within `ms` to run `action` (Reset, Delete): the first tap only arms it. */
+    function confirmButton(btn: HTMLElement, idle: string, ms: number, action: () => void): void {
+      tap(
+        btn,
+        () => {
+          if (confirmTimer === null) {
+            btn.textContent = 'Tap again';
+            confirmTimer = setTimeout(() => {
+              confirmTimer = null;
+              btn.textContent = idle;
+            }, ms);
+            return;
+          }
+          disarmConfirm();
+          btn.textContent = idle;
+          action();
+        },
+        false,
+      );
+    }
 
     async function pickSlot(i: number): Promise<void> {
       if (!store) return;
@@ -1989,14 +2353,8 @@
       if (p) p.textContent = msg;
     }
 
-    function disarmReset(): void {
-      if (resetArmed !== null) clearTimeout(resetArmed);
-      resetArmed = null;
-    }
-
     function buildSettingsCard(): void {
       if (!store) return;
-      disarmReset(); // a fresh card shows "Reset": its first tap must only arm it, never reset at once
       const s = store;
       const layout = activeLayout(s);
       const row1 = el('div', 'card-row');
@@ -2014,33 +2372,30 @@
       }
       const reset = el('button', 'card-btn reset', 'Reset');
       reset.type = 'button';
-      tap(
-        reset,
-        () => {
-          if (resetArmed === null) {
-            reset.textContent = 'Tap again';
-            resetArmed = setTimeout(() => {
-              resetArmed = null;
-              reset.textContent = 'Reset';
-            }, 3000);
-            return;
+      confirmButton(reset, 'Reset', 3000, () => {
+        void getDefaultLayout().then((def) => {
+          if (!def) return say('Cannot load the default layout');
+          if (store && mode === 'edit') {
+            edit(resetLayout(store, activeLayout(store).id, def));
+            showCard();
           }
-          clearTimeout(resetArmed);
-          resetArmed = null;
-          reset.textContent = 'Reset';
-          void getDefaultLayout().then((def) => {
-            if (!def) return say('Cannot load the default layout');
-            if (store && mode === 'edit') {
-              edit(resetLayout(store, activeLayout(store).id, def));
-              showCard();
-            }
-          });
-        },
-        false,
-      );
+        });
+      });
       row1.append(slots, reset);
-      card.appendChild(row1);
-      card.appendChild(
+      addRow(row1);
+
+      const add = el('div', 'card-row');
+      add.appendChild(el('span', 'card-label', 'Add'));
+      for (const [kind, text] of [['button', 'Button'], ['stick', 'Stick'], ['dpad', 'D-pad']] as const) {
+        const b = el('button', 'card-btn', text);
+        b.type = 'button';
+        b.setAttribute('aria-label', 'Add ' + (kind === 'dpad' ? 'D-pad' : kind));
+        tap(b, () => addAndSelect(store ? addControl(store, kind) : null), false);
+        add.appendChild(b);
+      }
+      addRow(add);
+
+      addRow(
         makeSlider({
           label: 'Stick sensitivity',
           min: SENSITIVITY_RANGE.min,
@@ -2053,33 +2408,75 @@
           },
         }),
       );
-      const row3 = el('div', 'card-row');
-      row3.appendChild(el('span', 'card-label', 'Haptics'));
-      const sw = el('button', 'switch');
-      sw.type = 'button';
-      sw.setAttribute('role', 'switch');
-      sw.setAttribute('aria-label', 'Haptics');
-      const paintSwitch = (): void => {
-        const isOn2 = !!store && activeLayout(store).haptics;
-        sw.setAttribute('aria-checked', isOn2 ? 'true' : 'false');
-        sw.textContent = isOn2 ? 'On' : 'Off';
-      };
-      paintSwitch();
-      tap(
-        sw,
-        () => {
-          if (!store) return;
-          const on2 = !activeLayout(store).haptics;
-          edit(setHaptics(store, on2));
-          paintSwitch();
-          if (on2) haptics.tick(); // one tick when it is switched on
-        },
-        false,
+      addRow(
+        makeToggle(
+          'Haptics',
+          () => !!store && activeLayout(store).haptics,
+          () => {
+            if (!store) return;
+            const next = !activeLayout(store).haptics;
+            edit(setHaptics(store, next));
+            if (next) haptics.tick(); // one tick when it is switched on
+          },
+        ),
       );
-      row3.appendChild(sw);
-      card.appendChild(row3);
-      card.appendChild(el('p', 'card-msg'));
+      const home = homeMode();
+      if (home) {
+        const b = el('button', 'card-btn wide', 'Add to Home Screen');
+        b.type = 'button';
+        tap(b, () => (home === 'prompt' ? promptInstall() : openSheet()), false);
+        addRow(b);
+      }
     }
+
+    // ---- Add to Home Screen ----
+    interface InstallPrompt extends Event {
+      prompt(): Promise<unknown>;
+    }
+    let installPrompt: InstallPrompt | null = null; // Android Chrome hands it over when the page qualifies (it needs https)
+    let sheetOffered = false;
+    const isStandalone = (): boolean => (navigator as { standalone?: boolean }).standalone === true || (typeof matchMedia === 'function' && matchMedia('(display-mode: standalone)').matches);
+    const homeMode = (): HomeMode | null => homeScreenMode(ua, navigator.maxTouchPoints ?? 0, isStandalone(), installPrompt !== null);
+
+    function openSheet(): void {
+      neutralise(); // the sheet covers the field: nothing may stay held under it
+      sheet.hidden = false;
+    }
+    function closeSheet(): void {
+      sheet.hidden = true;
+      storageSet(HOME_SEEN_KEY, '1');
+    }
+    function promptInstall(): void {
+      const p = installPrompt;
+      installPrompt = null; // a prompt can be used once
+      try {
+        void p?.prompt().catch(() => undefined);
+      } catch {
+        /* the browser refused: nothing to do */
+      }
+      if (mode === 'edit') showCard();
+    }
+    /** First time the connection is up on an iPhone that has not added the page yet: show the steps once, never while editing. */
+    function offerSheet(): void {
+      if (sheetOffered || mode !== 'play' || homeScreenMode(ua, navigator.maxTouchPoints ?? 0, isStandalone(), false) !== 'sheet' || storageGet(HOME_SEEN_KEY) === '1') return;
+      sheetOffered = true;
+      openSheet();
+    }
+    window.addEventListener(
+      'beforeinstallprompt',
+      (e) => {
+        e.preventDefault();
+        installPrompt = e as InstallPrompt;
+      },
+      on,
+    );
+    window.addEventListener(
+      'appinstalled',
+      () => {
+        installPrompt = null;
+      },
+      on,
+    );
 
     // ---- Orientation ----
     const portraitQuery = typeof matchMedia === 'function' ? matchMedia('(orientation: portrait)') : null;
@@ -2088,62 +2485,72 @@
     function onResize(): void {
       measure();
       syncField(false);
-      if (mode === 'edit') showCard();
+      if (mode === 'edit') placeCardNow(); // not showCard: the on-screen keyboard resizes the viewport and a rebuild would drop the label field
       const p = isPortrait();
       if (p === portrait) return;
       portrait = p;
       if (p) neutralise();
     }
 
-    // ---- Diagnostics: ?diag=1 shows four buttons that reveal which haptic paths work on this phone ----
+    // ---- Diagnostics: ?diag=1 tells on a real phone which haptic paths work ----
     if (params.get('diag') === '1') {
       const diag = div('diag');
       diag.setAttribute('role', 'group');
       diag.setAttribute('aria-label', 'Haptics diagnostics');
-      const rawTick = (): void => {
-        try {
-          if (hmode === 'ios') rawIosTick();
-          else rawVibrate(10);
-        } catch {
-          /* blocked */
-        }
+      // The switch test: the same overlay the controls carry, in a big box. Touch it and feel for a tick; the readout says whether
+      // its click arrived and how long after the touch (on press, or only when the finger lifted).
+      const test = div('diag-test');
+      test.appendChild(el('span', 'diag-test-label', 'Touch to test the switch'));
+      test.appendChild(makeSwitch('test'));
+      const out = el('p', 'diag-out');
+      showDiag = () => {
+        const line = (name: string, log: { n: number; text: string }): string => name + ': ' + (log.n === 0 ? 'no click yet' : log.n + (log.n === 1 ? ' click, ' : ' clicks, ') + log.text);
+        out.textContent = line('test switch', switchLog.test) + '\n' + line('controls', switchLog.control);
       };
-      const mk = (n: number, label: string): HTMLButtonElement => {
-        const b = el('button', 'diag-btn', String(n));
-        b.type = 'button';
-        b.id = 'diag-' + n;
-        b.setAttribute('aria-label', label);
-        diag.appendChild(b);
-        return b;
-      };
-      mk(1, 'Tick from click').addEventListener('click', rawTick, on);
-      mk(2, 'Tick from pointerdown').addEventListener('pointerdown', rawTick, on);
-      const three = mk(3, 'Ticks while dragging');
-      let lastDragTick = 0;
-      three.addEventListener('pointerdown', (e) => three.setPointerCapture?.(e.pointerId), on);
-      three.addEventListener(
-        'pointermove',
-        () => {
-          const t = now();
-          if (t - lastDragTick >= 30) {
-            lastDragTick = t;
-            rawTick();
-          }
-        },
-        on,
-      );
-      let timerCount = 0;
-      mk(4, 'Ten ticks from a timer').addEventListener(
-        'click',
-        () => {
-          timerCount = 0;
-          const iv = setInterval(() => {
-            rawTick();
-            if (++timerCount >= 10) clearInterval(iv);
-          }, 100);
-        },
-        on,
-      );
+      showDiag();
+      diag.append(test, out);
+      if (hmode !== 'ios') {
+        // Android/desktop: the programmatic paths. (On iOS none of them can tick any more, so they are not offered.)
+        const buttons = div('diag-buttons');
+        const rawTick = (): void => rawVibrate(10);
+        const mk = (n: number, label: string): HTMLButtonElement => {
+          const b = el('button', 'diag-btn', String(n));
+          b.type = 'button';
+          b.id = 'diag-' + n;
+          b.setAttribute('aria-label', label);
+          buttons.appendChild(b);
+          return b;
+        };
+        mk(1, 'Vibrate from click').addEventListener('click', rawTick, on);
+        mk(2, 'Vibrate from pointerdown').addEventListener('pointerdown', rawTick, on);
+        const three = mk(3, 'Vibrate while dragging');
+        let lastDragTick = 0;
+        three.addEventListener('pointerdown', (e) => three.setPointerCapture?.(e.pointerId), on);
+        three.addEventListener(
+          'pointermove',
+          () => {
+            const t = now();
+            if (t - lastDragTick >= 30) {
+              lastDragTick = t;
+              rawTick();
+            }
+          },
+          on,
+        );
+        let timerCount = 0;
+        mk(4, 'Ten vibrations from a timer').addEventListener(
+          'click',
+          () => {
+            timerCount = 0;
+            const iv = setInterval(() => {
+              rawTick();
+              if (++timerCount >= 10) clearInterval(iv);
+            }, 100);
+          },
+          on,
+        );
+        diag.appendChild(buttons);
+      }
       document.body.appendChild(diag);
     }
 
@@ -2151,16 +2558,22 @@
     fieldEl.addEventListener('pointerdown', (e) => (mode === 'edit' ? editDown(e) : playDown(e)), onPassive);
     fieldEl.addEventListener('pointermove', (e) => (mode === 'edit' ? editMove(e) : playMove(e)), onPassive);
     fieldEl.addEventListener('pointerup', (e) => (mode === 'edit' ? editEnd(e) : playEnd(e)), onPassive);
-    // A cancelled pointer (system gesture, palm rejection) is a reason to distrust everything: release all.
-    fieldEl.addEventListener('pointercancel', (e) => (mode === 'edit' ? editEnd(e) : neutralise()), onPassive);
+    // A cancelled pointer (system gesture, palm rejection) is a reason to distrust everything: release all. Except on a haptic
+    // switch: its touch is deliberately not cancelled at touchstart, so iOS may claim just that touch (a long press, say), and that
+    // must not also drop the stick under the other thumb. Only that finger's control is released.
+    fieldEl.addEventListener('pointercancel', (e) => (mode === 'edit' ? editEnd(e) : isSwitch(e.target) ? playEnd(e) : neutralise()), onPassive);
     fieldEl.addEventListener('lostpointercapture', (e) => (mode === 'edit' ? editEnd(e) : playEnd(e)), onPassive);
 
-    // iOS: touchstart on the field stops the magnifier, the callout and double-tap zoom; touchmove and gesturestart stop pinch and scroll.
-    fieldEl.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false, signal: ac.signal });
-    document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false, signal: ac.signal });
+    // iOS: touchstart on the field stops the magnifier, the callout and double-tap zoom; touchmove and gesturestart stop pinch and
+    // scroll. Two exceptions. A touch on a haptic switch must NOT be cancelled: preventDefault on touchstart or touchmove stops the
+    // browser from generating the click, and without the click there is no tick (the CSS touch-action: none covers zoom and scroll
+    // there). And the card and the home screen sheet scroll when they are taller than the screen.
+    const scrolls = (t: EventTarget | null): boolean => t instanceof Element && t.closest('#card, #a2hs') !== null;
+    fieldEl.addEventListener('touchstart', (e) => (isSwitch(e.target) ? undefined : e.preventDefault()), { passive: false, signal: ac.signal });
+    document.addEventListener('touchmove', (e) => (isSwitch(e.target) || scrolls(e.target) ? undefined : e.preventDefault()), { passive: false, signal: ac.signal });
     for (const g of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(g, (e) => e.preventDefault(), { passive: false, signal: ac.signal });
     document.addEventListener('contextmenu', (e) => e.preventDefault(), on);
-    document.addEventListener('selectstart', (e) => e.preventDefault(), on);
+    document.addEventListener('selectstart', (e) => (e.target instanceof HTMLInputElement ? undefined : e.preventDefault()), on); // the label field needs a caret
     document.addEventListener('dragstart', (e) => e.preventDefault(), on);
 
     document.addEventListener(
@@ -2186,6 +2599,7 @@
 
     tap(menu, enterEdit);
     tap(done, finishEdit);
+    tap(sheetClose, closeSheet);
     tap(retryBtn, () => {
       if (phase === 'full') {
         attempt = 0;
@@ -2210,13 +2624,13 @@
         ac.abort();
         observer?.disconnect();
         stopKeepalive();
-        for (const t of [reconnectTimer, sendTimer, retryTimer, resetArmed]) if (t !== null) clearTimeout(t);
+        for (const t of [reconnectTimer, sendTimer, retryTimer, confirmTimer]) if (t !== null) clearTimeout(t);
         for (const t of pendingRelease.values()) clearTimeout(t);
+        if (turboTimer !== null) clearInterval(turboTimer);
         haptics.stop();
         const sock = ws;
         ws = null;
         sock?.close();
-        iosLabel?.remove();
       },
     };
   }
@@ -2246,8 +2660,14 @@
       TAP_SLOP,
       SIZE_RANGE,
       SENSITIVITY_RANGE,
-      CARD_CONTROL,
-      CARD_SETTINGS,
+      CARD_W,
+      ROW_H,
+      CARD_PAD,
+      DIM_RANGE,
+      FLOATING_ZONE,
+      TURBO_HALF_MS,
+      CONFIRM_MS,
+      HOME_SEEN_KEY,
       // layout store
       coerceStore,
       activeLayout,
@@ -2269,6 +2689,16 @@
       placeSettingsCard,
       reachBox,
       applyProps,
+      setProps,
+      addControl,
+      duplicateControl,
+      deleteControl,
+      dimRange,
+      gridHeight,
+      buttonMode,
+      modePatch,
+      cardHeight,
+      floatingCentre,
       // pad maths and send timing
       stickAxes,
       deflection,
@@ -2283,10 +2713,10 @@
       hapticMode,
       androidPattern,
       androidStickStep,
-      iosStickInterval,
-      iosStickDecision,
-      buttonTickAllowed,
       createHaptics,
+      describeSwitchClick,
+      homeScreenMode,
+      isIosDevice,
       // protocol
       backoffDelay,
       deviceLabel,

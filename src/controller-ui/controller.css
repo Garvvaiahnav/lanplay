@@ -185,6 +185,16 @@ button {
   will-change: transform;
 }
 
+/* A floating stick's element is its touch area, FLOATING_ZONE (1.5) times the base: the base is drawn at 1 / 1.5 of it, in the
+   middle, and the script slides it under the finger. */
+.ctl-stick.is-floating .stick-base {
+  inset: auto;
+  left: 16.667%;
+  top: 16.667%;
+  width: 66.667%;
+  height: 66.667%;
+}
+
 .ctl-stick.is-active .stick-base {
   border-color: rgba(255, 255, 255, 0.85);
 }
@@ -370,49 +380,58 @@ button {
   font-weight: 800;
 }
 
+/* Width and height are set from JS (rows of 44 pt plus padding, see cardHeight); a card taller than the screen scrolls. */
 .card {
   position: fixed;
   z-index: 7;
   width: 280px;
-  height: 136px;
-  padding: 8px 14px;
+  padding: 8px 12px;
   transform: translate(-50%, -50%);
   border: 1.5px solid var(--edge);
   border-radius: 18px;
   background: rgba(21, 26, 38, 0.96);
   font-size: 14px;
-}
-
-.card.is-settings {
-  width: 300px;
-  height: 168px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
 }
 
 .card-title {
-  margin: 0 0 2px;
+  margin: 0;
   font-size: 14px;
   font-weight: 700;
 }
 
+/* Every row is exactly 44 pt: the card's height is the sum of them. */
 .card-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  min-height: 44px;
+  height: 44px;
 }
 
 .card-label {
   font-weight: 600;
 }
 
+/* A short error line over the bottom edge of the card's visible part, wherever it is scrolled to. */
 .card-msg {
-  position: absolute;
-  left: 14px;
-  bottom: 3px;
-  margin: 0;
+  position: sticky;
+  bottom: 0;
+  height: 14px;
+  margin: -14px 0 0;
+  padding: 0 4px;
+  background: rgba(21, 26, 38, 0.96);
   font-size: 11px;
+  line-height: 14px;
   color: var(--warn);
+}
+
+.card-msg:empty {
+  display: none;
 }
 
 .slots {
@@ -425,6 +444,7 @@ button {
   min-width: 44px;
   height: 44px;
   margin: 0;
+  touch-action: pan-y; /* a finger that starts on a button can still scroll the card; a scroll cancels the tap */
   padding: 0 10px;
   border: 1.5px solid var(--edge);
   border-radius: 12px;
@@ -449,6 +469,78 @@ button {
   background: var(--ok);
   border-color: var(--ok);
   color: var(--bg);
+}
+
+.card-btn.grow {
+  flex: 1;
+}
+
+.card-btn.wide {
+  width: 100%;
+}
+
+/* "More": exclusive choices (a label and a row of chips; a long list wraps under its label), the label field. */
+.choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+}
+
+.choice .card-label {
+  flex: 0 0 74px; /* the same column as the slider labels */
+}
+
+.opts {
+  display: flex;
+  flex: 1;
+  gap: 6px;
+}
+
+.opt {
+  flex: 1;
+  min-width: 44px;
+  padding: 0 4px;
+}
+
+.opt[aria-checked="true"] {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--bg);
+}
+
+.choice.is-grid {
+  display: block;
+  height: auto;
+}
+
+.choice.is-grid .card-label {
+  display: block;
+  height: 24px;
+  line-height: 24px;
+}
+
+.choice.is-grid .opts {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+}
+
+/* 16 px keeps iOS from zooming the page when the field takes focus; the page-wide user-select: none would stop typing in it. */
+.card-input {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  margin: 0;
+  padding: 0 10px;
+  border: 1.5px solid var(--edge);
+  border-radius: 12px;
+  background: var(--fill);
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  -webkit-user-select: text;
+  user-select: text;
+  touch-action: manipulation;
 }
 
 /* Sliders: one row each (label, track, value); pointer driven, a 44 pt thumb on a 44 pt tall track. */
@@ -524,29 +616,72 @@ button {
   background: var(--text);
 }
 
-/* The editor must not cover the field in play, and a card never needs the haptic switch label. */
+/* iOS haptics: a nearly transparent switch over a button or the d-pad; the finger lands on it and the browser's own click makes
+   the tick (see syncOverlay in controller.ts). It must be RENDERED, so no display: none or visibility: hidden; and nothing
+   may sit above it. Being a child of the control, its pointer events still reach the control's handlers. */
 .haptic-switch {
-  position: fixed;
-  left: -100px;
-  top: -100px;
-  width: 1px;
-  height: 1px;
-  opacity: 0.01;
-  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  border-radius: inherit;
+  opacity: 0.011;
+  outline: none;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
+/* A button's 1.5 pt border is outside the padding box: reach over it so no part of the visible control misses the switch. */
+.key > .haptic-switch {
+  inset: -1.5px;
+  width: calc(100% + 3px);
+  height: calc(100% + 3px);
+}
+
+/* ?diag=1 */
 .diag {
   position: fixed;
   z-index: 9;
   left: 50%;
   top: 50%;
   display: flex;
+  flex-direction: column;
   gap: 8px;
   padding: 8px;
   transform: translate(-50%, -50%);
   border: 1.5px solid var(--edge);
   border-radius: 14px;
   background: rgba(21, 26, 38, 0.96);
+}
+
+.diag-test {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 280px;
+  height: 72px;
+  border: 1.5px solid var(--edge);
+  border-radius: 12px;
+  background: var(--fill);
+  font-weight: 700;
+}
+
+.diag-out {
+  margin: 0;
+  max-width: 280px;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: pre-line;
+  color: var(--muted);
+}
+
+.diag-buttons {
+  display: flex;
+  gap: 8px;
 }
 
 .diag-btn {
@@ -605,6 +740,50 @@ button {
 .rotate-overlay {
   display: none;
   z-index: 50;
+}
+
+/* The Add to Home Screen sheet: above the rotate overlay (the steps are easiest in portrait), scrolls when the screen is short.
+   The auto margins centre it and, unlike justify-content: center, never push the top out of reach. */
+.sheet {
+  z-index: 60;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: max(16px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+}
+
+.sheet > :first-child {
+  margin-top: auto;
+}
+
+.sheet > :last-child {
+  margin-bottom: auto;
+}
+
+.sheet .overlay-sub {
+  max-width: 52ch;
+  font-size: 14px;
+}
+
+.sheet-steps {
+  margin: 0;
+  padding-left: 1.3em;
+  text-align: left;
+  font-size: 18px;
+  line-height: 1.6;
+}
+
+.share-glyph {
+  width: 1.3em;
+  height: 1.3em;
+  vertical-align: -0.25em;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 @media (orientation: portrait) {

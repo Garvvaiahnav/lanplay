@@ -9,11 +9,23 @@ LanPlay/Moonlight stream, and needs no controller on the viewer PC.
    (one Windows permission prompt): it installs the ViGEmBus virtual-controller driver and opens TCP port 47921 for
    your home network only.
 2. Open the shown link on each phone (same Wi-Fi) or scan the QR code. Rotate the phone to landscape.
-3. Tap **Edit** on the phone to customize: move and resize every control, add or remove controls, sensitivity, dead zone,
-   response curve, invert, turbo, latch, trigger value, vibration, and save presets. Layouts are saved on the host PC per
+3. Tap the gear on the phone to customize. Drag a control to move it, tap it for **Size** and **Opacity**; **More** opens
+   everything else: label, which button it sends, shape and size, hold / toggle / rapid fire, trigger strength (LT, RT), and
+   for sticks side, fixed or floating, dead zone, sensitivity, response curve, invert and double-tap click, for the d-pad
+   diagonals. **Duplicate** and **Delete** are in More too. With nothing selected the card has the three layout slots,
+   **Add** (button, stick, d-pad), stick sensitivity and vibration. Layouts are saved on the host PC per
    phone IP (`controller-layouts/<ip>.json` under LanPlay's per-user data folder), so they are there next time the same
    phone connects. If your router gives the phone a new IP, it starts from the default layout again.
-4. **New link** on the host invalidates old links and QR codes.
+4. **New link** on the host invalidates old links and QR codes (a page added to the home screen must be added again).
+
+## On an iPhone
+- **Add to Home Screen** (Share button, Add to Home Screen, Add) opens the controller full screen with no address bar. The
+  page offers this once after it connects, and always from the gear card. Do it in portrait or from the address-bar menu: in
+  landscape Safari may hide its toolbar.
+- **Vibration**: iOS Safari has no Vibration API. The only haptic a web page can get is the system tick of a real switch
+  that the finger touches, so each button and the d-pad carries an invisible one. You get one tick per tap, no stick ramp,
+  and the tick may come when you lift the finger. Open the page with `&diag=1` added to the link for a test switch that
+  shows whether the click arrived and how long after the touch. This is not verified on a real iPhone yet.
 
 ## How it works
 - `src/core/controller/server.ts`: HTTP + WebSocket on port 47921. Serves the page, the layout API (`/api/layouts`,
@@ -33,5 +45,6 @@ LanPlay/Moonlight stream, and needs no controller on the viewer PC.
   like the other third-party files.
 
 ## Not verified on real Windows yet
-The virtual pad creation (ViGEmBus/koffi), the driver and firewall install step, and the phone page on real phones. Test with
+The virtual pad creation (ViGEmBus/koffi), the driver and firewall install step, and the phone page on real phones (the iPhone
+haptic overlays, Add to Home Screen and typing a label with the on-screen keyboard in particular). Test with
 a gamepad tester page on the host while a phone is connected.
