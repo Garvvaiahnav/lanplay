@@ -173,30 +173,60 @@ function sanitizeLayout(raw: unknown, index: number, usedLayoutIds: Set<string>)
   return { id, name: text(raw['name'], LIMITS.nameChars, `Layout ${index + 1}`), haptics: bool(raw['haptics'], true), controls };
 }
 
-/** Standard Xbox arrangement for a landscape phone. */
+function layoutFromSpec(controls: Raw[]): Layout {
+  return sanitizeLayout({ id: DEFAULT_LAYOUT_ID, name: 'Xbox', haptics: true, controls }, 0, new Set()) as Layout;
+}
+const btn = (button: ButtonName, x: number, y: number, w: number, h: number, shape: Shape, label?: string): Raw => ({ id: `btn-${button.toLowerCase()}`, type: 'button', button, x, y, w, h, shape, ...(label ? { label } : {}) });
+
+/**
+ * Standard Xbox arrangement for an iPhone-sized landscape screen (the phone page maps x/y to its safe-area rectangle, about
+ * 750x380 pt on an iPhone 17): triggers and bumpers in the top corners for the index fingers, left stick and ABXY where the
+ * thumbs rest, Start/Back small at the top.
+ */
 export function defaultLayout(): Layout {
-  const btn = (button: ButtonName, x: number, y: number, w: number, h: number, shape: Shape, label?: string): Raw => ({ id: `btn-${button.toLowerCase()}`, type: 'button', button, x, y, w, h, shape, ...(label ? { label } : {}) });
-  const raw = {
-    id: DEFAULT_LAYOUT_ID,
-    name: 'Xbox',
-    haptics: true,
-    controls: [
-      btn('LT', 9, 10, 17, 11, 'rect'),
-      btn('LB', 9, 24, 17, 11, 'rect'),
-      btn('RT', 91, 10, 17, 11, 'rect'),
-      btn('RB', 91, 24, 17, 11, 'rect'),
-      { id: 'stick-left', type: 'stick', stick: 'left', x: 15, y: 66, size: 40 },
-      { id: 'dpad', type: 'dpad', x: 37, y: 82, size: 26 },
-      { id: 'stick-right', type: 'stick', stick: 'right', x: 63, y: 82, size: 30 },
-      btn('Y', 85, 46, 14, 14, 'circle'),
-      btn('X', 77, 61, 14, 14, 'circle'),
-      btn('B', 93, 61, 14, 14, 'circle'),
-      btn('A', 85, 76, 14, 14, 'circle'),
-      btn('BACK', 44, 12, 12, 7, 'pill', 'Back'),
-      btn('START', 56, 12, 12, 7, 'pill', 'Start'),
+  return layoutFromSpec([
+    btn('LT', 6.5, 8, 22, 13, 'rect'),
+    btn('LB', 6.5, 23.5, 22, 13, 'rect'),
+    btn('RT', 93.5, 8, 22, 13, 'rect'),
+    btn('RB', 93.5, 23.5, 22, 13, 'rect'),
+    { id: 'stick-left', type: 'stick', stick: 'left', x: 16, y: 64, size: 38 },
+    { id: 'dpad', type: 'dpad', x: 38, y: 80, size: 26 },
+    { id: 'stick-right', type: 'stick', stick: 'right', x: 62, y: 80, size: 30 },
+    btn('Y', 85, 43.5, 16, 16, 'circle'),
+    btn('X', 76.8, 60, 16, 16, 'circle'),
+    btn('B', 93.2, 60, 16, 16, 'circle'),
+    btn('A', 85, 76.5, 16, 16, 'circle'),
+    btn('BACK', 38, 7, 14, 10, 'pill', 'Back'),
+    btn('START', 62, 7, 14, 10, 'pill', 'Start'),
+  ]);
+}
+
+/**
+ * The default layout of 0.3.0 and earlier. A phone that saved it without changing anything is switched to the current default
+ * (LayoutFileStore.get); customised layouts are never touched.
+ */
+export function legacyDefaultStoreV1(): LayoutStore {
+  return {
+    version: 1,
+    activeId: DEFAULT_LAYOUT_ID,
+    layouts: [
+      layoutFromSpec([
+        btn('LT', 9, 10, 17, 11, 'rect'),
+        btn('LB', 9, 24, 17, 11, 'rect'),
+        btn('RT', 91, 10, 17, 11, 'rect'),
+        btn('RB', 91, 24, 17, 11, 'rect'),
+        { id: 'stick-left', type: 'stick', stick: 'left', x: 15, y: 66, size: 40 },
+        { id: 'dpad', type: 'dpad', x: 37, y: 82, size: 26 },
+        { id: 'stick-right', type: 'stick', stick: 'right', x: 63, y: 82, size: 30 },
+        btn('Y', 85, 46, 14, 14, 'circle'),
+        btn('X', 77, 61, 14, 14, 'circle'),
+        btn('B', 93, 61, 14, 14, 'circle'),
+        btn('A', 85, 76, 14, 14, 'circle'),
+        btn('BACK', 44, 12, 12, 7, 'pill', 'Back'),
+        btn('START', 56, 12, 12, 7, 'pill', 'Start'),
+      ]),
     ],
   };
-  return sanitizeLayout(raw, 0, new Set()) as Layout;
 }
 
 export function defaultStore(): LayoutStore {

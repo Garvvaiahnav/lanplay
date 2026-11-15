@@ -3,7 +3,7 @@
 //
 // phone -> host
 //   {"t":"hello","name":"Pixel 8"}                       first frame; the host answers with "welcome" or "full"
-//   {"t":"s","b":<buttons>,"lt":0..255,"rt":0..255,"lx":..,"ly":..,"rx":..,"ry":..}   full pad state, sent on change (<= ~60/s)
+//   {"t":"s","b":<buttons>,"lt":0..255,"rt":0..255,"lx":..,"ly":..,"rx":..,"ry":..}   full pad state, sent on change (sticks <= ~125/s, hard cap 240/s; the host closes a socket above 300/s)
 //   {"t":"k"}                                            keepalive, every ~500 ms while the state is unchanged
 // host -> phone
 //   {"t":"welcome","slot":1}    player number 1..4

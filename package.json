@@ -1,6 +1,6 @@
 {
   "name": "lanplay",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "LanPlay: one simple app that sets up Sunshine (Windows host) and launches Moonlight (Mac client) on your own LAN.",
   "license": "GPL-3.0-only",

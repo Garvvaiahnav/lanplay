@@ -9,9 +9,11 @@
   <meta name="referrer" content="no-referrer">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="LanPlay">
   <title>LanPlay Controller</title>
   <link rel="icon" href="data:,">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <link rel="stylesheet" href="controller.css">
   <script src="controller.js" defer></script>
 </head>
@@ -21,42 +23,19 @@
   <!-- Every control is drawn here from the active layout (src/core/controller/layout.ts), so this stays empty in the markup. -->
   <main id="field" class="field" aria-label="Game controller"></main>
 
-  <div id="strip" class="strip" data-state="connecting">
-    <span class="dot" aria-hidden="true"></span>
-    <span id="status" class="status" role="status" aria-live="polite">Connecting…</span>
-    <span id="save" class="save" role="status" hidden></span>
-    <button type="button" id="save-retry" class="strip-btn text-btn" hidden>Retry</button>
-    <span class="strip-actions">
-      <select id="layout-pick" class="strip-select" aria-label="Layout" hidden></select>
-      <button type="button" id="fullscreen" class="strip-btn" aria-label="Enter full screen" hidden>
-        <span class="fs-icon" aria-hidden="true"></span>
-      </button>
-      <button type="button" id="edit" class="strip-btn text-btn edit-btn" aria-label="Edit layout (press and hold)" title="Press and hold to edit" hidden>Edit</button>
-    </span>
-  </div>
+  <!-- The only chrome in play: one button at the top centre. The dot shows the connection (green, amber, red) and the player slot. -->
+  <button type="button" id="menu" class="menu" aria-label="Menu" data-state="connecting">
+    <svg class="gear" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <circle class="gear-teeth" cx="12" cy="12" r="7.6"></circle>
+      <circle class="gear-ring" cx="12" cy="12" r="5.4"></circle>
+      <circle class="gear-hub" cx="12" cy="12" r="1.8"></circle>
+    </svg>
+    <span class="menu-label"><span class="menu-dot" aria-hidden="true">●</span> <span id="menu-slot">P?</span></span>
+  </button>
+  <button type="button" id="done" class="done" hidden>Done</button>
 
-  <aside id="panel" class="panel" aria-label="Layout editor" hidden>
-    <div class="panel-head">
-      <button type="button" id="done" class="action small">Done</button>
-      <button type="button" id="undo" class="strip-btn text-btn" disabled>Undo</button>
-      <button type="button" id="panel-save" class="save-btn" aria-live="polite" disabled hidden></button>
-      <button type="button" id="collapse" class="strip-btn text-btn" aria-expanded="true" aria-controls="panel-body">Hide</button>
-    </div>
-    <div id="panel-body" class="panel-body">
-      <div class="tabs" role="tablist" aria-label="Editor sections">
-        <button type="button" class="tab" role="tab" data-tab="control" aria-selected="true">Control</button>
-        <button type="button" class="tab" role="tab" data-tab="add" aria-selected="false">Add</button>
-        <button type="button" class="tab" role="tab" data-tab="layout" aria-selected="false">Layouts</button>
-      </div>
-      <p id="panel-msg" class="panel-msg" role="status"></p>
-      <div id="panel-content" class="panel-content"></div>
-    </div>
-  </aside>
-
-  <div id="hint" class="hint" hidden>
-    <span>Set your screen timeout to Never while playing</span>
-    <button type="button" id="hint-close" class="hint-close">Got it</button>
-  </div>
+  <!-- The editor surface: Size and Opacity for a selected control, or the settings when nothing is selected. -->
+  <div id="card" class="card" role="group" aria-label="Layout editor" hidden></div>
 
   <div id="notice" class="overlay" role="alert" hidden>
     <p id="notice-text" class="overlay-title"></p>

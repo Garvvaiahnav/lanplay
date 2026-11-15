@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, 
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { defaultStore } from '../../src/core/controller/layout.js';
+import { defaultStore, legacyDefaultStoreV1 } from '../../src/core/controller/layout.js';
 import { LayoutFileStore } from '../../src/core/controller/layout-store.js';
 
 describe('LayoutFileStore', () => {
@@ -76,6 +76,17 @@ describe('LayoutFileStore', () => {
     expect(readdirSync(dir)).toHaveLength(3);
     expect(s.get('10.0.0.1')).toEqual(defaultStore()); // oldest was dropped
     expect(s.get('10.0.0.4').layouts[0]!.name).toBe('P4');
+  });
+
+  it('a phone that saved the old stock layout unchanged gets the new default; a customised one is kept', () => {
+    const s = new LayoutFileStore(dir);
+    s.put('10.0.0.7', legacyDefaultStoreV1());
+    expect(s.get('10.0.0.7')).toEqual(defaultStore());
+    expect(defaultStore()).not.toEqual(legacyDefaultStoreV1());
+    const tweaked = legacyDefaultStoreV1();
+    (tweaked.layouts[0]!.controls[0] as { x: number }).x = 12;
+    s.put('10.0.0.8', tweaked);
+    expect(s.get('10.0.0.8')).toEqual(tweaked);
   });
 
   it('leaves no temporary files behind', () => {

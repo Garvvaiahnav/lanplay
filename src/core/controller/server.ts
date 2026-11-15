@@ -35,6 +35,7 @@ const STATIC: Record<string, { file: string; type: string }> = {
   '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
   '/controller.js': { file: 'controller.js', type: 'text/javascript; charset=utf-8' },
   '/controller.css': { file: 'controller.css', type: 'text/css; charset=utf-8' },
+  '/apple-touch-icon.png': { file: 'apple-touch-icon.png', type: 'image/png' },
 };
 
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";

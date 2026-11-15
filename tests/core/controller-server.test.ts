@@ -87,6 +87,7 @@ describe('ControllerServer', () => {
     writeFileSync(path.join(ui, 'index.html'), '<!doctype html><title>pad</title>');
     writeFileSync(path.join(ui, 'controller.js'), 'console.log(1)');
     writeFileSync(path.join(ui, 'controller.css'), 'body{}');
+    writeFileSync(path.join(ui, 'apple-touch-icon.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
     writeFileSync(path.join(tmp, 'secret.txt'), 'nope');
     pads = [];
     allowed = true;
@@ -108,7 +109,7 @@ describe('ControllerServer', () => {
 
   describe('HTTP', () => {
     it('serves the phone page and its two files with a strict CSP, and nothing else', async () => {
-      for (const [p, type] of [['/', 'text/html'], ['/index.html', 'text/html'], ['/controller.js', 'text/javascript'], ['/controller.css', 'text/css']] as const) {
+      for (const [p, type] of [['/', 'text/html'], ['/index.html', 'text/html'], ['/controller.js', 'text/javascript'], ['/controller.css', 'text/css'], ['/apple-touch-icon.png', 'image/png']] as const) {
         const r = await request(port, 'GET', p);
         expect(r.status).toBe(200);
         expect(r.headers['content-type']).toContain(type);

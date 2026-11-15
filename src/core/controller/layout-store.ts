@@ -3,8 +3,10 @@
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { normalizeAddress } from '../shared/ipnet.js';
-import { defaultStore, sanitizeStore } from './layout.js';
+import { defaultStore, legacyDefaultStoreV1, sanitizeStore } from './layout.js';
 import type { LayoutStore } from './layout.js';
+
+const LEGACY_DEFAULT_JSON = JSON.stringify(legacyDefaultStoreV1());
 
 export interface LayoutFileStoreOptions {
   /** At most this many phones keep layouts; saving for a new phone drops the least recently saved one. */
@@ -32,7 +34,9 @@ export class LayoutFileStore {
 
   get(address: string): LayoutStore {
     try {
-      return sanitizeStore(JSON.parse(readFileSync(this.file(address), 'utf8')));
+      const stored = sanitizeStore(JSON.parse(readFileSync(this.file(address), 'utf8')));
+      // Saved but never changed from the old stock layout: give the phone the current default instead.
+      return JSON.stringify(stored) === LEGACY_DEFAULT_JSON ? defaultStore() : stored;
     } catch {
       return defaultStore();
     }

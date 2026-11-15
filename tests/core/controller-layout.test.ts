@@ -13,6 +13,34 @@ describe('default layout', () => {
   });
 });
 
+describe('default layout geometry (iPhone-sized landscape)', () => {
+  const byId = (id: string) => defaultLayout().controls.find((c) => c.id === id) as unknown as Record<string, number>;
+  it('puts triggers and bumpers in the top corners, the left stick and face buttons where thumbs rest', () => {
+    expect(byId('btn-lt')).toMatchObject({ x: 6.5, y: 8 });
+    expect(byId('btn-rt')).toMatchObject({ x: 93.5, y: 8 });
+    expect(byId('stick-left')).toMatchObject({ x: 16, y: 64, size: 38 });
+    expect(byId('btn-a')).toMatchObject({ x: 85, y: 76.5, w: 16, h: 16 });
+  });
+  it('no two default controls overlap (boxes in % of height, x converted with a 750x380 safe area)', () => {
+    const W = 750, H = 380;
+    const boxes = defaultLayout().controls.map((c) => {
+      const o = c as unknown as Record<string, number>;
+      const w = ((o['w'] ?? o['size']) as number) * (H / 100);
+      const h = ((o['h'] ?? o['size']) as number) * (H / 100);
+      const cx = (o['x'] as number) * (W / 100);
+      const cy = (o['y'] as number) * (H / 100);
+      return { id: c.id, l: cx - w / 2, r: cx + w / 2, t: cy - h / 2, b: cy + h / 2 };
+    });
+    for (let i = 0; i < boxes.length; i++) {
+      for (let j = i + 1; j < boxes.length; j++) {
+        const a = boxes[i]!, b = boxes[j]!;
+        const overlap = a.l < b.r && b.l < a.r && a.t < b.b && b.t < a.b;
+        expect(overlap, `${a.id} overlaps ${b.id}`).toBe(false);
+      }
+    }
+  });
+});
+
 describe('sanitizeStore', () => {
   it('turns garbage into the default store and never throws', () => {
     for (const bad of [null, undefined, 5, 'x', [], {}, { layouts: 'no' }, { version: 1, layouts: [] }]) {

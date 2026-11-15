@@ -1,23 +1,29 @@
 /* LanPlay phone controller page.
  *
- * Classic script (no import/export) wrapped in an IIFE so it adds no globals. The wire protocol is implemented in
+ * Classic script (no import/export) wrapped in an IIFE so it adds no globals. The wire protocol lives in
  * src/core/controller/protocol.ts and the layout schema in src/core/controller/layout.ts; this file mirrors the numbers and
  * types it needs (tests/ui/controller-page.test.ts asserts the mirrors match and that every edit is a fixed point of the
  * host's sanitizer).
  *
- * Layout of this file
  *   1. wire constants and the mirror of layout.ts
- *   2. pure logic: layout store operations, undo history, stick / d-pad / pad maths, protocol helpers
- *   3. boot(): the page (rendering from the active layout, play input, edit mode, host sync, connection)
+ *   2. pure logic: layout store, geometry, pad maths, send timing, haptic decisions, protocol helpers
+ *   3. boot(): the page (controls drawn from the active layout, play input, the small edit mode, host sync, connection)
  *   4. the test hook
  *
  * Design notes
- *  - Layouts live on the HOST (per phone IP). The page loads them with GET /api/layouts, edits a local draft and saves the whole
- *    store with PUT /api/layouts; the sanitized store in the response is the truth. There is no fallback layout and nothing is
- *    kept on the phone except the player-name digits.
- *  - Every control is driven by Pointer Events with setPointerCapture, so any number of fingers work at once.
- *  - Anything that could leave a control stuck (page hidden, window blur, socket closed, cancelled pointer, portrait, entering
- *    the editor) releases every control and sends one neutral state.
+ *  - Layouts live on the HOST (per phone IP). The page loads them with GET /api/layouts, edits a local copy, and saves the whole
+ *    store with ONE PUT /api/layouts when the user taps Done. Nothing is kept on the phone except the player-name digits.
+ *  - Input first: a pointer event updates the held state and sends the frame from inside the handler; painting happens after, with
+ *    transforms only, and no layout is read while a finger is down (geometry is measured on resize, not on touch).
+ *  - There is no animation-frame loop: Safari drops rAF to 30 fps in Low Power Mode. Sends are event-driven with timers only for
+ *    the 8 ms stick gap, the 24 ms minimum press, the 500 ms keepalive and the Android vibration clock (iOS has none: see
+ *    createHaptics). A send from inside a handler cancels any trailing send that was armed before it.
+ *  - Anything that could leave a control stuck (page hidden, window blur, socket closed, cancelled pointer, portrait, entering the
+ *    editor) releases every control and sends one neutral state.
+ *  - Haptics: Android/Chrome have navigator.vibrate (a duration, no amplitude). iOS Safari has NO Vibration API, so there the page
+ *    tries the system tick of a hidden <input type=checkbox switch>; strength is emulated as tick RATE, and ticks are only attempted
+ *    from inside input handlers. This is best effort: WebKit requires a user gesture for that haptic (288403@main, Jan 2025) and
+ *    since WebKit commit fc1ef83eae (May 2026) also a TRUSTED click, which a script-driven label.click() is not. See createHaptics.
  *  - Nothing is logged: the page URL carries the session token.
  */
 (() => {
@@ -120,7 +126,7 @@
   // end of the mirror
   // ================================================================================================================
 
-  /** XUSB bit for each digital button name. LT and RT are analog triggers and have no bit. */
+  /** XUSB bit for each digital button name. LT and RT are analog triggers (sent as 255) and have no bit. */
   const BUTTON_BITS: Readonly<Record<string, number>> = Object.freeze({
     A: BTN.A,
     B: BTN.B,
@@ -135,26 +141,26 @@
   });
 
   // ---- Tuning (page behaviour, not part of the schema) ----
-  const FLOATING_ZONE = 1.5; // a floating stick's touch area is this many times its base size
-  const STICK_RADIUS_FALLBACK = 56;
+  const SLOTS = 3;
   const DPAD_CENTRE = 0.2; // fraction of the d-pad half-size that counts as "centre"
   const DPAD_TAN = Math.tan(Math.PI / 3); // cardinal arms 60 degrees wide, diagonals 30
   const DOUBLE_TAP_MS = 300;
-  const TURBO_HALF_PERIOD_MS = 50;
-  const MIN_FRAME_MS = 16;
+  const MIN_PRESS_MS = 24; // a button release is deferred until it has been down this long
+  const STICK_SEND_MS = 8; // at most one stick frame per 8 ms, plus a trailing one
+  const HARD_SEND_GAP_MS = 1000 / 240; // never more than 240 frames per second
   const KEEPALIVE_MS = 500;
   const RECONNECT_BASE_MS = 500;
   const RECONNECT_MAX_MS = 5000;
-  const VIBRATE_MS = 8;
-  const HINT_VISIBLE_MS = 12000;
-  const EDIT_HOLD_MS = 600;
-  const SAVE_DEBOUNCE_MS = 1500;
-  const SAVED_VISIBLE_MS = 2500;
-  const UNDO_STEPS = 20;
+  const SAVE_RETRY_MS = 5000;
+  const TAP_SLOP = 12; // a tap counts when the finger is released within the button plus this many points
   const MAX_SLOT = 99;
   const WS_OPEN = 1;
   const NAME_KEY = 'lanplay.pad.number';
-  const HINT_KEY = 'lanplay.pad.timeout-hint';
+  const SENSITIVITY_RANGE = { min: 0.5, max: 2 } as const;
+  const OPACITY_MIN = 0.2;
+  const SIZE_RANGE = { stick: { min: 24, max: 60 }, dpad: { min: 18, max: 45 }, button: { min: 8, max: 30 } } as const;
+  const CARD_CONTROL = { w: 280, h: 136 } as const;
+  const CARD_SETTINGS = { w: 300, h: 168 } as const;
 
   // ================================================================================================================
   // 2. Pure logic (reachable from tests through the hook at the bottom)
@@ -172,10 +178,6 @@
   interface Axes {
     x: number;
     y: number;
-  }
-  interface ButtonOut {
-    button: ButtonName;
-    value: number;
   }
   type Phase = 'notoken' | 'connecting' | 'connected' | 'retrying' | 'full' | 'kicked';
   type ServerMessage = { t: 'welcome'; slot: number } | { t: 'full' } | { t: 'kicked' };
@@ -200,30 +202,29 @@
     }
   }
 
-  // ---- Controls: defaults, validated property patches --------------------------------------------------------------
+  // ---- Reading controls from host JSON ---------------------------------------------------------------------------
 
+  type NewKind = 'stick' | 'dpad' | ButtonName;
   const BUTTON_LOOK: Readonly<Record<ButtonName, { w: number; h: number; shape: Shape; label: string }>> = Object.freeze({
-    A: { w: 14, h: 14, shape: 'circle', label: 'A' },
-    B: { w: 14, h: 14, shape: 'circle', label: 'B' },
-    X: { w: 14, h: 14, shape: 'circle', label: 'X' },
-    Y: { w: 14, h: 14, shape: 'circle', label: 'Y' },
-    LB: { w: 17, h: 11, shape: 'rect', label: 'LB' },
-    RB: { w: 17, h: 11, shape: 'rect', label: 'RB' },
-    LT: { w: 17, h: 11, shape: 'rect', label: 'LT' },
-    RT: { w: 17, h: 11, shape: 'rect', label: 'RT' },
-    START: { w: 12, h: 7, shape: 'pill', label: 'Start' },
-    BACK: { w: 12, h: 7, shape: 'pill', label: 'Back' },
+    A: { w: 16, h: 16, shape: 'circle', label: 'A' },
+    B: { w: 16, h: 16, shape: 'circle', label: 'B' },
+    X: { w: 16, h: 16, shape: 'circle', label: 'X' },
+    Y: { w: 16, h: 16, shape: 'circle', label: 'Y' },
+    LB: { w: 22, h: 13, shape: 'rect', label: 'LB' },
+    RB: { w: 22, h: 13, shape: 'rect', label: 'RB' },
+    LT: { w: 22, h: 13, shape: 'rect', label: 'LT' },
+    RT: { w: 22, h: 13, shape: 'rect', label: 'RT' },
+    START: { w: 14, h: 10, shape: 'pill', label: 'Start' },
+    BACK: { w: 14, h: 10, shape: 'pill', label: 'Back' },
     L3: { w: 10, h: 10, shape: 'circle', label: 'L3' },
     R3: { w: 10, h: 10, shape: 'circle', label: 'R3' },
   });
 
-  type NewKind = 'stick' | 'dpad' | ButtonName;
-
-  /** A control with the host's defaults (the same numbers layout.ts falls back to). */
-  function newControl(kind: NewKind, id: string, x: number, y: number, side: 'left' | 'right' = 'left'): Control {
+  /** A control with the host's defaults (the numbers layout.ts falls back to when a field is missing). */
+  function newControl(kind: NewKind, id: string, x: number, y: number): Control {
     const base = { id, x: round(x, 2), y: round(y, 2), opacity: 0.8 };
     if (kind === 'stick') {
-      return { ...base, type: 'stick', stick: side, size: 36, mode: 'fixed', deadzone: 0.1, sensitivity: 1, curve: 'linear', invertX: false, invertY: false, doubleTapClick: true };
+      return { ...base, type: 'stick', stick: 'left', size: 36, mode: 'fixed', deadzone: 0.1, sensitivity: 1, curve: 'linear', invertX: false, invertY: false, doubleTapClick: true };
     }
     if (kind === 'dpad') return { ...base, type: 'dpad', size: 26, diagonals: true };
     const look = BUTTON_LOOK[kind];
@@ -242,6 +243,7 @@
   const flag: Validator = (v) => (typeof v === 'boolean' ? v : undefined);
   const dimension = numberIn(LIMITS.size.min, LIMITS.size.max, 2);
   const COMMON_PROPS: Record<string, Validator> = { x: numberIn(0, 100, 2), y: numberIn(0, 100, 2), opacity: numberIn(LIMITS.opacity.min, LIMITS.opacity.max, 2) };
+  /** What a control may carry. The editor only ever writes x, y, opacity, size (w/h) and stick sensitivity; the rest is read tolerantly. */
   const PROPS: Record<Control['type'], Record<string, Validator>> = {
     stick: {
       ...COMMON_PROPS,
@@ -269,11 +271,7 @@
     },
   };
 
-  /**
-   * Apply a property patch with validation: unknown keys and invalid values are ignored, numbers are clamped to LIMITS and rounded
-   * the way the host rounds them. Returns the SAME object when nothing changed. Changing a button's name also renames its label
-   * when the label was still the old default.
-   */
+  /** Apply validated properties (unknown keys and invalid values are ignored). Returns the SAME object when nothing changed. */
   function applyProps(c: Control, patch: Readonly<Record<string, unknown>>): Control {
     const table = PROPS[c.type];
     const next: Record<string, unknown> = { ...c };
@@ -288,11 +286,20 @@
     }
     if (c.type === 'button') {
       const b = next as unknown as ButtonControl;
-      if (b.button !== c.button && !('label' in patch) && (c.label === c.button || c.label === BUTTON_LOOK[c.button].label)) b.label = BUTTON_LOOK[b.button].label;
       if (b.label === '') b.label = BUTTON_LOOK[b.button].label;
       if (b.label !== c.label) changed = true;
     }
     return changed ? (next as unknown as Control) : c;
+  }
+
+  /**
+   * The simple editor does not expose these, so a store written by the old editor must not change how the pad plays: they are
+   * forced on load (and the cleaned store is what gets saved). Shape, label and size of other controls render as stored.
+   */
+  function forceFixed(c: Control): Control {
+    if (c.type === 'button') return { ...c, latch: false, turbo: false, value: 255 };
+    if (c.type === 'stick') return { ...c, mode: 'fixed', curve: 'linear', invertX: false, invertY: false, deadzone: 0.1, doubleTapClick: true };
+    return { ...c, diagonals: true };
   }
 
   /** Tolerant read of a control from host JSON: anything missing or invalid falls back to the defaults. Never throws. */
@@ -306,10 +313,10 @@
     const wanted = typeof raw['id'] === 'string' ? raw['id'] : `${kind.toLowerCase()}-${index}`;
     const id = freshId(wanted, used);
     used.add(id);
-    return applyProps(newControl(kind, id, 50, 50), raw);
+    return forceFixed(applyProps(newControl(kind, id, 50, 50), raw));
   }
 
-  /** Tolerant read of a store from host JSON, or null when it has no usable layout. */
+  /** Tolerant read of a store from host JSON, or null when it has no usable layout. Layouts beyond the three slots are kept as they are. */
   function coerceStore(raw: unknown): LayoutStore | null {
     if (!isObj(raw) || !Array.isArray(raw['layouts'])) return null;
     const usedLayouts = new Set<string>();
@@ -336,14 +343,12 @@
 
   // ---- Geometry of controls --------------------------------------------------------------------------------------
 
-  /** Touch-area size of a control as [width, height], in percent of the viewport HEIGHT. */
+  /** Touch-area size of a control as [width, height], in percent of the field HEIGHT. */
   function controlBox(c: Control): [number, number] {
-    if (c.type === 'button') return [c.w, c.h];
-    const s = c.type === 'stick' && c.mode === 'floating' ? c.size * FLOATING_ZONE : c.size;
-    return [s, s];
+    return c.type === 'button' ? [c.w, c.h] : [c.size, c.size];
   }
 
-  /** Half extent of a control as [percent of width, percent of height]; `aspect` = viewport width / height. */
+  /** Half extent of a control as [percent of width, percent of height]; `aspect` = field width / height. */
   function halfExtent(c: Control, aspect: number): [number, number] {
     const [w, h] = controlBox(c);
     return [w / 2 / (aspect > 0 ? aspect : 1), h / 2];
@@ -354,93 +359,76 @@
     return round(half * 2 >= 100 ? 50 : clampTo(v, half, 100 - half), 2);
   }
 
-  /** New dimensions for a control whose bottom-right resize handle sits at (wPct, hPct) = twice its offset from the centre. */
-  function sizeFromHandle(c: Control, wPct: number, hPct: number): Record<string, number> {
-    if (c.type === 'button') {
-      if (c.shape === 'circle') {
-        const d = Math.max(wPct, hPct);
-        return { w: d, h: d };
-      }
-      return { w: wPct, h: hPct };
-    }
-    const d = Math.max(wPct, hPct);
-    return { size: c.type === 'stick' && c.mode === 'floating' ? d / FLOATING_ZONE : d };
+  interface Box {
+    cx: number;
+    cy: number;
+    hw: number;
+    hh: number;
   }
 
-  // ---- Layout store operations (pure: every one returns a new store, or the SAME store when it is a no-op) ------------
+  /**
+   * Where the settings/property card goes: centred on the field, unless that would cover the selected control, then the opposite
+   * half (and, if the control is large, the other side or the top/bottom band). `box` is the control and `card` the card size, both
+   * in pixels of the field; returns the card centre. Tries to keep a small gap around the control.
+   */
+  function placeCard(box: Box, card: { w: number; h: number }, field: { w: number; h: number }, gap = 8, top = gap): { x: number; y: number } {
+    const hw = card.w / 2;
+    const hh = card.h / 2;
+    // `top`: the card's top edge never goes above this (it keeps the card out from under the Done button).
+    const fit = (x: number, y: number): { x: number; y: number } => ({ x: clampTo(x, hw + gap, Math.max(hw + gap, field.w - hw - gap)), y: clampTo(y, top + hh, Math.max(top + hh, field.h - hh - gap)) });
+    const hits = (p: { x: number; y: number }): boolean => Math.abs(p.x - box.cx) < hw + box.hw + gap && Math.abs(p.y - box.cy) < hh + box.hh + gap;
+    const midX = field.w / 2;
+    const midY = field.h / 2;
+    const leftFirst = box.cx >= midX;
+    const candidates = [
+      fit(midX, midY),
+      fit(leftFirst ? field.w * 0.25 : field.w * 0.75, midY),
+      fit(leftFirst ? field.w * 0.75 : field.w * 0.25, midY),
+      // a big control: put the card flush against its right or left side, or in the band above or below it
+      fit(box.cx + box.hw + gap + hw, midY),
+      fit(box.cx - box.hw - gap - hw, midY),
+      fit(midX, box.cy >= midY ? top + hh : field.h - hh - gap),
+    ];
+    for (const c of candidates) if (!hits(c)) return c;
+    return candidates[1] as { x: number; y: number };
+  }
+
+  /**
+   * The settings card (nothing selected): on the vertical centre line, at the height that covers the least control area (so every
+   * control stays tappable when possible), the one nearest the middle among equals. Its top edge stays at or below `top`.
+   */
+  function placeSettingsCard(boxes: readonly Box[], card: { w: number; h: number }, field: { w: number; h: number }, top: number, gap = 8): { x: number; y: number } {
+    const hw = card.w / 2;
+    const hh = card.h / 2;
+    const x = clampTo(field.w / 2, hw + gap, Math.max(hw + gap, field.w - hw - gap));
+    const lo = top + hh;
+    const hi = Math.max(lo, field.h - hh - gap);
+    const midY = clampTo(field.h / 2, lo, hi);
+    const covered = (y: number): number => {
+      let area = 0;
+      for (const b of boxes) {
+        const ox = Math.min(x + hw + gap, b.cx + b.hw) - Math.max(x - hw - gap, b.cx - b.hw);
+        const oy = Math.min(y + hh + gap, b.cy + b.hh) - Math.max(y - hh - gap, b.cy - b.hh);
+        if (ox > 0 && oy > 0) area += ox * oy;
+      }
+      return area;
+    };
+    let best = { y: midY, area: covered(midY) };
+    for (let y = lo; y <= hi + 0.01; y += 4) {
+      const area = covered(y);
+      if (area < best.area - 0.5 || (Math.abs(area - best.area) <= 0.5 && Math.abs(y - midY) < Math.abs(best.y - midY))) best = { y, area };
+    }
+    return { x, y: best.y };
+  }
+
+  // ---- Layout store operations (pure: each returns a new store, or the SAME store when it is a no-op) ------------------
 
   function activeLayout(store: LayoutStore): Layout {
     return store.layouts.find((l) => l.id === store.activeId) ?? (store.layouts[0] as Layout);
   }
-
-  const cloneControls = (cs: readonly Control[]): Control[] => cs.slice(0, LIMITS.controls).map((c) => ({ ...c }));
-
-  function uniqueName(store: LayoutStore, base: string): string {
-    const taken = new Set(store.layouts.map((l) => l.name));
-    const name = cleanText(base, LIMITS.nameChars) || 'Layout';
-    if (!taken.has(name)) return name;
-    for (let n = 2; ; n++) {
-      const suffix = ` ${n}`;
-      const candidate = name.slice(0, LIMITS.nameChars - suffix.length).trim() + suffix;
-      if (!taken.has(candidate)) return candidate;
-    }
-  }
-
-  function insertLayout(store: LayoutStore, name: string, haptics: boolean, controls: readonly Control[]): LayoutStore {
-    if (store.layouts.length >= LIMITS.layouts) return store;
-    const id = freshId('layout', new Set(store.layouts.map((l) => l.id)));
-    const layout: Layout = { id, name: uniqueName(store, name), haptics, controls: cloneControls(controls) };
-    return { version: 1, activeId: id, layouts: [...store.layouts, layout] };
-  }
-
-  /** New empty layout, made active. */
-  function newBlankLayout(store: LayoutStore): LayoutStore {
-    return insertLayout(store, `Layout ${store.layouts.length + 1}`, true, []);
-  }
-  /** New layout with the controls of `template` (the host's stock layout, or any other), made active. */
-  function newLayoutFrom(store: LayoutStore, template: Layout): LayoutStore {
-    return insertLayout(store, template.name, template.haptics, template.controls);
-  }
-  function duplicateLayout(store: LayoutStore, id: string): LayoutStore {
-    const src = store.layouts.find((l) => l.id === id);
-    return src ? insertLayout(store, `${src.name} copy`, src.haptics, src.controls) : store;
-  }
-  function renameLayout(store: LayoutStore, id: string, name: string): LayoutStore {
-    const clean = cleanText(name, LIMITS.nameChars);
-    const cur = store.layouts.find((l) => l.id === id);
-    if (!cur || !clean || clean === cur.name) return store;
-    return { ...store, layouts: store.layouts.map((l) => (l.id === id ? { ...l, name: clean } : l)) };
-  }
-  /** Never deletes the last layout. Deleting the active one activates its neighbour. */
-  function deleteLayout(store: LayoutStore, id: string): LayoutStore {
-    const index = store.layouts.findIndex((l) => l.id === id);
-    if (index < 0 || store.layouts.length <= 1) return store;
-    const layouts = store.layouts.filter((l) => l.id !== id);
-    const activeId = store.activeId === id ? (layouts[Math.min(index, layouts.length - 1)] as Layout).id : store.activeId;
-    return { version: 1, activeId, layouts };
-  }
   function switchLayout(store: LayoutStore, id: string): LayoutStore {
     return id !== store.activeId && store.layouts.some((l) => l.id === id) ? { ...store, activeId: id } : store;
   }
-  /** Next (step 1) or previous (step -1) layout, wrapping around. */
-  function cycleLayout(store: LayoutStore, step: number): LayoutStore {
-    const n = store.layouts.length;
-    if (n <= 1) return store;
-    const i = store.layouts.findIndex((l) => l.id === store.activeId);
-    return switchLayout(store, (store.layouts[(((i < 0 ? 0 : i) + step) % n + n) % n] as Layout).id);
-  }
-  /** Replace the controls (and the haptics setting) of one layout with the stock ones; id and name stay. */
-  function resetLayout(store: LayoutStore, id: string, stock: Layout): LayoutStore {
-    if (!store.layouts.some((l) => l.id === id)) return store;
-    return { ...store, layouts: store.layouts.map((l) => (l.id === id ? { ...l, haptics: stock.haptics, controls: cloneControls(stock.controls) } : l)) };
-  }
-  function setHaptics(store: LayoutStore, id: string, on: boolean): LayoutStore {
-    const cur = store.layouts.find((l) => l.id === id);
-    if (!cur || cur.haptics === on) return store;
-    return { ...store, layouts: store.layouts.map((l) => (l.id === id ? { ...l, haptics: on } : l)) };
-  }
-
-  // Control operations act on the ACTIVE layout.
 
   function mapActive(store: LayoutStore, fn: (l: Layout) => Layout): LayoutStore {
     const cur = activeLayout(store);
@@ -457,23 +445,6 @@
     });
   }
 
-  const canAddControl = (store: LayoutStore): boolean => activeLayout(store).controls.length < LIMITS.controls;
-
-  /** Add a control near the middle of the screen (staggered so new ones do not hide each other). Returns the new id, or null at the limit. */
-  function addControl(store: LayoutStore, kind: NewKind, aspect = 2): { store: LayoutStore; id: string | null } {
-    const layout = activeLayout(store);
-    if (layout.controls.length >= LIMITS.controls) return { store, id: null };
-    const used = new Set(layout.controls.map((c) => c.id));
-    const side: 'left' | 'right' = layout.controls.some((c) => c.type === 'stick' && c.stick === 'left') ? 'right' : 'left';
-    const prefix = kind === 'stick' ? `stick-${side}` : kind === 'dpad' ? 'dpad' : `btn-${kind.toLowerCase()}`;
-    const id = freshId(prefix, used);
-    const step = layout.controls.length % 5;
-    const probe = newControl(kind, id, 0, 0, side);
-    const [hx, hy] = halfExtent(probe, aspect);
-    const c = newControl(kind, id, clampCentre(50 + (step - 2) * 4, hx), clampCentre(50 + (step - 2) * 4, hy), side);
-    return { store: mapActive(store, (l) => ({ ...l, controls: [...l.controls, c] })), id };
-  }
-
   /** Move a control's centre (percent) keeping the whole control on screen. */
   function moveControl(store: LayoutStore, id: string, x: number, y: number, aspect = 2): LayoutStore {
     if (!isNum(x) || !isNum(y)) return store;
@@ -485,57 +456,97 @@
     });
   }
 
-  /** Resize: `{size}` for sticks and d-pads, `{w, h}` for buttons; clamped to LIMITS.size and kept on screen. */
-  function resizeControl(store: LayoutStore, id: string, dims: { size?: number; w?: number; h?: number }, aspect = 2): LayoutStore {
+  /** The one number the Size slider edits: the diameter of a stick or d-pad, the height of a button. */
+  function sizeOf(c: Control): number {
+    return c.type === 'button' ? c.h : c.size;
+  }
+  /** Slider range for Size, widened to include a stored value outside it. */
+  function sizeRange(c: Control): { min: number; max: number } {
+    const r = SIZE_RANGE[c.type];
+    const cur = sizeOf(c);
+    return { min: Math.min(r.min, cur), max: Math.max(r.max, cur) };
+  }
+  /** Touch-area size [w, h] (percent of the field height) of a control at the top of its Size range, keeping a button's ratio. */
+  function reachBox(c: Control): [number, number] {
+    const max = sizeRange(c).max;
+    if (c.type !== 'button') return [max, max];
+    return [c.h > 0 ? (max * c.w) / c.h : max, max];
+  }
+  function opacityRange(c: Control): { min: number; max: number } {
+    return { min: Math.min(OPACITY_MIN, c.opacity), max: 1 };
+  }
+
+  /**
+   * Set the Size of a control. Buttons scale width and height together: `ratio` (width / height) is the one the control had when
+   * the slider was grabbed, so repeated rounding cannot make it drift. The control is kept on screen.
+   */
+  function setSize(store: LayoutStore, id: string, value: number, ratio?: number, aspect = 2): LayoutStore {
+    if (!isNum(value)) return store;
     return mapControl(store, id, (c) => {
-      const resized = applyProps(c, dims);
-      if (resized === c) return c;
-      const [hx, hy] = halfExtent(resized, aspect);
-      return { ...resized, x: clampCentre(resized.x, hx), y: clampCentre(resized.y, hy) };
+      const r = sizeRange(c);
+      const v = round(clampTo(value, r.min, r.max), 2);
+      let next: Control;
+      if (c.type === 'button') {
+        const k = ratio !== undefined && ratio > 0 ? ratio : c.h > 0 ? c.w / c.h : 1;
+        next = applyProps(c, { h: v, w: round(v * k, 2) });
+      } else {
+        next = applyProps(c, { size: v });
+      }
+      if (next === c) return c;
+      const [hx, hy] = halfExtent(next, aspect);
+      return { ...next, x: clampCentre(next.x, hx), y: clampCentre(next.y, hy) };
     });
   }
 
-  /** A copy next to the original with a fresh id. Returns the new id, or null at the limit / when the control is missing. */
-  function duplicateControl(store: LayoutStore, id: string, aspect = 2): { store: LayoutStore; id: string | null } {
-    const layout = activeLayout(store);
-    const src = layout.controls.find((c) => c.id === id);
-    if (!src || layout.controls.length >= LIMITS.controls) return { store, id: null };
-    const newId = freshId(id, new Set(layout.controls.map((c) => c.id)));
-    const copy: Control = { ...src, id: newId };
-    const [hx, hy] = halfExtent(copy, aspect);
-    copy.x = clampCentre(src.x + 4, hx);
-    copy.y = clampCentre(src.y + 4, hy);
-    return { store: mapActive(store, (l) => ({ ...l, controls: [...l.controls, copy] })), id: newId };
+  function setOpacity(store: LayoutStore, id: string, value: number): LayoutStore {
+    if (!isNum(value)) return store;
+    return mapControl(store, id, (c) => applyProps(c, { opacity: clampTo(value, opacityRange(c).min, 1) }));
   }
 
-  function deleteControl(store: LayoutStore, id: string): LayoutStore {
-    return mapActive(store, (l) => (l.controls.some((c) => c.id === id) ? { ...l, controls: l.controls.filter((c) => c.id !== id) } : l));
+  /** The stick sensitivity shown in the settings card: that of the first stick in the layout (1 when there is none). */
+  function layoutSensitivity(l: Layout): number {
+    const s = l.controls.find((c): c is StickControl => c.type === 'stick');
+    return s ? s.sensitivity : 1;
+  }
+  /** Write a stick sensitivity (0.5..2.0) to every stick of the active layout. */
+  function setSensitivity(store: LayoutStore, value: number): LayoutStore {
+    if (!isNum(value)) return store;
+    const v = round(clampTo(value, SENSITIVITY_RANGE.min, SENSITIVITY_RANGE.max), 3);
+    return mapActive(store, (l) => {
+      let changed = false;
+      const controls = l.controls.map((c) => {
+        if (c.type !== 'stick' || c.sensitivity === v) return c;
+        changed = true;
+        return { ...c, sensitivity: v };
+      });
+      return changed ? { ...l, controls } : l;
+    });
+  }
+  /** Haptics on or off, written to every layout. */
+  function setHaptics(store: LayoutStore, on: boolean): LayoutStore {
+    if (store.layouts.every((l) => l.haptics === on)) return store;
+    return { ...store, layouts: store.layouts.map((l) => (l.haptics === on ? l : { ...l, haptics: on })) };
   }
 
-  /** Set validated properties on one control (see applyProps). */
-  function patchControl(store: LayoutStore, id: string, patch: Readonly<Record<string, unknown>>): LayoutStore {
-    return mapControl(store, id, (c) => applyProps(c, patch));
+  /**
+   * Fill an empty slot: a copy of the stock layout (`template`) made active. It inherits the haptics setting and stick sensitivity of
+   * the layout the user is on, so those two settings feel global.
+   */
+  function addSlot(store: LayoutStore, template: Layout): LayoutStore {
+    if (store.layouts.length >= LIMITS.layouts) return store;
+    const cur = activeLayout(store);
+    const sens = layoutSensitivity(cur);
+    const id = freshId('layout', new Set(store.layouts.map((l) => l.id)));
+    const controls = template.controls.slice(0, LIMITS.controls).map((c): Control => (c.type === 'stick' ? { ...c, sensitivity: sens } : { ...c }));
+    return { version: 1, activeId: id, layouts: [...store.layouts, { id, name: cleanText(template.name, LIMITS.nameChars) || 'Layout', haptics: cur.haptics, controls }] };
   }
-
-  // ---- Undo (the last UNDO_STEPS stores; stores are immutable so a step is just a reference) --------------------------
-
-  interface History {
-    past: LayoutStore[];
-    /** Key of the gesture in progress; edits with the same key share one undo step. */
-    key: string | null;
-  }
-  const emptyHistory = (): History => ({ past: [], key: null });
-  /** Call before replacing `before` with an edited store. A repeated non-null key (a drag, a slider) records only the first. */
-  function recordEdit(h: History, before: LayoutStore, key: string | null): History {
-    if (key !== null && h.key === key) return h;
-    return { past: [...h.past, before].slice(-UNDO_STEPS), key };
-  }
-  function endGesture(h: History): History {
-    return h.key === null ? h : { ...h, key: null };
-  }
-  function undo(h: History): { history: History; store: LayoutStore } | null {
-    const prev = h.past[h.past.length - 1];
-    return prev ? { history: { past: h.past.slice(0, -1), key: null }, store: prev } : null;
+  /** Replace the controls of one layout with the stock ones; id, name, haptics and the stick sensitivity stay. */
+  function resetLayout(store: LayoutStore, id: string, stock: Layout): LayoutStore {
+    const old = store.layouts.find((l) => l.id === id);
+    if (!old) return store;
+    const sens = layoutSensitivity(old);
+    const controls = stock.controls.slice(0, LIMITS.controls).map((c): Control => (c.type === 'stick' ? { ...c, sensitivity: sens } : { ...c }));
+    return { ...store, layouts: store.layouts.map((l) => (l.id === id ? { ...l, controls } : l)) };
   }
 
   // ---- Pad state -------------------------------------------------------------------------------------------------
@@ -553,7 +564,7 @@
   const STICK_DEFAULTS: Readonly<StickParams> = Object.freeze({ deadzone: 0.1, sensitivity: 1, curve: 'linear', invertX: false, invertY: false });
 
   /**
-   * Stick offset from the base centre (screen pixels, y grows downwards) to XInput axes:
+   * Stick offset from the base centre (pixels, y grows downwards) to XInput axes:
    *   r = min(1, distance / radius);  below the dead zone the output is 0, otherwise m = (r - dz) / (1 - dz);
    *   curve (linear m, precise m*m, aggressive sqrt m);  m = min(1, m * sensitivity);  axis = unit vector * m * 32767;
    *   then invertX / invertY. Up is positive on the wire, so a screen-up drag gives a positive y unless invertY is set.
@@ -571,6 +582,12 @@
     if (p.invertX) x = -x;
     if (p.invertY) y = -y;
     return { x: Math.round(x) || 0, y: Math.round(y) || 0 };
+  }
+
+  /** How far the stick is pulled, 0..1 (the haptic clock follows this, not the curved output). */
+  function deflection(dx: number, dy: number, radius: number): number {
+    const dist = Math.hypot(dx, dy);
+    return radius > 0 && dist > 0 ? Math.min(1, dist / radius) : 0;
   }
 
   /** Limit an offset to a circle (keeps the knob drawing inside the base). */
@@ -593,45 +610,209 @@
     return m;
   }
 
-  /** XUSB bits for a set of buttons plus the d-pad. LT and RT add nothing here (see buildPad). */
+  /** XUSB bits for a set of button names plus the d-pad. LT and RT add nothing here (see buildPad). */
   function buttonMask(buttons: Iterable<string>, dpad: number): number {
     let m = dpad & DPAD_BITS;
     for (const name of buttons) m |= BUTTON_BITS[name] ?? 0;
     return m;
   }
 
-  /** The wire state for the buttons currently down. Triggers send their configured value (the largest wins when several are down). */
-  function buildPad(outs: Iterable<ButtonOut>, dpad: number, ls: Readonly<Axes>, rs: Readonly<Axes>): Pad {
+  /** The wire state for the buttons currently down. LT and RT are digital: 255. */
+  function buildPad(buttons: Iterable<ButtonName>, dpad: number, ls: Readonly<Axes>, rs: Readonly<Axes>): Pad {
     let b = dpad & DPAD_BITS;
     let lt = 0;
     let rt = 0;
-    for (const o of outs) {
-      if (o.button === 'LT') lt = Math.max(lt, o.value);
-      else if (o.button === 'RT') rt = Math.max(rt, o.value);
-      else b |= BUTTON_BITS[o.button] ?? 0;
+    for (const name of buttons) {
+      if (name === 'LT') lt = 255;
+      else if (name === 'RT') rt = 255;
+      else b |= BUTTON_BITS[name] ?? 0;
     }
     const axis = (v: number): number => clampTo(Math.round(v) || 0, -32768, AXIS_MAX);
-    const trig = (v: number): number => clampTo(Math.round(v) || 0, 0, 255);
-    return { b, lt: trig(lt), rt: trig(rt), lx: axis(ls.x), ly: axis(ls.y), rx: axis(rs.x), ry: axis(rs.y) };
+    return { b, lt, rt, lx: axis(ls.x), ly: axis(ls.y), rx: axis(rs.x), ry: axis(rs.y) };
   }
 
   function samePad(a: Readonly<Pad> | null, b: Readonly<Pad>): boolean {
     return a !== null && a.b === b.b && a.lt === b.lt && a.rt === b.rt && a.lx === b.lx && a.ly === b.ly && a.rx === b.rx && a.ry === b.ry;
   }
 
-  /** Union of two pad snapshots for latching presses: buttons OR-ed, triggers maxed, sticks from the newer one. */
-  function mergePress(older: Readonly<Pad>, newer: Readonly<Pad>): Pad {
-    return { ...newer, b: older.b | newer.b, lt: Math.max(older.lt, newer.lt), rt: Math.max(older.rt, newer.rt) };
-  }
-
-  /** True when `pad` still shows every button and trigger that `press` had down. */
-  function coversPress(pad: Readonly<Pad>, press: Readonly<Pad>): boolean {
-    return (press.b & ~pad.b) === 0 && press.lt <= pad.lt && press.rt <= pad.rt;
+  /** A release must wait until the press has lasted MIN_PRESS_MS (a game that polls at 60 Hz can miss a 2 ms press). */
+  function releaseDelay(pressedAt: number, now: number, minMs = MIN_PRESS_MS): number {
+    return Math.max(0, minMs - (now - pressedAt));
   }
 
   /** Two taps on a stick: the second touch starts within 300 ms of the first tap's release. */
   function isDoubleTap(lastTapEnd: number | null, now: number): boolean {
     return lastTapEnd !== null && now >= lastTapEnd && now - lastTapEnd <= DOUBLE_TAP_MS;
+  }
+
+  // ---- Haptic decisions (pure; createHaptics below wires them to timers and sinks) --------------------------------------
+
+  type HapticMode = 'android' | 'ios' | 'none';
+
+  /** Android and desktop Chrome have navigator.vibrate; iOS Safari does not (it gets the switch tick); anything else stays silent. */
+  function hapticMode(ua: string, maxTouchPoints: number, hasVibrate: boolean): HapticMode {
+    if (hasVibrate) return 'android';
+    if (/iPhone|iPad|iPod/i.test(ua) || (/Macintosh/i.test(ua) && maxTouchPoints > 1)) return 'ios';
+    return 'none';
+  }
+
+  /** Android stick feedback by deflection d: a pulse of `pulse` ms every `period` ms, stronger (longer, more often) the farther it is pulled. */
+  function androidPattern(d: number): { pulse: number; period: number } | null {
+    if (!(d >= 0.15)) return null;
+    if (d < 0.4) return { pulse: 6, period: 140 };
+    if (d < 0.65) return { pulse: 10, period: 110 };
+    if (d < 0.9) return { pulse: 16, period: 90 };
+    return { pulse: 24, period: 80 };
+  }
+
+  interface AndroidStick {
+    active: boolean;
+    /** When the next pulse is due. */
+    nextAt: number;
+    /** Length of the pulse train currently running, so a stronger pull can take over at once. */
+    pulse: number;
+  }
+  /**
+   * One step of the Android stick clock. Returns the new state, the argument for navigator.vibrate (0 cancels) or null, and how long
+   * until the clock must be consulted again (null: not needed).
+   */
+  function androidStickStep(s: AndroidStick, d: number, now: number): { s: AndroidStick; vibrate: number | null; wait: number | null } {
+    const p = androidPattern(d);
+    if (!p) return { s: { active: false, nextAt: 0, pulse: 0 }, vibrate: s.active ? 0 : null, wait: null };
+    // A stronger pull starts its pulse train at once; a weaker one waits for the current pulse to finish.
+    if (!s.active || now >= s.nextAt || p.pulse > s.pulse) return { s: { active: true, nextAt: now + p.period, pulse: p.pulse }, vibrate: p.pulse, wait: p.period };
+    return { s, vibrate: null, wait: s.nextAt - now };
+  }
+
+  const IOS_STICK_MIN_D = 0.2;
+  const IOS_STICK_MIN_MS = 55; // a stick never ticks faster than this
+  const IOS_ANY_MIN_MS = 25; // nothing ticks faster than this
+
+  /** iOS stick strength is the tick RATE: nothing under d = 0.2, then 4 Hz rising to 18 Hz at full deflection. */
+  function iosStickInterval(d: number): number | null {
+    if (!(d >= IOS_STICK_MIN_D)) return null;
+    const hz = 4 + (14 * (Math.min(1, d) - IOS_STICK_MIN_D)) / (1 - IOS_STICK_MIN_D);
+    return Math.max(IOS_STICK_MIN_MS, 1000 / hz);
+  }
+
+  interface TickGate {
+    /** Time of the last tick of any kind. */
+    lastAny: number;
+    /** Earliest time of the next stick tick. */
+    nextStickDue: number;
+  }
+  /** A button/d-pad tick takes priority over the stick cadence but still obeys the global 25 ms spacing. */
+  function buttonTickAllowed(g: TickGate, now: number): boolean {
+    return now - g.lastAny >= IOS_ANY_MIN_MS;
+  }
+  /** Whether a stick tick is due now, and how long until it will be (the interval at the current deflection). */
+  function iosStickDecision(g: TickGate, d: number, now: number): { fire: boolean; wait: number | null } {
+    const iv = iosStickInterval(d);
+    if (iv === null) return { fire: false, wait: null };
+    const due = Math.max(g.nextStickDue, g.lastAny + IOS_ANY_MIN_MS);
+    return now >= due ? { fire: true, wait: iv } : { fire: false, wait: due - now };
+  }
+
+  interface HapticDeps {
+    mode: HapticMode;
+    /** Layout setting: false means no vibration anywhere. */
+    enabled(): boolean;
+    /** Android sink: navigator.vibrate. */
+    vibrate(ms: number): void;
+    /** iOS sink: one switch tick. */
+    iosTick(): void;
+    now(): number;
+    setTimer(fn: () => void, ms: number): unknown;
+    clearTimer(handle: unknown): void;
+  }
+  interface Haptics {
+    /** One press tick (buttons, d-pad direction change, stick touch-down). */
+    tick(): void;
+    /** The larger deflection of the two sticks, 0..1; call on every stick event and with 0 on release. */
+    setStick(d: number): void;
+    /** Cancel everything (release, hidden, blur, edit mode). */
+    stop(): void;
+  }
+
+  /** Android: a 10 ms vibrate per press, a pulse train for sticks. iOS: switch ticks, stick strength as rate. Never throws. */
+  function createHaptics(deps: HapticDeps): Haptics {
+    let gate: TickGate = { lastAny: -1e9, nextStickDue: 0 };
+    let android: AndroidStick = { active: false, nextAt: 0, pulse: 0 };
+    let timer: unknown = null;
+    let timerDue = 0;
+    let lastD = 0;
+    const safe = (fn: () => void): void => {
+      try {
+        fn();
+      } catch {
+        /* haptics are a nicety */
+      }
+    };
+    const clearTimer = (): void => {
+      if (timer !== null) deps.clearTimer(timer);
+      timer = null;
+    };
+    /** Keep one timer due `wait` ms from `now`; an already armed timer for (nearly) the same moment is left alone. */
+    const arm = (wait: number | null, now: number): void => {
+      if (wait === null) return clearTimer();
+      const due = now + Math.max(1, Math.ceil(wait));
+      if (timer !== null && Math.abs(due - timerDue) < 2) return;
+      clearTimer();
+      timerDue = due;
+      timer = deps.setTimer(onTimer, due - now);
+    };
+    function step(): void {
+      const now = deps.now();
+      if (deps.mode === 'android') {
+        const r = androidStickStep(android, lastD, now);
+        android = r.s;
+        if (r.vibrate !== null) {
+          const ms = r.vibrate;
+          safe(() => deps.vibrate(ms));
+        }
+        arm(r.wait, now);
+      } else if (deps.mode === 'ios') {
+        // iOS: WebKit only plays the switch haptic while it is processing a user gesture (CheckboxInputType.cpp,
+        // performSwitchVisuallyOnAnimation), so a tick from a timer can never be felt. Ticks are therefore only attempted
+        // synchronously from an input event (setStick is called from pointerdown/pointermove); no timer is armed.
+        const dec = iosStickDecision(gate, lastD, now);
+        if (dec.fire) {
+          gate = { lastAny: now, nextStickDue: now + (iosStickInterval(lastD) ?? IOS_STICK_MIN_MS) };
+          safe(deps.iosTick);
+        }
+      }
+    }
+    function onTimer(): void {
+      timer = null;
+      if (!deps.enabled()) return stop();
+      step();
+    }
+    function stop(): void {
+      clearTimer();
+      lastD = 0;
+      if (deps.mode === 'android' && android.active) {
+        android = { active: false, nextAt: 0, pulse: 0 };
+        safe(() => deps.vibrate(0));
+      }
+    }
+    return {
+      tick(): void {
+        if (deps.mode === 'none' || !deps.enabled()) return;
+        if (deps.mode === 'android') return safe(() => deps.vibrate(10));
+        const now = deps.now();
+        if (!buttonTickAllowed(gate, now)) return;
+        gate = { ...gate, lastAny: now };
+        safe(deps.iosTick);
+      },
+      setStick(d: number): void {
+        if (deps.mode === 'none') return;
+        if (!deps.enabled()) return stop();
+        lastD = d;
+        if (d <= 0) return stop();
+        step();
+      },
+      stop,
+    };
   }
 
   // ---- Protocol helpers --------------------------------------------------------------------------------------------
@@ -697,15 +878,6 @@
     }
   }
 
-  /** Short, user-facing reason for a failed layout request. */
-  function httpMessage(status: number): string {
-    if (status === 401 || status === 403) return 'The host did not accept this link';
-    if (status === 413) return 'The layout is too big to save';
-    if (status === 429) return 'Too many requests, wait a moment';
-    if (status === 0) return 'Cannot reach the PC';
-    return 'The PC reported an error';
-  }
-
   const BUTTON_ARIA: Readonly<Record<ButtonName, string>> = Object.freeze({
     A: 'A button',
     B: 'B button',
@@ -720,6 +892,7 @@
     L3: 'Left stick click (L3)',
     R3: 'Right stick click (R3)',
   });
+  const controlName = (c: Control): string => (c.type === 'button' ? BUTTON_ARIA[c.button] : c.type === 'stick' ? (c.stick === 'left' ? 'Left' : 'Right') + ' stick' : 'D-pad');
 
   // ================================================================================================================
   // 3. The page
@@ -733,16 +906,17 @@
     kind: 'stick';
     cid: string;
     side: 'left' | 'right';
-    /** Zone rect origin and the base centre inside it (CSS pixels). */
-    left: number;
-    top: number;
-    ox: number;
-    oy: number;
+    /** Base centre and radius in CSS pixels, measured on resize (never on touch). */
+    cx: number;
+    cy: number;
     radius: number;
     params: StickParams;
     downAt: number;
     click: boolean;
     ax: Axes;
+    /** Deflection 0..1 for the haptic clock. */
+    d: number;
+    knob: HTMLElement | null;
   }
   interface DpadHold {
     kind: 'dpad';
@@ -752,24 +926,21 @@
     half: number;
     diagonals: boolean;
     bits: number;
+    el: HTMLElement;
   }
   type Hold = ButtonHold | StickHold | DpadHold;
   interface EditDrag {
     pointerId: number;
-    kind: 'move' | 'resize';
     id: string;
-    /** move: the control centre minus the finger, in percent. */
+    /** The control centre minus the finger, in percent. */
     ox: number;
     oy: number;
   }
-  type SaveState = 'idle' | 'saving' | 'saved' | 'error';
-  type Tab = 'control' | 'add' | 'layout';
   interface ApiResult {
     ok: boolean;
     status: number;
     body: unknown;
   }
-
   interface Booted {
     destroy(): void;
   }
@@ -777,6 +948,7 @@
   function boot(): Booted {
     const ac = new AbortController();
     const on = { signal: ac.signal };
+    const onPassive = { signal: ac.signal, passive: true };
 
     const must = <T extends HTMLElement>(id: string): T => {
       const el = document.getElementById(id);
@@ -784,30 +956,18 @@
       return el as T;
     };
     const fieldEl = must('field');
-    const strip = must('strip');
-    const statusEl = must('status');
-    const saveEl = must('save');
-    const saveRetry = must('save-retry');
-    const layoutPick = must<HTMLSelectElement>('layout-pick');
-    const fsBtn = must('fullscreen');
-    const editBtn = must('edit');
-    const panel = must('panel');
-    const doneBtn = must('done');
-    const undoBtn = must<HTMLButtonElement>('undo');
-    const panelSave = must<HTMLButtonElement>('panel-save');
-    const collapseBtn = must('collapse');
-    const panelBody = must('panel-body');
-    const panelMsg = must('panel-msg');
-    const panelContent = must('panel-content');
-    const hintEl = must('hint');
-    const hintClose = must('hint-close');
+    const menu = must('menu');
+    const menuSlot = must('menu-slot');
+    const done = must('done');
+    const card = must('card');
     const noticeEl = must('notice');
     const noticeText = must('notice-text');
     const retryBtn = must('retry');
 
-    const now = (): number => Date.now();
+    // Monotonic: a wall-clock step (NTP, manual time change) must not stall the send gap or the minimum-press timer.
+    const now = (): number => performance.now();
 
-    // ---- Storage (private mode and blocked storage throw). Only the player-name digits and the hint flag live here. ----
+    // ---- Storage (private mode and blocked storage throw). Only the player-name digits live here. ----
     const storageGet = (k: string): string | null => {
       try {
         return localStorage.getItem(k);
@@ -824,7 +984,8 @@
     };
 
     // ---- Page state ----
-    const token = new URLSearchParams(location.search).get('t');
+    const params = new URLSearchParams(location.search);
+    const token = params.get('t');
     let phase: Phase = token ? 'connecting' : 'notoken';
     let slot: number | null = null;
     let layoutState: 'loading' | 'ready' | 'failed' = 'loading';
@@ -834,24 +995,21 @@
     let destroyed = false;
     /** Bumped by every edit; a save response is only adopted when nothing changed since it was sent. */
     let rev = 0;
-    let history: History = emptyHistory();
+    /** The last save failed (or an edit has not been saved yet): the dot is amber and a retry is pending. */
+    let unsaved = false;
     let selectedId: string | null = null;
-    let tab: Tab = 'control';
     let defaultCache: Layout | null = null;
 
-    // ---- Units: sizes in layouts are percent of the viewport height ----
-    function updateUnit(): void {
-      const active = document.activeElement;
-      if (active instanceof HTMLInputElement || active instanceof HTMLSelectElement) return; // the on-screen keyboard resizes the viewport
-      const vv = window.visualViewport;
-      const h = window.innerHeight > 0 ? window.innerHeight : (vv?.height ?? 0);
-      if (h > 0) document.documentElement.style.setProperty('--u', (h / 100).toFixed(4) + 'px');
-    }
-    const aspect = (): number => (window.innerHeight > 0 ? window.innerWidth / window.innerHeight : 2);
-    function fieldMetrics(): { left: number; top: number; w: number; h: number } {
+    // ---- Geometry: measured on resize only, so no layout is read while a finger is down ----
+    let fm = { left: 0, top: 0, w: 0, h: 0 };
+    let unit = 0; // pixels per 1% of the field height
+    function measure(): void {
       const r = fieldEl.getBoundingClientRect();
-      return r.width > 0 && r.height > 0 ? { left: r.left, top: r.top, w: r.width, h: r.height } : { left: 0, top: 0, w: window.innerWidth, h: window.innerHeight };
+      fm = r.width > 0 && r.height > 0 ? { left: r.left, top: r.top, w: r.width, h: r.height } : { left: 0, top: 0, w: window.innerWidth, h: window.innerHeight };
+      unit = fm.h / 100;
+      if (unit > 0) document.documentElement.style.setProperty('--u', unit.toFixed(4) + 'px');
     }
+    const aspect = (): number => (fm.h > 0 ? fm.w / fm.h : 2);
 
     // ---- Controls on screen ----
     const controls = new Map<string, Control>(); // active layout, by id
@@ -879,7 +1037,6 @@
       } else {
         el = div('ctl ctl-dpad');
         el.setAttribute('role', 'group');
-        el.setAttribute('aria-label', 'D-pad');
         for (const dir of ['up', 'left', 'right', 'down']) {
           const arm = document.createElement('span');
           arm.className = 'arm arm-' + dir;
@@ -898,23 +1055,18 @@
       el.style.setProperty('--w', String(w));
       el.style.setProperty('--h', String(h));
       el.style.opacity = String(c.opacity);
+      el.setAttribute('aria-label', controlName(c));
       if (c.type === 'button') {
-        el.className = 'ctl key ctl-btn shape-' + c.shape; // resets the state classes, which are re-applied below
-        el.classList.toggle('is-down', isDown(c.id));
-        el.classList.toggle('is-latch', c.latch);
+        el.className = 'ctl key ctl-btn shape-' + c.shape; // resets the state classes, re-applied below
+        el.classList.toggle('is-down', isOn(c.id));
         el.dataset['button'] = c.button;
-        el.setAttribute('aria-label', BUTTON_ARIA[c.button]);
         if (el.textContent !== c.label) el.textContent = c.label;
-        // Text size follows the button height but shrinks for long labels (units of 1% of the viewport height).
+        // Text size follows the button height but shrinks for long labels (units of 1% of the field height).
         el.style.setProperty('--fs', Math.max(2.2, Math.min(c.h * 0.42, (c.w * 1.4) / Math.max(1, c.label.length))).toFixed(2));
-      } else if (c.type === 'stick') {
-        el.classList.toggle('is-floating', c.mode === 'floating');
-        el.setAttribute('aria-label', (c.stick === 'left' ? 'Left' : 'Right') + ' stick');
-        el.style.setProperty('--s', String(c.size));
       }
     }
 
-    /** Make the DOM match the active layout without recreating elements (pointer capture survives edits). */
+    /** Make the DOM match the active layout without recreating elements (so a drag keeps its pointer capture). */
     function syncField(reset: boolean): void {
       if (reset) {
         for (const el of elems.values()) el.remove();
@@ -947,82 +1099,65 @@
         }
       }
       if (order.some((el, i) => fieldEl.children[i] !== el)) fieldEl.append(...order); // only when the order really changed
-      updateSelection();
+      for (const [id, el] of elems) el.classList.toggle('is-selected', mode === 'edit' && id === selectedId);
     }
 
-    function updateSelection(): void {
-      for (const [id, el] of elems) {
-        const sel = mode === 'edit' && id === selectedId;
-        el.classList.toggle('is-selected', sel);
-        const handle = el.querySelector('.resize-handle');
-        if (sel && !handle) {
-          const hd = document.createElement('span');
-          hd.className = 'resize-handle';
-          hd.dataset['handle'] = '1';
-          el.appendChild(hd);
-        } else if (!sel && handle) {
-          handle.remove();
-        }
-      }
+    // ---- Haptics wiring ----
+    const ua = navigator.userAgent;
+    const hasVibrate = typeof navigator.vibrate === 'function';
+    const hmode = hapticMode(ua, navigator.maxTouchPoints ?? 0, hasVibrate);
+    let iosLabel: HTMLLabelElement | null = null;
+    if (hmode === 'ios') {
+      // The system "switch" haptic: toggling a hidden <input type=checkbox switch> from a touch handler plays a tick (iOS 17.4+).
+      iosLabel = document.createElement('label');
+      iosLabel.className = 'haptic-switch';
+      iosLabel.setAttribute('aria-hidden', 'true');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.setAttribute('switch', '');
+      input.tabIndex = -1;
+      iosLabel.appendChild(input);
+      document.body.appendChild(iosLabel);
     }
+    const rawIosTick = (): void => iosLabel?.click();
+    const rawVibrate = (ms: number): void => {
+      if (typeof navigator.vibrate === 'function') navigator.vibrate(ms);
+    };
+    const haptics = createHaptics({
+      mode: hmode,
+      enabled: () => !!store && activeLayout(store).haptics,
+      vibrate: rawVibrate,
+      iosTick: rawIosTick,
+      now,
+      setTimer: (fn, ms) => setTimeout(fn, ms),
+      clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+    });
 
     // ---- Play input state ----
     const holds = new Map<number, Hold>(); // pointerId -> what that finger holds
     const fingers = new Map<string, number>(); // button control id -> fingers on it
-    const latched = new Set<string>(); // button controls toggled on
+    const pressedAt = new Map<string, number>(); // button control id -> when it went down
+    const pendingRelease = new Map<string, ReturnType<typeof setTimeout>>(); // releases waiting out the minimum press time
     const lastTapEnd = new Map<string, number>(); // stick control id -> when its last tap ended
-    let turboOn = true;
-    let turboTimer: ReturnType<typeof setInterval> | null = null;
-    /** Pad as it was when a button went down; see onFrame. */
-    let latch: Pad | null = null;
 
-    function haptic(): void {
-      if (!store || !activeLayout(store).haptics) return;
-      try {
-        if (typeof navigator.vibrate === 'function') navigator.vibrate(VIBRATE_MS);
-      } catch {
-        /* vibration is a nicety */
-      }
-    }
-
-    const isDown = (cid: string): boolean => (fingers.get(cid) ?? 0) > 0 || latched.has(cid);
+    const isOn = (cid: string): boolean => (fingers.get(cid) ?? 0) > 0 || pendingRelease.has(cid);
 
     function paintButton(cid: string): void {
       const el = elems.get(cid);
       if (!el) return;
-      const down = isDown(cid);
+      const down = isOn(cid);
       el.classList.toggle('is-down', down);
       if (el.hasAttribute('aria-pressed')) el.setAttribute('aria-pressed', down ? 'true' : 'false');
     }
 
-    /** Rapid fire runs only while a turbo button is held; the output blinks 50 ms on, 50 ms off. */
-    function syncTurbo(): void {
-      let any = false;
-      for (const cid of [...fingers.keys(), ...latched]) {
-        const c = controls.get(cid);
-        if (c && c.type === 'button' && c.turbo && isDown(cid)) any = true;
-      }
-      if (any && turboTimer === null) {
-        turboOn = true;
-        turboTimer = setInterval(() => {
-          turboOn = !turboOn;
-          requestFlush();
-        }, TURBO_HALF_PERIOD_MS);
-      } else if (!any && turboTimer !== null) {
-        clearInterval(turboTimer);
-        turboTimer = null;
-        turboOn = true;
-      }
-    }
-
     function readPad(): Pad {
-      const outs: ButtonOut[] = [];
+      const names: ButtonName[] = [];
       const add = (cid: string): void => {
         const c = controls.get(cid);
-        if (c && c.type === 'button' && (!c.turbo || turboOn)) outs.push({ button: c.button, value: c.value });
+        if (c && c.type === 'button') names.push(c.button);
       };
       for (const [cid, n] of fingers) if (n > 0) add(cid);
-      for (const cid of latched) add(cid);
+      for (const cid of pendingRelease.keys()) add(cid);
       let dpad = 0;
       let ls: Readonly<Axes> = ZERO;
       let rs: Readonly<Axes> = ZERO;
@@ -1030,17 +1165,15 @@
         if (h.kind === 'stick') {
           if (h.side === 'left') ls = h.ax;
           else rs = h.ax;
-          if (h.click) outs.push({ button: h.side === 'left' ? 'L3' : 'R3', value: 255 });
+          if (h.click) names.push(h.side === 'left' ? 'L3' : 'R3');
         } else if (h.kind === 'dpad') {
           dpad |= h.bits;
         }
       }
-      return buildPad(outs, dpad, ls, rs);
+      return buildPad(names, dpad, ls, rs);
     }
 
-    function paintDpad(cid: string, bits: number): void {
-      const el = elems.get(cid);
-      if (!el) return;
+    function paintDpad(el: HTMLElement, bits: number): void {
       for (const [dir, bit] of [['up', BTN.UP], ['down', BTN.DOWN], ['left', BTN.LEFT], ['right', BTN.RIGHT]] as const) {
         el.querySelector('.arm-' + dir)?.classList.toggle('is-down', (bits & bit) !== 0);
       }
@@ -1048,34 +1181,18 @@
 
     function resetStickVisual(el: HTMLElement): void {
       el.classList.remove('is-active');
-      const base = el.querySelector<HTMLElement>('.stick-base');
       const knob = el.querySelector<HTMLElement>('.stick-knob');
-      base?.style.removeProperty('--ox');
-      base?.style.removeProperty('--oy');
       if (knob) knob.style.transform = '';
     }
 
-    function paintKnob(el: HTMLElement, dx: number, dy: number, radius: number): void {
-      const knob = el.querySelector<HTMLElement>('.stick-knob');
-      if (!knob) return;
-      const k = limitToRadius(dx, dy, radius);
-      knob.style.transform = 'translate(' + k.x.toFixed(1) + 'px, ' + k.y.toFixed(1) + 'px)';
+    /** Larger deflection of the sticks held right now. */
+    function pushStickHaptics(): void {
+      let d = 0;
+      for (const h of holds.values()) if (h.kind === 'stick') d = Math.max(d, h.d);
+      haptics.setStick(d);
     }
 
-    /** Remember that something was pressed, in case it is released again before the next frame goes out. */
-    function latchPress(): void {
-      const cur = readPad();
-      latch = latch ? mergePress(latch, cur) : cur;
-    }
-
-    function pressDown(cid: string): void {
-      paintButton(cid);
-      haptic();
-      latchPress();
-      syncTurbo();
-    }
-
-    // ---- Play: pointer handling ----
+    // ---- Play: pointer handling (state, then send, then paint, then haptics) ----
     function inputEnabled(): boolean {
       return mode === 'play' && layoutState === 'ready' && !portrait && phase !== 'notoken' && phase !== 'full' && phase !== 'kicked';
     }
@@ -1087,80 +1204,68 @@
       const el = target?.closest<HTMLElement>('[data-cid]');
       const c = el ? controls.get(el.dataset['cid'] ?? '') : undefined;
       if (!el || !c) return;
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch {
+        /* the pointer is already gone; lostpointercapture cleans up */
+      }
+      const t = now();
 
       if (c.type === 'button') {
-        if (c.latch) {
-          // Tap to hold, tap again to release: nothing to track per finger.
-          if (latched.has(c.id)) {
-            latched.delete(c.id);
-            paintButton(c.id);
-            syncTurbo();
-          } else {
-            latched.add(c.id);
-            pressDown(c.id);
-          }
-        } else {
-          holds.set(e.pointerId, { kind: 'btn', cid: c.id });
-          const n = (fingers.get(c.id) ?? 0) + 1;
-          fingers.set(c.id, n);
-          if (n === 1) pressDown(c.id);
+        holds.set(e.pointerId, { kind: 'btn', cid: c.id });
+        const n = (fingers.get(c.id) ?? 0) + 1;
+        fingers.set(c.id, n);
+        const pending = pendingRelease.get(c.id);
+        if (pending !== undefined) {
+          clearTimeout(pending); // pressed again before the deferred release went out: it simply stays down
+          pendingRelease.delete(c.id);
+        }
+        if (n === 1) {
+          pressedAt.set(c.id, t);
+          requestSend(0);
+          paintButton(c.id);
+          haptics.tick();
         }
       } else if (c.type === 'stick') {
         if (zoneBusy((h) => h.kind === 'stick' && h.cid === c.id)) return;
-        const rect = el.getBoundingClientRect();
-        const baseW = el.querySelector<HTMLElement>('.stick-base')?.getBoundingClientRect().width ?? 0;
-        const radius = baseW > 0 ? baseW / 2 : STICK_RADIUS_FALLBACK;
-        const px = e.clientX - rect.left;
-        const py = e.clientY - rect.top;
-        let ox = rect.width / 2;
-        let oy = rect.height / 2;
-        if (c.mode === 'floating') {
-          // The base appears under the finger, kept fully inside the touch area.
-          ox = rect.width >= radius * 2 ? clampTo(px, radius, rect.width - radius) : px;
-          oy = rect.height >= radius * 2 ? clampTo(py, radius, rect.height - radius) : py;
-          const base = el.querySelector<HTMLElement>('.stick-base');
-          base?.style.setProperty('--ox', ox.toFixed(1) + 'px');
-          base?.style.setProperty('--oy', oy.toFixed(1) + 'px');
-        }
-        const t = now();
         const click = c.doubleTapClick && isDoubleTap(lastTapEnd.get(c.id) ?? null, t);
         lastTapEnd.delete(c.id);
         const hold: StickHold = {
           kind: 'stick',
           cid: c.id,
           side: c.stick,
-          left: rect.left,
-          top: rect.top,
-          ox,
-          oy,
-          radius,
+          cx: fm.left + (c.x / 100) * fm.w,
+          cy: fm.top + (c.y / 100) * fm.h,
+          radius: (c.size * unit) / 2,
           params: { deadzone: c.deadzone, sensitivity: c.sensitivity, curve: c.curve, invertX: c.invertX, invertY: c.invertY },
           downAt: t,
           click,
           ax: ZERO,
+          d: 0,
+          knob: el.querySelector<HTMLElement>('.stick-knob'),
         };
         holds.set(e.pointerId, hold);
+        updateStick(hold, e);
+        requestSend(STICK_SEND_MS);
         el.classList.add('is-active');
-        moveStick(hold, el, e);
-        if (click) {
-          haptic();
-          latchPress();
-        }
+        paintKnob(hold, e);
+        haptics.tick();
+        pushStickHaptics();
       } else {
         if (zoneBusy((h) => h.kind === 'dpad' && h.cid === c.id)) return;
-        const rect = el.getBoundingClientRect();
-        const hold: DpadHold = { kind: 'dpad', cid: c.id, cx: rect.left + rect.width / 2, cy: rect.top + rect.height / 2, half: Math.min(rect.width, rect.height) / 2, diagonals: c.diagonals, bits: 0 };
+        const hold: DpadHold = {
+          kind: 'dpad',
+          cid: c.id,
+          cx: fm.left + (c.x / 100) * fm.w,
+          cy: fm.top + (c.y / 100) * fm.h,
+          half: (c.size * unit) / 2,
+          diagonals: c.diagonals,
+          bits: 0,
+          el,
+        };
         holds.set(e.pointerId, hold);
         moveDpad(hold, e);
       }
-
-      e.preventDefault();
-      try {
-        el.setPointerCapture(e.pointerId);
-      } catch {
-        /* the pointer is already gone; lostpointercapture cleans up */
-      }
-      requestFlush();
     }
 
     function zoneBusy(match: (h: Hold) => boolean): boolean {
@@ -1168,48 +1273,79 @@
       return false;
     }
 
-    function moveStick(h: StickHold, el: HTMLElement, e: PointerEvent): void {
-      const dx = e.clientX - h.left - h.ox;
-      const dy = e.clientY - h.top - h.oy;
+    function updateStick(h: StickHold, e: PointerEvent): void {
+      const dx = e.clientX - h.cx;
+      const dy = e.clientY - h.cy;
       h.ax = stickAxes(dx, dy, h.radius, h.params);
-      paintKnob(el, dx, dy, h.radius);
+      h.d = deflection(dx, dy, h.radius);
+    }
+
+    function paintKnob(h: StickHold, e: PointerEvent): void {
+      if (!h.knob) return;
+      const k = limitToRadius(e.clientX - h.cx, e.clientY - h.cy, h.radius);
+      h.knob.style.transform = 'translate3d(' + k.x.toFixed(1) + 'px,' + k.y.toFixed(1) + 'px,0)';
     }
 
     function moveDpad(h: DpadHold, e: PointerEvent): void {
       const next = dpadMask(e.clientX - h.cx, e.clientY - h.cy, h.half, h.diagonals);
+      if (next === h.bits) return;
       const added = (next & ~h.bits) !== 0;
       h.bits = next;
-      paintDpad(h.cid, next);
-      if (added) {
-        haptic();
-        latchPress();
-      }
+      requestSend(0);
+      paintDpad(h.el, next);
+      if (added) haptics.tick();
     }
 
     function playMove(e: PointerEvent): void {
       const h = holds.get(e.pointerId);
       if (!h || h.kind === 'btn') return;
-      const el = elems.get(h.cid);
-      if (!el) return;
-      if (h.kind === 'stick') moveStick(h, el, e);
-      else moveDpad(h, e);
-      requestFlush();
+      if (h.kind === 'stick') {
+        updateStick(h, e);
+        requestSend(STICK_SEND_MS);
+        paintKnob(h, e);
+        pushStickHaptics();
+      } else {
+        moveDpad(h, e);
+      }
+    }
+
+    function finishButtonRelease(cid: string): void {
+      pendingRelease.delete(cid);
+      pressedAt.delete(cid);
+      requestSend(0);
+      paintButton(cid);
     }
 
     function endHold(h: Hold): void {
       if (h.kind === 'btn') {
         const n = (fingers.get(h.cid) ?? 0) - 1;
-        if (n > 0) fingers.set(h.cid, n);
-        else fingers.delete(h.cid);
-        paintButton(h.cid);
-        syncTurbo();
+        if (n > 0) {
+          fingers.set(h.cid, n);
+          return;
+        }
+        fingers.delete(h.cid);
+        const wait = releaseDelay(pressedAt.get(h.cid) ?? 0, now());
+        if (wait > 0) {
+          // Down for less than the minimum press: keep it down for the remainder, then release.
+          pendingRelease.set(
+            h.cid,
+            setTimeout(() => finishButtonRelease(h.cid), wait),
+          );
+        } else {
+          pressedAt.delete(h.cid);
+          requestSend(0);
+          paintButton(h.cid);
+        }
       } else if (h.kind === 'stick') {
         const el = elems.get(h.cid);
         if (el) resetStickVisual(el);
         const t = now();
         if (!h.click && t - h.downAt <= DOUBLE_TAP_MS) lastTapEnd.set(h.cid, t);
+        requestSend(0);
+        pushStickHaptics();
       } else {
-        paintDpad(h.cid, 0);
+        requestSend(0);
+        paintDpad(h.el, 0);
       }
     }
 
@@ -1218,17 +1354,17 @@
       if (!h) return;
       holds.delete(e.pointerId);
       endHold(h);
-      requestFlush();
     }
 
     /** Release every control. Does not send anything by itself. */
     function releaseAll(): void {
-      latch = null;
       holds.clear();
       fingers.clear();
-      latched.clear();
+      pressedAt.clear();
+      for (const t of pendingRelease.values()) clearTimeout(t);
+      pendingRelease.clear();
       lastTapEnd.clear();
-      syncTurbo();
+      haptics.stop();
       for (const el of fieldEl.querySelectorAll('.is-down')) {
         el.classList.remove('is-down');
         if (el.hasAttribute('aria-pressed')) el.setAttribute('aria-pressed', 'false');
@@ -1236,7 +1372,7 @@
       for (const el of fieldEl.querySelectorAll<HTMLElement>('.ctl-stick')) resetStickVisual(el);
     }
 
-    /** Safety release: drop everything and tell the host right now (rAF may never run again, e.g. page hidden). */
+    /** Safety release: drop everything and tell the host right now. */
     function neutralise(): void {
       releaseAll();
       flushNow();
@@ -1246,32 +1382,47 @@
     let ws: WebSocket | null = null;
     let welcomed = false;
     let lastSent: Pad | null = null;
-    let lastFrameTs: number | null = null;
-    let rafId = 0;
+    let lastSendAt = -1e9;
+    let sendTimer: ReturnType<typeof setTimeout> | null = null;
+    let sendTimerDue = 0;
     let keepaliveTimer: ReturnType<typeof setTimeout> | null = null;
 
     function canSend(): boolean {
       return ws !== null && ws.readyState === WS_OPEN && welcomed;
     }
 
-    function sendFrame(frame: object): boolean {
+    let lastFrameAt = 0; // any frame, keepalives included
+    const KEEPALIVE_FRAME = JSON.stringify({ t: 'k' });
+
+    function sendRaw(text: string): boolean {
       if (!ws) return false;
       try {
-        ws.send(JSON.stringify(frame));
+        ws.send(text);
       } catch {
         return false;
       }
+      lastFrameAt = now();
       armKeepalive();
       return true;
     }
 
-    /** A keepalive is due 500 ms after the last frame of any kind, and then every 500 ms of silence. */
+    /**
+     * A keepalive is due 500 ms after the last frame of any kind, and then every 500 ms of silence. ONE timer: a frame sent while it
+     * is pending only moves lastFrameAt, and the timer re-arms itself for the remainder (no clear/set per stick frame).
+     */
     function armKeepalive(): void {
-      if (keepaliveTimer !== null) clearTimeout(keepaliveTimer);
-      keepaliveTimer = setTimeout(() => {
-        keepaliveTimer = null;
-        if (canSend()) sendFrame({ t: 'k' });
-      }, KEEPALIVE_MS);
+      if (keepaliveTimer !== null) return;
+      keepaliveTimer = setTimeout(onKeepalive, KEEPALIVE_MS);
+    }
+    function onKeepalive(): void {
+      keepaliveTimer = null;
+      if (!canSend()) return;
+      const wait = lastFrameAt + KEEPALIVE_MS - now();
+      if (wait > 1) {
+        keepaliveTimer = setTimeout(onKeepalive, wait);
+        return;
+      }
+      sendRaw(KEEPALIVE_FRAME);
     }
 
     function stopKeepalive(): void {
@@ -1279,45 +1430,43 @@
       keepaliveTimer = null;
     }
 
-    function sendPad(pad: Pad): void {
-      if (sendFrame({ t: 's', b: pad.b, lt: pad.lt, rt: pad.rt, lx: pad.lx, ly: pad.ly, rx: pad.rx, ry: pad.ry })) lastSent = pad;
-    }
-
-    function requestFlush(): void {
-      if (rafId === 0 && !destroyed) rafId = requestAnimationFrame(onFrame);
-    }
-
-    function onFrame(ts: number): void {
-      rafId = 0;
-      if (!canSend()) {
-        latch = null; // the welcome handler sends the current state
-        return;
-      }
-      if (lastFrameTs !== null && ts - lastFrameTs < MIN_FRAME_MS) {
-        requestFlush();
-        return;
-      }
-      const pad = readPad();
-      const pressed = latch;
-      latch = null;
-      // A press and its release can land between two frames (a janky main thread delivers both events in one task).
-      // Send the pressed state first so the host sees it for one frame; the release follows on the next frame.
-      if (pressed && !coversPress(pad, pressed) && !samePad(lastSent, pressed)) {
-        sendPad(pressed);
-        lastFrameTs = ts;
-        requestFlush();
-        return;
-      }
-      if (samePad(lastSent, pad)) return;
-      sendPad(pad);
-      lastFrameTs = ts;
-    }
-
-    /** Send the current state immediately if it differs from what the host has. Bypasses the frame throttle. */
-    function flushNow(): void {
+    /** Send the current state if it differs from what the host has. Only the newest sample matters: every frame is the full state. */
+    function sendIfChanged(): void {
       if (!canSend()) return;
       const pad = readPad();
-      if (!samePad(lastSent, pad)) sendPad(pad);
+      if (samePad(lastSent, pad)) return;
+      if (sendRaw('{"t":"s","b":' + pad.b + ',"lt":' + pad.lt + ',"rt":' + pad.rt + ',"lx":' + pad.lx + ',"ly":' + pad.ly + ',"rx":' + pad.rx + ',"ry":' + pad.ry + '}')) {
+        lastSent = pad;
+        lastSendAt = lastFrameAt;
+        // This frame carries the newest state, so a trailing send armed earlier is now redundant: without this it fired right after
+        // and doubled the stick rate (measured 172 frames/s instead of <= 125).
+        if (sendTimer !== null) {
+          clearTimeout(sendTimer);
+          sendTimer = null;
+        }
+      }
+    }
+
+    /**
+     * Send from inside the event handler when the gap since the last frame allows it (`minGap` 0 for button edges, 8 ms for sticks,
+     * never closer than 1/240 s); otherwise one timer sends the latest state at the earliest allowed time.
+     */
+    function requestSend(minGap: number): void {
+      const t = now();
+      const due = lastSendAt + Math.max(minGap, HARD_SEND_GAP_MS);
+      if (t >= due) return sendIfChanged();
+      if (sendTimer !== null && sendTimerDue <= due) return;
+      if (sendTimer !== null) clearTimeout(sendTimer);
+      sendTimerDue = due;
+      sendTimer = setTimeout(() => {
+        sendTimer = null;
+        sendIfChanged();
+      }, Math.max(0, Math.ceil(due - t)));
+    }
+
+    /** Send right now, whatever the gap (safety release, welcome). */
+    function flushNow(): void {
+      sendIfChanged();
     }
 
     // ---- Connection ----
@@ -1328,23 +1477,29 @@
       storageSet(NAME_KEY, String(fresh));
       return fresh;
     })();
-    const name = playerName(navigator.userAgent, navigator.maxTouchPoints ?? 0, number);
+    const name = playerName(ua, navigator.maxTouchPoints ?? 0, number);
     let attempt = 0;
     let everDropped = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+    /** green: playing; amber: connecting, retrying, or the last save has not reached the host; red: blocked. */
+    function dotState(): string {
+      if (phase === 'connected' && unsaved) return 'retrying';
+      return phase;
+    }
+
     function render(): void {
       const text = statusText(phase, slot);
-      statusEl.textContent = text;
-      strip.dataset['state'] = phase;
+      menu.dataset['state'] = dotState();
+      menuSlot.textContent = slot === null ? 'P?' : 'P' + slot;
+      menu.setAttribute('aria-label', 'Menu, ' + text);
       const blocked = phase === 'notoken' || phase === 'full' || phase === 'kicked';
       const layoutFailed = !blocked && layoutState === 'failed';
       noticeEl.hidden = !(blocked || layoutFailed);
       noticeText.textContent = blocked ? text : layoutFailed ? 'Cannot load your layout' : '';
       retryBtn.hidden = !(phase === 'full' || layoutFailed);
-      const usable = !blocked && layoutState === 'ready';
-      editBtn.hidden = !usable || mode === 'edit';
-      layoutPick.hidden = !usable || mode === 'edit' || !store || store.layouts.length < 2;
+      menu.hidden = blocked || mode === 'edit';
+      done.hidden = mode !== 'edit';
     }
 
     function setPhase(next: Phase): void {
@@ -1386,6 +1541,7 @@
           lastSent = null;
           setPhase('connected');
           flushNow();
+          retrySave(); // the layout did not reach the host last time: try again now that we are back (not while editing)
         } else {
           // 'full' and 'kicked' are final: no reconnect until the user asks (full) or the host re-adds the phone.
           releaseAll();
@@ -1464,8 +1620,8 @@
       }
       store = s;
       layoutState = 'ready';
+      measure();
       syncField(true);
-      renderPicker();
       render();
     }
 
@@ -1479,184 +1635,114 @@
       return defaultCache;
     }
 
-    // ---- Saving ----
-    let saveState: SaveState = 'idle';
-    let saveTimer: ReturnType<typeof setTimeout> | null = null;
-    let savedHideTimer: ReturnType<typeof setTimeout> | null = null;
+    // ---- Saving: one PUT per Done; a failed one is retried every 5 s and on reconnect ----
     let saving = false;
-    let resave = false;
-    let lastError = '';
+    let saveAgain = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const SAVE_TEXT: Record<SaveState, string> = { idle: '', saving: 'Saving…', saved: 'Saved on the host PC', error: 'Not saved, retry' };
-
-    function setSave(next: SaveState): void {
-      saveState = next;
-      if (savedHideTimer !== null) clearTimeout(savedHideTimer);
-      savedHideTimer = null;
-      const text = SAVE_TEXT[next];
-      saveEl.textContent = text;
-      saveEl.hidden = next === 'idle';
-      saveRetry.hidden = next !== 'error';
-      panelSave.textContent = text;
-      panelSave.hidden = next === 'idle';
-      panelSave.disabled = next !== 'error';
-      panelSave.title = next === 'error' ? lastError : '';
-      saveRetry.title = next === 'error' ? lastError : '';
-      if (next === 'saved') {
-        savedHideTimer = setTimeout(() => {
-          savedHideTimer = null;
-          if (saveState === 'saved') {
-            saveEl.hidden = true;
-          }
-        }, SAVED_VISIBLE_MS);
-      }
-    }
-
-    function scheduleSave(delay: number = SAVE_DEBOUNCE_MS): void {
-      if (saveTimer !== null) clearTimeout(saveTimer);
-      setSave('saving');
-      saveTimer = setTimeout(() => {
-        saveTimer = null;
-        void save();
-      }, delay);
+    /** A retry (timer or reconnect) only while playing: in edit mode the store is a draft, and Done saves it. */
+    function retrySave(): void {
+      if (mode === 'play' && unsaved) void save();
     }
 
     async function save(): Promise<void> {
       if (!store || destroyed) return;
-      if (saveTimer !== null) clearTimeout(saveTimer);
-      saveTimer = null;
+      if (retryTimer !== null) clearTimeout(retryTimer);
+      retryTimer = null;
       if (saving) {
-        resave = true;
+        saveAgain = true;
         return;
       }
       saving = true;
-      setSave('saving');
       const sentRev = rev;
       const r = await api('PUT', '/api/layouts', store);
       saving = false;
       if (destroyed) return;
-      if (!r.ok) {
-        lastError = httpMessage(r.status);
-        setSave('error');
-        resave = false;
-        return;
-      }
-      if (rev === sentRev) {
+      if (r.ok) {
         const s = coerceStore(r.body);
-        if (s) adopt(s);
-        setSave('saved');
+        // The host's sanitized store is the truth, unless the user kept editing while it was in flight.
+        if (s && rev === sentRev && mode === 'play') {
+          const changedActive = store !== null && s.activeId !== store.activeId;
+          store = s;
+          syncField(changedActive);
+        }
+        unsaved = rev !== sentRev;
+      } else {
+        unsaved = true;
       }
-      if (resave || rev !== sentRev) {
-        resave = false;
-        if (saveTimer === null) void save();
-      }
-    }
-
-    /** The host's sanitized store is the truth: show it (without touching the editor panel the user may be using). */
-    function adopt(s: LayoutStore): void {
-      if (!store) return;
-      const layoutChanged = s.activeId !== store.activeId;
-      store = s;
-      if (selectedId && !activeLayout(s).controls.some((c) => c.id === selectedId)) selectedId = null;
-      syncField(layoutChanged);
-      renderPicker();
       render();
+      if (saveAgain) {
+        saveAgain = false;
+        void save();
+      } else if (unsaved && mode === 'play') {
+        retryTimer = setTimeout(() => {
+          retryTimer = null;
+          retrySave();
+        }, SAVE_RETRY_MS);
+      }
     }
 
-    // ---- Edits (the only place the store changes while editing) ----
-    function updateUndo(): void {
-      undoBtn.disabled = history.past.length === 0;
-    }
-
+    // ---- Chrome buttons: one tap helper ----
     /**
-     * Replace the store with an edited one. `key` groups the many small edits of one gesture (a drag, a slider) into one undo step.
-     * Edits that change structure rebuild the panel; keyed ones keep it, because rebuilding would destroy the slider under the finger.
+     * Fire `fn` on pointerup when the finger is released within the element plus a 12 pt slop. The pointer is captured on
+     * pointerdown, so a slightly rolling finger still ends on the element. Synthesised clicks are NOT relied upon (a touch click has
+     * detail > 0 and is ignored, so nothing fires twice); a click with detail 0 is the keyboard / assistive-technology path.
      */
-    function edit(next: LayoutStore, key: string | null = null): void {
-      if (!store || next === store) return;
-      const prevActive = store.activeId;
-      history = recordEdit(history, store, key);
-      store = next;
-      rev += 1;
-      const layoutChanged = next.activeId !== prevActive;
-      if (layoutChanged || (selectedId && !activeLayout(next).controls.some((c) => c.id === selectedId))) selectedId = null;
-      syncField(layoutChanged);
-      if (key === null) {
-        renderPicker();
-        render();
-        buildPanel();
-      }
-      updateUndo();
-      scheduleSave();
-    }
-
-    function endEditGesture(): void {
-      history = endGesture(history);
-    }
-
-    function doUndo(): void {
-      if (!store) return;
-      const r = undo(history);
-      if (!r) return;
-      const layoutChanged = r.store.activeId !== store.activeId;
-      history = r.history;
-      store = r.store;
-      rev += 1;
-      if (layoutChanged || (selectedId && !activeLayout(store).controls.some((c) => c.id === selectedId))) selectedId = null;
-      syncField(layoutChanged);
-      renderPicker();
-      render();
-      updateUndo();
-      buildPanel();
-      scheduleSave();
-    }
-
-    /** Preset switch from the status strip during play. */
-    function switchPreset(id: string): void {
-      if (!store) return;
-      releaseAll();
-      flushNow();
-      const next = switchLayout(store, id);
-      if (next === store) return;
-      store = next;
-      rev += 1;
-      syncField(true);
-      renderPicker();
-      render();
-      scheduleSave(400);
-    }
-
-    function renderPicker(): void {
-      layoutPick.textContent = '';
-      if (!store) return;
-      for (const l of store.layouts) {
-        const o = document.createElement('option');
-        o.value = l.id;
-        o.textContent = l.name;
-        layoutPick.appendChild(o);
-      }
-      layoutPick.value = store.activeId;
+    function tap(el: HTMLElement, fn: () => void, scoped = true): void {
+      let active: number | null = null;
+      const opts = scoped ? on : undefined;
+      el.addEventListener(
+        'pointerdown',
+        (e) => {
+          active = e.pointerId;
+          try {
+            el.setPointerCapture(e.pointerId);
+          } catch {
+            /* synthetic pointer */
+          }
+        },
+        opts,
+      );
+      el.addEventListener(
+        'pointerup',
+        (e) => {
+          if (active !== e.pointerId) return;
+          active = null;
+          const r = el.getBoundingClientRect();
+          const noLayout = r.width === 0 && r.height === 0;
+          if (noLayout || (e.clientX >= r.left - TAP_SLOP && e.clientX <= r.right + TAP_SLOP && e.clientY >= r.top - TAP_SLOP && e.clientY <= r.bottom + TAP_SLOP)) fn();
+        },
+        opts,
+      );
+      el.addEventListener(
+        'pointercancel',
+        () => {
+          active = null;
+        },
+        opts,
+      );
+      el.addEventListener(
+        'click',
+        (e) => {
+          if (e.detail === 0) fn();
+        },
+        opts,
+      );
     }
 
     // ---- Edit mode ----
     let drag: EditDrag | null = null;
-    let editTimer: ReturnType<typeof setTimeout> | null = null;
 
     function enterEdit(): void {
       if (mode === 'edit' || layoutState !== 'ready' || !store || phase === 'notoken' || phase === 'full' || phase === 'kicked') return;
-      neutralise(); // the pad stays neutral for as long as we edit: only keepalives go out
+      neutralise(); // the pad stays neutral while editing: only keepalives go out
       mode = 'edit';
       document.body.classList.add('editing');
       fieldEl.classList.add('is-editing');
-      history = emptyHistory();
       selectedId = null;
-      tab = 'control';
-      panel.hidden = false;
-      setCollapsed(true); // start with just the header so the whole screen can be tapped; selecting a control opens the panel
-      updateUndo();
       syncField(false);
-      buildPanel();
       render();
+      showCard();
     }
 
     function exitEdit(): void {
@@ -1665,33 +1751,37 @@
       drag = null;
       document.body.classList.remove('editing');
       fieldEl.classList.remove('is-editing');
-      panel.hidden = true;
       selectedId = null;
-      endEditGesture();
+      disarmReset();
+      card.hidden = true;
+      card.textContent = '';
       syncField(false);
       render();
-      if (saveState !== 'idle' && saveState !== 'saved') void save();
     }
 
-    function setCollapsed(collapsed: boolean): void {
-      panelBody.hidden = collapsed;
-      panel.classList.toggle('collapsed', collapsed);
-      collapseBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-      collapseBtn.textContent = collapsed ? 'Panel' : 'Hide';
+    /** Done: back to play at once, and ONE save. A failed save keeps the draft and retries. */
+    function finishEdit(): void {
+      if (mode !== 'edit') return;
+      exitEdit();
+      unsaved = true;
+      render();
+      void save();
     }
 
-    /** Select a control (or nothing). The panel opens on the side away from the selected control so it never covers it. */
+    /** Replace the store with an edited one (edit mode only; nothing is sent until Done). */
+    function edit(next: LayoutStore): void {
+      if (!store || next === store) return;
+      const layoutChanged = next.activeId !== store.activeId;
+      store = next;
+      rev += 1;
+      unsaved = true;
+      if (layoutChanged) selectedId = null;
+      syncField(layoutChanged);
+    }
+
     function select(id: string | null): void {
-      if (id === selectedId) return;
       selectedId = id;
-      updateSelection();
-      const c = id ? controls.get(id) : undefined;
-      if (c) {
-        tab = 'control';
-        panel.classList.toggle('panel-left', c.x > 50);
-        setCollapsed(false);
-      }
-      buildPanel();
+      for (const [cid, el] of elems) el.classList.toggle('is-selected', cid === id);
     }
 
     function editDown(e: PointerEvent): void {
@@ -1701,15 +1791,14 @@
       const c = el ? controls.get(el.dataset['cid'] ?? '') : undefined;
       if (!el || !c) {
         select(null);
+        showCard();
         return;
       }
-      e.preventDefault();
       select(c.id);
-      const m = fieldMetrics();
-      const px = ((e.clientX - m.left) / m.w) * 100;
-      const py = ((e.clientY - m.top) / m.h) * 100;
-      const resizing = target?.closest('[data-handle]') !== null && target?.closest('[data-handle]') !== undefined;
-      drag = { pointerId: e.pointerId, kind: resizing ? 'resize' : 'move', id: c.id, ox: c.x - px, oy: c.y - py };
+      card.hidden = true; // the card comes back when the finger lifts
+      const px = ((e.clientX - fm.left) / fm.w) * 100;
+      const py = ((e.clientY - fm.top) / fm.h) * 100;
+      drag = { pointerId: e.pointerId, id: c.id, ox: c.x - px, oy: c.y - py };
       try {
         el.setPointerCapture(e.pointerId);
       } catch {
@@ -1719,30 +1808,18 @@
 
     function editMove(e: PointerEvent): void {
       if (!store || !drag || drag.pointerId !== e.pointerId) return;
-      const c = controls.get(drag.id);
-      if (!c) return;
-      const m = fieldMetrics();
-      if (drag.kind === 'move') {
-        const px = ((e.clientX - m.left) / m.w) * 100;
-        const py = ((e.clientY - m.top) / m.h) * 100;
-        edit(moveControl(store, c.id, px + drag.ox, py + drag.oy, m.w / m.h), 'move:' + c.id);
-      } else {
-        const unit = m.h / 100;
-        const wPct = (2 * (e.clientX - (m.left + (c.x / 100) * m.w))) / unit;
-        const hPct = (2 * (e.clientY - (m.top + (c.y / 100) * m.h))) / unit;
-        edit(resizeControl(store, c.id, sizeFromHandle(c, wPct, hPct), m.w / m.h), 'resize:' + c.id);
-      }
+      const px = ((e.clientX - fm.left) / fm.w) * 100;
+      const py = ((e.clientY - fm.top) / fm.h) * 100;
+      edit(moveControl(store, drag.id, px + drag.ox, py + drag.oy, aspect()));
     }
 
     function editEnd(e: PointerEvent): void {
       if (!drag || drag.pointerId !== e.pointerId) return;
-      const wasResize = drag.kind === 'resize';
       drag = null;
-      endEditGesture();
-      if (wasResize) buildPanel(); // the size sliders must show the new size
+      showCard();
     }
 
-    // ---- Editor panel (DOM built with createElement only) ----
+    // ---- The card (the only editor surface): control card (Size, Opacity) or settings card (nothing selected) ----
     const el = <K extends keyof HTMLElementTagNameMap>(tag: K, cls = '', text = ''): HTMLElementTagNameMap[K] => {
       const n = document.createElement(tag);
       if (cls) n.className = cls;
@@ -1750,458 +1827,379 @@
       return n;
     };
 
-    function say(msg: string): void {
-      panelMsg.textContent = msg;
-    }
-
-    function sliderRow(label: string, min: number, max: number, step: number, value: number, fmt: (v: number) => string, onInput: (v: number) => void): HTMLElement {
-      const row = el('label', 'row');
-      row.appendChild(el('span', 'row-label', label));
-      const out = el('output', 'row-value', fmt(value));
-      const input = el('input');
-      input.type = 'range';
-      input.min = String(min);
-      input.max = String(max);
-      input.step = String(step);
-      input.value = String(value);
-      input.addEventListener('input', () => {
-        const v = Number(input.value);
-        out.textContent = fmt(v);
-        onInput(v);
+    /**
+     * A slider driven by pointer events (native range inputs are fiddly on iOS): a 44 pt thumb on a 44 pt tall track, tap on the track
+     * jumps there, drag follows the finger, arrow keys step. `onInput` runs on every change.
+     */
+    function makeSlider(o: { label: string; min: number; max: number; step: number; value: number; fmt: (v: number) => string; onInput: (v: number) => void }): HTMLElement {
+      const root = el('div', 'slider');
+      const label = el('span', 'slider-label', o.label);
+      const out = el('span', 'slider-value');
+      const track = el('div', 'slider-track');
+      track.tabIndex = 0;
+      track.setAttribute('role', 'slider');
+      track.setAttribute('aria-label', o.label);
+      track.setAttribute('aria-valuemin', String(o.min));
+      track.setAttribute('aria-valuemax', String(o.max));
+      track.appendChild(el('div', 'slider-fill'));
+      track.appendChild(el('div', 'slider-thumb'));
+      root.append(label, track, out);
+      let value = clampTo(o.value, o.min, o.max);
+      const paint = (): void => {
+        const ratio = o.max > o.min ? (value - o.min) / (o.max - o.min) : 0;
+        track.style.setProperty('--p', ratio.toFixed(4));
+        track.setAttribute('aria-valuenow', String(value));
+        out.textContent = o.fmt(value);
+      };
+      const set = (v: number): void => {
+        const snapped = round(clampTo(Math.round((v - o.min) / o.step) * o.step + o.min, o.min, o.max), 3);
+        if (snapped === value) return;
+        value = snapped;
+        paint();
+        o.onInput(value);
+      };
+      // The track is measured once per drag: every step restyles the control, so a read per move would force a layout each time.
+      let r = { left: 0, width: 0 };
+      const fromX = (x: number): void => {
+        if (r.width > 0) set(o.min + clampTo((x - r.left) / r.width, 0, 1) * (o.max - o.min));
+      };
+      let active: number | null = null;
+      track.addEventListener('pointerdown', (e) => {
+        active = e.pointerId;
+        const b = track.getBoundingClientRect();
+        r = { left: b.left, width: b.width };
+        try {
+          track.setPointerCapture(e.pointerId);
+        } catch {
+          /* synthetic pointer */
+        }
+        fromX(e.clientX);
       });
-      input.addEventListener('change', endEditGesture);
-      row.append(input, out);
-      return row;
-    }
-
-    function checkRow(label: string, value: boolean, onChange: (v: boolean) => void): HTMLElement {
-      const row = el('label', 'row row-check');
-      const input = el('input');
-      input.type = 'checkbox';
-      input.checked = value;
-      input.addEventListener('change', () => onChange(input.checked));
-      row.append(input, el('span', 'row-label', label));
-      return row;
-    }
-
-    function selectRow(label: string, options: ReadonlyArray<readonly [string, string]>, value: string, onChange: (v: string) => void): HTMLElement {
-      const row = el('label', 'row');
-      row.appendChild(el('span', 'row-label', label));
-      const sel = el('select', 'row-select');
-      for (const [v, text] of options) {
-        const o = el('option', '', text);
-        o.value = v;
-        sel.appendChild(o);
+      track.addEventListener('pointermove', (e) => {
+        if (active === e.pointerId) fromX(e.clientX);
+      });
+      for (const type of ['pointerup', 'pointercancel'] as const) {
+        track.addEventListener(type, (e) => {
+          if (active === e.pointerId) active = null;
+        });
       }
-      sel.value = value;
-      sel.addEventListener('change', () => onChange(sel.value));
-      row.appendChild(sel);
-      return row;
+      track.addEventListener('keydown', (e) => {
+        const k = e.key;
+        if (k === 'ArrowLeft' || k === 'ArrowDown') set(value - o.step);
+        else if (k === 'ArrowRight' || k === 'ArrowUp') set(value + o.step);
+        else if (k === 'Home') set(o.min);
+        else if (k === 'End') set(o.max);
+        else return;
+        e.preventDefault();
+      });
+      paint();
+      return root;
     }
 
-    function textRow(label: string, value: string, maxLength: number, onCommit: (v: string) => void): HTMLElement {
-      const row = el('label', 'row');
-      row.appendChild(el('span', 'row-label', label));
-      const input = el('input', 'row-text');
-      input.type = 'text';
-      input.maxLength = maxLength;
-      input.value = value;
-      input.autocomplete = 'off';
-      input.addEventListener('change', () => onCommit(input.value));
-      input.addEventListener('blur', updateUnit);
-      row.appendChild(input);
-      return row;
-    }
-
-    function actionButton(label: string, onClick: () => void, disabled = false, danger = false): HTMLButtonElement {
-      const b = el('button', 'panel-btn' + (danger ? ' danger' : ''), label);
-      b.type = 'button';
-      b.disabled = disabled;
-      b.addEventListener('click', onClick);
-      return b;
-    }
-
-    const pct = (v: number): string => (Math.round(v * 10) / 10).toString();
-    const two = (v: number): string => v.toFixed(2);
-
-    function buildPanel(): void {
-      if (mode !== 'edit') return;
-      for (const t of panel.querySelectorAll<HTMLElement>('.tab')) t.setAttribute('aria-selected', t.dataset['tab'] === tab ? 'true' : 'false');
-      panelContent.textContent = '';
-      say('');
-      if (!store) return;
-      if (tab === 'control') buildControlTab();
-      else if (tab === 'add') buildAddTab();
-      else buildLayoutTab();
-    }
-
-    function setProp(id: string, key: string, value: unknown, gesture: boolean): void {
-      if (!store) return;
-      edit(patchControl(store, id, { [key]: value }), gesture ? `prop:${id}:${key}` : null);
-    }
-
-    function buildControlTab(): void {
+    function placeCardNow(size: { w: number; h: number }): void {
       const c = selectedId ? controls.get(selectedId) : undefined;
-      if (!c) {
-        panelContent.appendChild(el('p', 'panel-hint', 'Tap a control to edit it. Drag to move, drag the corner handle to resize.'));
+      const field = { w: fm.w, h: fm.h };
+      // Keep the card's top edge below Done (edit mode only, so this layout read never happens while playing).
+      const d = done.getBoundingClientRect();
+      const top = Math.max(8, d.height > 0 ? d.bottom - fm.top + 6 : 8);
+      const boxOf = (x: Control): Box => {
+        const [bw, bh] = controlBox(x);
+        return { cx: (x.x / 100) * field.w, cy: (x.y / 100) * field.h, hw: (bw * unit) / 2, hh: (bh * unit) / 2 };
+      };
+      let p: { x: number; y: number };
+      if (c) {
+        // Placed for the LARGEST size the Size slider can reach, so growing the control never slides it under the card.
+        const [bw, bh] = reachBox(c);
+        p = placeCard({ cx: (c.x / 100) * field.w, cy: (c.y / 100) * field.h, hw: (bw * unit) / 2, hh: (bh * unit) / 2 }, size, field, 8, top);
+      } else {
+        p = placeSettingsCard([...controls.values()].map(boxOf), size, field, top);
+      }
+      card.style.left = fm.left + p.x + 'px';
+      card.style.top = fm.top + p.y + 'px';
+    }
+
+    function showCard(): void {
+      if (mode !== 'edit' || !store) return;
+      card.textContent = '';
+      const c = selectedId ? controls.get(selectedId) : undefined;
+      if (c) buildControlCard(c);
+      else buildSettingsCard();
+      card.classList.toggle('is-settings', !c);
+      card.hidden = false;
+      placeCardNow(c ? CARD_CONTROL : CARD_SETTINGS);
+    }
+
+    function buildControlCard(c: Control): void {
+      const id = c.id;
+      const ratio = c.type === 'button' && c.h > 0 ? c.w / c.h : 1; // kept for the whole drag of the slider, so rounding cannot drift
+      card.appendChild(el('h2', 'card-title', controlName(c)));
+      const sr = sizeRange(c);
+      card.appendChild(
+        makeSlider({
+          label: 'Size',
+          min: sr.min,
+          max: sr.max,
+          step: 1,
+          value: sizeOf(c),
+          fmt: (v) => String(Math.round(v)),
+          onInput: (v) => {
+            if (store) edit(setSize(store, id, v, ratio, aspect()));
+          },
+        }),
+      );
+      const or = opacityRange(c);
+      card.appendChild(
+        makeSlider({
+          label: 'Opacity',
+          min: or.min,
+          max: or.max,
+          step: 0.05,
+          value: c.opacity,
+          fmt: (v) => Math.round(v * 100) + '%',
+          onInput: (v) => {
+            if (store) edit(setOpacity(store, id, v));
+          },
+        }),
+      );
+    }
+
+    let resetArmed: ReturnType<typeof setTimeout> | null = null;
+
+    async function pickSlot(i: number): Promise<void> {
+      if (!store) return;
+      const existing = store.layouts[i];
+      if (existing) {
+        edit(switchLayout(store, existing.id));
+        select(null);
+        showCard();
         return;
       }
-      const id = c.id;
-      const title = c.type === 'button' ? BUTTON_ARIA[c.button] : c.type === 'stick' ? (c.stick === 'left' ? 'Left' : 'Right') + ' stick' : 'D-pad';
-      panelContent.appendChild(el('h3', 'panel-title', title));
-      const slider = (label: string, key: string, lo: number, hi: number, step: number, value: number, fmt: (v: number) => string = pct): void => {
-        panelContent.appendChild(sliderRow(label, lo, hi, step, value, fmt, (v) => setProp(id, key, v, true)));
-      };
-      const check = (label: string, key: string, value: boolean): void => {
-        panelContent.appendChild(checkRow(label, value, (v) => setProp(id, key, v, false)));
-      };
-      const choice = (label: string, key: string, options: ReadonlyArray<readonly [string, string]>, value: string, rebuild = false): void => {
-        panelContent.appendChild(
-          selectRow(label, options, value, (v) => {
-            setProp(id, key, v, false);
-            if (rebuild) buildPanel();
-          }),
-        );
-      };
-      if (c.type === 'stick') {
-        slider('Size', 'size', LIMITS.size.min, LIMITS.size.max, 1, c.size);
-        choice('Stick', 'stick', [['left', 'Left'], ['right', 'Right']], c.stick);
-        choice('Mode', 'mode', [['fixed', 'Fixed'], ['floating', 'Floating']], c.mode);
-        slider('Dead zone', 'deadzone', LIMITS.deadzone.min, LIMITS.deadzone.max, 0.01, c.deadzone, two);
-        slider('Sensitivity', 'sensitivity', LIMITS.sensitivity.min, LIMITS.sensitivity.max, 0.05, c.sensitivity, two);
-        choice('Curve', 'curve', [['linear', 'Linear'], ['precise', 'Precise'], ['aggressive', 'Aggressive']], c.curve);
-        check('Invert X', 'invertX', c.invertX);
-        check('Invert Y', 'invertY', c.invertY);
-        check('Double-tap = stick click', 'doubleTapClick', c.doubleTapClick);
-      } else if (c.type === 'dpad') {
-        slider('Size', 'size', LIMITS.size.min, LIMITS.size.max, 1, c.size);
-        check('Diagonals', 'diagonals', c.diagonals);
-      } else {
-        choice('Button', 'button', BUTTON_NAMES.map((n) => [n, n] as const), c.button, true);
-        slider('Width', 'w', LIMITS.size.min, LIMITS.size.max, 1, c.w);
-        slider('Height', 'h', LIMITS.size.min, LIMITS.size.max, 1, c.h);
-        choice('Shape', 'shape', [['circle', 'Circle'], ['rect', 'Rectangle'], ['pill', 'Pill']], c.shape);
-        panelContent.appendChild(textRow('Label', c.label, LIMITS.labelChars, (v) => setProp(id, 'label', v, false)));
-        check('Latch (tap on, tap off)', 'latch', c.latch);
-        check('Turbo (rapid fire)', 'turbo', c.turbo);
-        if (c.button === 'LT' || c.button === 'RT') slider('Trigger value', 'value', LIMITS.value.min, LIMITS.value.max, 1, c.value, (v) => String(Math.round(v)));
-      }
-      slider('Opacity', 'opacity', LIMITS.opacity.min, LIMITS.opacity.max, 0.05, c.opacity, two);
-      const actions = el('div', 'panel-actions');
-      actions.appendChild(
-        actionButton(
-          'Duplicate',
-          () => {
-            if (!store) return;
-            const r = duplicateControl(store, id, aspect());
-            if (r.id === null) return say(`At most ${LIMITS.controls} controls per layout.`);
-            edit(r.store);
-            select(r.id);
-          },
-          !canAddControl(store as LayoutStore),
-        ),
-      );
-      actions.appendChild(
-        actionButton(
-          'Delete',
-          () => {
-            if (store) edit(deleteControl(store, id));
-          },
-          false,
-          true,
-        ),
-      );
-      panelContent.appendChild(actions);
+      const def = await getDefaultLayout();
+      if (destroyed || !store || mode !== 'edit') return;
+      if (!def) return say('Cannot load the default layout');
+      let next = store;
+      while (next.layouts.length <= i && next.layouts.length < LIMITS.layouts) next = addSlot(next, def);
+      edit(next);
+      select(null);
+      showCard();
     }
 
-    function buildAddTab(): void {
-      if (!store) return;
-      const full = !canAddControl(store);
-      let chosen: ButtonName = 'A';
-      const addOne = (kind: NewKind): void => {
-        if (!store) return;
-        const r = addControl(store, kind, aspect());
-        if (r.id === null) return say(`At most ${LIMITS.controls} controls per layout.`);
-        edit(r.store);
-        select(r.id);
-        say('');
-      };
-      panelContent.appendChild(el('p', 'panel-hint', `${activeLayout(store).controls.length} of ${LIMITS.controls} controls used.`));
-      const row = el('div', 'panel-actions');
-      const pick = el('select', 'row-select');
-      pick.setAttribute('aria-label', 'Button to add');
-      for (const n of BUTTON_NAMES) {
-        const o = el('option', '', BUTTON_ARIA[n]);
-        o.value = n;
-        pick.appendChild(o);
-      }
-      pick.addEventListener('change', () => {
-        chosen = pick.value as ButtonName;
-      });
-      row.append(pick, actionButton('Add button', () => addOne(chosen), full));
-      panelContent.appendChild(row);
-      const row2 = el('div', 'panel-actions');
-      row2.append(actionButton('Add stick', () => addOne('stick'), full), actionButton('Add d-pad', () => addOne('dpad'), full));
-      panelContent.appendChild(row2);
-      if (full) say(`At most ${LIMITS.controls} controls per layout.`);
+    function say(msg: string): void {
+      const p = card.querySelector('.card-msg');
+      if (p) p.textContent = msg;
     }
 
-    let armedDelete: ReturnType<typeof setTimeout> | null = null;
+    function disarmReset(): void {
+      if (resetArmed !== null) clearTimeout(resetArmed);
+      resetArmed = null;
+    }
 
-    function buildLayoutTab(): void {
+    function buildSettingsCard(): void {
       if (!store) return;
-      const layout = activeLayout(store);
+      disarmReset(); // a fresh card shows "Reset": its first tap must only arm it, never reset at once
       const s = store;
-      panelContent.appendChild(
-        selectRow(
-          'Active layout',
-          s.layouts.map((l) => [l.id, l.name] as const),
-          s.activeId,
-          (id) => edit(switchLayout(s, id)),
-        ),
+      const layout = activeLayout(s);
+      const row1 = el('div', 'card-row');
+      const slots = el('div', 'slots');
+      slots.setAttribute('role', 'group');
+      slots.setAttribute('aria-label', 'Layout slot');
+      const activeIndex = Math.max(0, s.layouts.findIndex((l) => l.id === s.activeId));
+      for (let i = 0; i < SLOTS; i++) {
+        const b = el('button', 'card-btn slot' + (s.layouts[i] ? '' : ' is-empty'), String(i + 1));
+        b.type = 'button';
+        b.setAttribute('aria-pressed', i === activeIndex ? 'true' : 'false');
+        b.setAttribute('aria-label', 'Layout ' + (i + 1) + (s.layouts[i] ? '' : ' (empty)'));
+        tap(b, () => void pickSlot(i), false);
+        slots.appendChild(b);
+      }
+      const reset = el('button', 'card-btn reset', 'Reset');
+      reset.type = 'button';
+      tap(
+        reset,
+        () => {
+          if (resetArmed === null) {
+            reset.textContent = 'Tap again';
+            resetArmed = setTimeout(() => {
+              resetArmed = null;
+              reset.textContent = 'Reset';
+            }, 3000);
+            return;
+          }
+          clearTimeout(resetArmed);
+          resetArmed = null;
+          reset.textContent = 'Reset';
+          void getDefaultLayout().then((def) => {
+            if (!def) return say('Cannot load the default layout');
+            if (store && mode === 'edit') {
+              edit(resetLayout(store, activeLayout(store).id, def));
+              showCard();
+            }
+          });
+        },
+        false,
       );
-      panelContent.appendChild(textRow('Name', layout.name, LIMITS.nameChars, (v) => edit(renameLayout(s, layout.id, v))));
-      panelContent.appendChild(checkRow('Vibrate on button press', layout.haptics, (v) => edit(setHaptics(s, layout.id, v))));
-      panelContent.appendChild(el('p', 'panel-hint', `${s.layouts.length} of ${LIMITS.layouts} layouts.`));
-      const atLimit = s.layouts.length >= LIMITS.layouts;
-      const grid = el('div', 'panel-actions wrap');
-      grid.appendChild(actionButton('New (blank)', () => edit(newBlankLayout(s)), atLimit));
-      grid.appendChild(
-        actionButton(
-          'New from default',
-          () => {
-            say('Loading the default layout…');
-            void getDefaultLayout().then((def) => {
-              if (!def) return say('Cannot load the default layout');
-              if (store) edit(newLayoutFrom(store, def));
-            });
+      row1.append(slots, reset);
+      card.appendChild(row1);
+      card.appendChild(
+        makeSlider({
+          label: 'Stick sensitivity',
+          min: SENSITIVITY_RANGE.min,
+          max: SENSITIVITY_RANGE.max,
+          step: 0.1,
+          value: clampTo(layoutSensitivity(layout), SENSITIVITY_RANGE.min, SENSITIVITY_RANGE.max),
+          fmt: (v) => v.toFixed(1),
+          onInput: (v) => {
+            if (store) edit(setSensitivity(store, v));
           },
-          atLimit,
-        ),
+        }),
       );
-      grid.appendChild(actionButton('Duplicate', () => edit(duplicateLayout(s, layout.id)), atLimit));
-      grid.appendChild(
-        actionButton(
-          'Reset to default',
-          () => {
-            say('Loading the default layout…');
-            void getDefaultLayout().then((def) => {
-              if (!def) return say('Cannot load the default layout');
-              if (store) edit(resetLayout(store, activeLayout(store).id, def));
-            });
-          },
-        ),
+      const row3 = el('div', 'card-row');
+      row3.appendChild(el('span', 'card-label', 'Haptics'));
+      const sw = el('button', 'switch');
+      sw.type = 'button';
+      sw.setAttribute('role', 'switch');
+      sw.setAttribute('aria-label', 'Haptics');
+      const paintSwitch = (): void => {
+        const isOn2 = !!store && activeLayout(store).haptics;
+        sw.setAttribute('aria-checked', isOn2 ? 'true' : 'false');
+        sw.textContent = isOn2 ? 'On' : 'Off';
+      };
+      paintSwitch();
+      tap(
+        sw,
+        () => {
+          if (!store) return;
+          const on2 = !activeLayout(store).haptics;
+          edit(setHaptics(store, on2));
+          paintSwitch();
+          if (on2) haptics.tick(); // one tick when it is switched on
+        },
+        false,
       );
-      const del = actionButton('Delete layout', () => {
-        if (!armedDelete) {
-          del.textContent = 'Tap again to delete';
-          armedDelete = setTimeout(() => {
-            armedDelete = null;
-            del.textContent = 'Delete layout';
-          }, 3000);
-          return;
-        }
-        clearTimeout(armedDelete);
-        armedDelete = null;
-        if (store) edit(deleteLayout(store, layout.id));
-      }, s.layouts.length <= 1, true);
-      grid.appendChild(del);
-      panelContent.appendChild(grid);
+      row3.appendChild(sw);
+      card.appendChild(row3);
+      card.appendChild(el('p', 'card-msg'));
     }
 
     // ---- Orientation ----
     const portraitQuery = typeof matchMedia === 'function' ? matchMedia('(orientation: portrait)') : null;
     const isPortrait = (): boolean => (portraitQuery ? portraitQuery.matches : window.innerHeight > window.innerWidth);
     portrait = isPortrait();
-    function onOrientation(): void {
-      updateUnit();
+    function onResize(): void {
+      measure();
+      syncField(false);
+      if (mode === 'edit') showCard();
       const p = isPortrait();
       if (p === portrait) return;
       portrait = p;
       if (p) neutralise();
     }
 
-    // ---- Full screen ----
-    type FsDoc = Document & { webkitFullscreenElement?: Element | null; webkitFullscreenEnabled?: boolean; webkitExitFullscreen?: () => Promise<void> | void };
-    type FsEl = HTMLElement & { webkitRequestFullscreen?: () => Promise<void> | void };
-    const fsDoc = document as FsDoc;
-    const fsRoot = document.documentElement as FsEl;
-    const fullscreenElement = (): Element | null => document.fullscreenElement ?? fsDoc.webkitFullscreenElement ?? null;
-
-    function paintFullscreen(): void {
-      fsBtn.setAttribute('aria-label', fullscreenElement() !== null ? 'Exit full screen' : 'Enter full screen');
-    }
-
-    async function toggleFullscreen(): Promise<void> {
-      try {
-        if (fullscreenElement()) {
-          if (typeof document.exitFullscreen === 'function') await document.exitFullscreen();
-          else if (typeof fsDoc.webkitExitFullscreen === 'function') await fsDoc.webkitExitFullscreen();
-          return;
+    // ---- Diagnostics: ?diag=1 shows four buttons that reveal which haptic paths work on this phone ----
+    if (params.get('diag') === '1') {
+      const diag = div('diag');
+      diag.setAttribute('role', 'group');
+      diag.setAttribute('aria-label', 'Haptics diagnostics');
+      const rawTick = (): void => {
+        try {
+          if (hmode === 'ios') rawIosTick();
+          else rawVibrate(10);
+        } catch {
+          /* blocked */
         }
-        if (typeof fsRoot.requestFullscreen === 'function') await fsRoot.requestFullscreen();
-        else if (typeof fsRoot.webkitRequestFullscreen === 'function') await fsRoot.webkitRequestFullscreen();
-        const orientation = screen.orientation as (ScreenOrientation & { lock?: (o: string) => Promise<void> }) | undefined;
-        if (orientation && typeof orientation.lock === 'function') await orientation.lock('landscape');
-      } catch {
-        /* denied, unsupported, or the orientation lock is not allowed here: the pad still works */
-      }
-    }
-
-    if (document.fullscreenEnabled || fsDoc.webkitFullscreenEnabled) {
-      fsBtn.hidden = false;
-      paintFullscreen();
-    }
-
-    // ---- Wake lock and the screen-timeout hint ----
-    interface Sentinel {
-      released?: boolean;
-      release(): Promise<void>;
-    }
-    let sentinel: Sentinel | null = null;
-    let hintShown = false;
-    let hintTimer: ReturnType<typeof setTimeout> | null = null;
-
-    function hideHint(): void {
-      hintEl.hidden = true;
-      if (hintTimer !== null) clearTimeout(hintTimer);
-      hintTimer = null;
-    }
-
-    /** One line, once per device: the screen may turn off mid-game if the wake lock is not available. */
-    function showHintOnce(): void {
-      if (hintShown) return;
-      hintShown = true;
-      if (storageGet(HINT_KEY) === '1') return;
-      storageSet(HINT_KEY, '1');
-      hintEl.hidden = false;
-      hintTimer = setTimeout(hideHint, HINT_VISIBLE_MS);
-    }
-
-    async function acquireWakeLock(): Promise<void> {
-      const wl = (navigator as Navigator & { wakeLock?: { request(type: 'screen'): Promise<Sentinel> } }).wakeLock;
-      if (!wl) {
-        showHintOnce();
-        return;
-      }
-      try {
-        sentinel = await wl.request('screen');
-      } catch {
-        showHintOnce();
-      }
+      };
+      const mk = (n: number, label: string): HTMLButtonElement => {
+        const b = el('button', 'diag-btn', String(n));
+        b.type = 'button';
+        b.id = 'diag-' + n;
+        b.setAttribute('aria-label', label);
+        diag.appendChild(b);
+        return b;
+      };
+      mk(1, 'Tick from click').addEventListener('click', rawTick, on);
+      mk(2, 'Tick from pointerdown').addEventListener('pointerdown', rawTick, on);
+      const three = mk(3, 'Ticks while dragging');
+      let lastDragTick = 0;
+      three.addEventListener('pointerdown', (e) => three.setPointerCapture?.(e.pointerId), on);
+      three.addEventListener(
+        'pointermove',
+        () => {
+          const t = now();
+          if (t - lastDragTick >= 30) {
+            lastDragTick = t;
+            rawTick();
+          }
+        },
+        on,
+      );
+      let timerCount = 0;
+      mk(4, 'Ten ticks from a timer').addEventListener(
+        'click',
+        () => {
+          timerCount = 0;
+          const iv = setInterval(() => {
+            rawTick();
+            if (++timerCount >= 10) clearInterval(iv);
+          }, 100);
+        },
+        on,
+      );
+      document.body.appendChild(diag);
     }
 
     // ---- Wiring ----
-    fieldEl.addEventListener('pointerdown', (e) => (mode === 'edit' ? editDown(e) : playDown(e)), on);
-    fieldEl.addEventListener('pointermove', (e) => (mode === 'edit' ? editMove(e) : playMove(e)), on);
-    fieldEl.addEventListener('pointerup', (e) => (mode === 'edit' ? editEnd(e) : playEnd(e)), on);
+    fieldEl.addEventListener('pointerdown', (e) => (mode === 'edit' ? editDown(e) : playDown(e)), onPassive);
+    fieldEl.addEventListener('pointermove', (e) => (mode === 'edit' ? editMove(e) : playMove(e)), onPassive);
+    fieldEl.addEventListener('pointerup', (e) => (mode === 'edit' ? editEnd(e) : playEnd(e)), onPassive);
     // A cancelled pointer (system gesture, palm rejection) is a reason to distrust everything: release all.
-    fieldEl.addEventListener('pointercancel', (e) => (mode === 'edit' ? editEnd(e) : neutralise()), on);
-    fieldEl.addEventListener('lostpointercapture', (e) => (mode === 'edit' ? editEnd(e) : playEnd(e)), on);
+    fieldEl.addEventListener('pointercancel', (e) => (mode === 'edit' ? editEnd(e) : neutralise()), onPassive);
+    fieldEl.addEventListener('lostpointercapture', (e) => (mode === 'edit' ? editEnd(e) : playEnd(e)), onPassive);
 
+    // iOS: touchstart on the field stops the magnifier, the callout and double-tap zoom; touchmove and gesturestart stop pinch and scroll.
+    fieldEl.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false, signal: ac.signal });
+    document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false, signal: ac.signal });
+    for (const g of ['gesturestart', 'gesturechange', 'gestureend']) document.addEventListener(g, (e) => e.preventDefault(), { passive: false, signal: ac.signal });
     document.addEventListener('contextmenu', (e) => e.preventDefault(), on);
-    document.addEventListener('selectstart', (e) => (e.target instanceof HTMLInputElement ? undefined : e.preventDefault()), on);
+    document.addEventListener('selectstart', (e) => e.preventDefault(), on);
     document.addEventListener('dragstart', (e) => e.preventDefault(), on);
-    // iOS Safari still pinch-zooms and scrolls despite touch-action: none and user-scalable=no. The editor panel must keep scrolling.
-    document.addEventListener(
-      'touchmove',
-      (e) => {
-        if (!(e.target instanceof Element && e.target.closest('.panel-body'))) e.preventDefault();
-      },
-      { passive: false, signal: ac.signal },
-    );
-    document.addEventListener('gesturestart', (e) => e.preventDefault(), { passive: false, signal: ac.signal });
 
     document.addEventListener(
       'visibilitychange',
       () => {
-        if (document.visibilityState === 'hidden') {
-          neutralise();
-          if (saveState === 'saving' || saveState === 'error') void save(); // best effort before the page may be frozen
-        } else {
-          reconnectNow();
-          if (!sentinel || sentinel.released) void acquireWakeLock();
-        }
+        if (document.visibilityState === 'hidden') neutralise();
+        else reconnectNow();
       },
       on,
     );
     window.addEventListener('blur', neutralise, on);
     window.addEventListener('pagehide', neutralise, on);
     window.addEventListener('online', reconnectNow, on);
-    window.addEventListener('resize', onOrientation, on);
-    window.addEventListener('orientationchange', onOrientation, on);
-    window.visualViewport?.addEventListener('resize', updateUnit, on);
-    portraitQuery?.addEventListener('change', onOrientation, on);
-
-    fsBtn.addEventListener('click', () => void toggleFullscreen(), on);
-    document.addEventListener('fullscreenchange', paintFullscreen, on);
-    document.addEventListener('webkitfullscreenchange', paintFullscreen, on);
-    hintClose.addEventListener('click', hideHint, on);
-    retryBtn.addEventListener(
-      'click',
-      () => {
-        if (phase === 'full') {
-          attempt = 0;
-          everDropped = false;
-          setPhase('connecting');
-          connect();
-        } else if (layoutState === 'failed') {
-          void loadLayouts();
-        }
-      },
-      on,
-    );
-
-    // The Edit button needs a deliberate 600 ms press so it cannot be hit by accident during play.
-    const cancelEditHold = (): void => {
-      if (editTimer !== null) clearTimeout(editTimer);
-      editTimer = null;
-      editBtn.classList.remove('is-arming');
-    };
-    editBtn.addEventListener(
-      'pointerdown',
-      () => {
-        if (editTimer !== null) return;
-        editBtn.classList.add('is-arming');
-        editTimer = setTimeout(() => {
-          editTimer = null;
-          editBtn.classList.remove('is-arming');
-          enterEdit();
-        }, EDIT_HOLD_MS);
-      },
-      on,
-    );
-    for (const type of ['pointerup', 'pointercancel', 'pointerleave'] as const) editBtn.addEventListener(type, cancelEditHold, on);
-    // Keyboard and assistive technology activate with a click that has no pointer behind it (detail 0).
-    editBtn.addEventListener('click', (e) => (e.detail === 0 ? enterEdit() : undefined), on);
-
-    layoutPick.addEventListener('change', () => switchPreset(layoutPick.value), on);
-    saveRetry.addEventListener('click', () => void save(), on);
-    panelSave.addEventListener('click', () => void save(), on);
-    doneBtn.addEventListener(
-      'click',
-      () => {
-        exitEdit();
-      },
-      on,
-    );
-    undoBtn.addEventListener('click', doUndo, on);
-    collapseBtn.addEventListener('click', () => setCollapsed(!panelBody.hidden), on);
-    for (const t of panel.querySelectorAll<HTMLElement>('.tab')) {
-      t.addEventListener(
-        'click',
-        () => {
-          tab = (t.dataset['tab'] as Tab | undefined) ?? 'control';
-          buildPanel();
-        },
-        on,
-      );
+    window.addEventListener('resize', onResize, on);
+    window.addEventListener('orientationchange', onResize, on);
+    window.visualViewport?.addEventListener('resize', onResize, on);
+    portraitQuery?.addEventListener('change', onResize, on);
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver === 'function') {
+      observer = new ResizeObserver(() => onResize());
+      observer.observe(fieldEl);
     }
 
-    updateUnit();
+    tap(menu, enterEdit);
+    tap(done, finishEdit);
+    tap(retryBtn, () => {
+      if (phase === 'full') {
+        attempt = 0;
+        everDropped = false;
+        setPhase('connecting');
+        connect();
+      } else if (layoutState === 'failed') {
+        void loadLayouts();
+      }
+    });
+
+    measure();
     render();
     if (token) {
-      void acquireWakeLock();
       connect();
       void loadLayouts();
     }
@@ -2210,14 +2208,15 @@
       destroy(): void {
         destroyed = true;
         ac.abort();
+        observer?.disconnect();
         stopKeepalive();
-        for (const t of [reconnectTimer, hintTimer, saveTimer, savedHideTimer, editTimer, armedDelete]) if (t !== null) clearTimeout(t);
-        if (turboTimer !== null) clearInterval(turboTimer);
-        if (rafId !== 0 && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(rafId);
+        for (const t of [reconnectTimer, sendTimer, retryTimer, resetArmed]) if (t !== null) clearTimeout(t);
+        for (const t of pendingRelease.values()) clearTimeout(t);
+        haptics.stop();
         const sock = ws;
         ws = null;
         sock?.close();
-        void sentinel?.release().catch(() => undefined);
+        iosLabel?.remove();
       },
     };
   }
@@ -2237,48 +2236,57 @@
       BUTTON_NAMES,
       CURVES,
       SHAPES,
-      MIN_FRAME_MS,
+      SLOTS,
+      MIN_PRESS_MS,
+      STICK_SEND_MS,
+      HARD_SEND_GAP_MS,
       KEEPALIVE_MS,
       DOUBLE_TAP_MS,
-      FLOATING_ZONE,
-      UNDO_STEPS,
+      SAVE_RETRY_MS,
+      TAP_SLOP,
+      SIZE_RANGE,
+      SENSITIVITY_RANGE,
+      CARD_CONTROL,
+      CARD_SETTINGS,
       // layout store
       coerceStore,
       activeLayout,
-      newBlankLayout,
-      newLayoutFrom,
-      duplicateLayout,
-      renameLayout,
-      deleteLayout,
       switchLayout,
-      cycleLayout,
-      resetLayout,
-      setHaptics,
-      addControl,
       moveControl,
-      resizeControl,
-      duplicateControl,
-      deleteControl,
-      patchControl,
-      canAddControl,
-      sizeFromHandle,
+      setSize,
+      setOpacity,
+      setSensitivity,
+      setHaptics,
+      addSlot,
+      resetLayout,
+      layoutSensitivity,
+      sizeOf,
+      sizeRange,
+      opacityRange,
+      controlBox,
       halfExtent,
+      placeCard,
+      placeSettingsCard,
+      reachBox,
       applyProps,
-      // history
-      emptyHistory,
-      recordEdit,
-      endGesture,
-      undo,
-      // pad maths
+      // pad maths and send timing
       stickAxes,
+      deflection,
       limitToRadius,
       dpadMask,
       buttonMask,
       buildPad,
       samePad,
-      mergePress,
-      coversPress,
+      releaseDelay,
       isDoubleTap,
+      // haptics
+      hapticMode,
+      androidPattern,
+      androidStickStep,
+      iosStickInterval,
+      iosStickDecision,
+      buttonTickAllowed,
+      createHaptics,
       // protocol
       backoffDelay,
       deviceLabel,
@@ -2286,7 +2294,6 @@
       wsUrl,
       parseServerMessage,
       statusText,
-      httpMessage,
       boot,
     });
   } else {

@@ -1,17 +1,16 @@
 /* LanPlay phone controller. Dark, high contrast, landscape. No external assets, no inline styles (CSP style-src 'self').
-   Controls are absolutely positioned from the layout: left/top are percentages of the screen (set from JS through CSSOM) and
-   --w/--h are percentages of the viewport HEIGHT, turned into pixels with --u (= 1% of the viewport height, set from JS). */
+   .field is the safe rectangle (inside the notch and home indicator). Controls are positioned from the layout: left/top are
+   percentages of it (set from JS through CSSOM) and --w/--h are percentages of its HEIGHT, turned into pixels with --u
+   (= 1% of the field height, set from JS). */
 
 :root {
   color-scheme: dark;
   --bg: #0b0d12;
-  --panel: #131722;
-  --panel-edge: #5f6b88;
-  --ctl: #232a3a;
-  --ctl-edge: #7d8aa6;
-  --ctl-down: #46557a;
-  --text: #f3f6fb;
+  --panel: #151a26;
+  --text: #ffffff;
   --muted: #b3bccd;
+  --fill: rgba(255, 255, 255, 0.1);
+  --edge: rgba(255, 255, 255, 0.35);
   --ok: #46d17a;
   --warn: #f2b84b;
   --bad: #ff6b63;
@@ -19,8 +18,6 @@
   --face-b: #f2584f;
   --face-x: #4e90f2;
   --face-y: #f6c944;
-  --on-face: #0b0d12;
-  --focus: #ffffff;
   --u: 1vh;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
@@ -58,25 +55,15 @@ body {
   inset: 0;
 }
 
-button,
-select,
-input {
+button {
   font: inherit;
   color: inherit;
-}
-
-button {
   touch-action: none;
-}
-
-/* Text fields must stay editable even though the page blocks selection. */
-input[type="text"] {
-  -webkit-user-select: text;
-  user-select: text;
+  -webkit-touch-callout: none;
 }
 
 :focus-visible {
-  outline: 3px solid var(--focus);
+  outline: 3px solid var(--text);
   outline-offset: 2px;
 }
 
@@ -89,7 +76,10 @@ input[type="text"] {
 
 .field {
   position: fixed;
-  inset: 0;
+  top: 0;
+  left: env(safe-area-inset-left);
+  right: env(safe-area-inset-right);
+  bottom: env(safe-area-inset-bottom);
   z-index: 1;
   touch-action: none;
 }
@@ -102,26 +92,27 @@ input[type="text"] {
   padding: 0;
   transform: translate(-50%, -50%);
   touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .key {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 2px solid var(--ctl-edge);
-  background: var(--ctl);
+  border: 1.5px solid var(--edge);
+  background: var(--fill);
   color: var(--text);
   font-weight: 700;
   letter-spacing: 0.02em;
   line-height: 1;
-  cursor: pointer;
-  transition: transform 60ms ease-out, background-color 60ms ease-out;
+  /* Releasing fades out; pressing is instant (the .is-down rule below has no transition). */
+  transition: background-color 80ms linear, color 80ms linear, transform 80ms linear;
 }
 
 .ctl-btn {
   font-size: calc(var(--u) * var(--fs, 4));
   white-space: nowrap;
-  overflow: visible;
 }
 
 .shape-circle {
@@ -137,107 +128,47 @@ input[type="text"] {
 }
 
 .key.is-down {
-  background: var(--ctl-down);
-  border-color: var(--text);
+  background: rgba(255, 255, 255, 0.85);
+  border-color: rgba(255, 255, 255, 0.85);
+  color: var(--bg);
   transform: translate(-50%, -50%) scale(0.94);
+  transition: none;
 }
 
-/* Latched buttons carry a small marker so a held-on button is not mistaken for a stuck one. */
-.is-latch::after {
-  content: "";
-  position: absolute;
-  top: 8%;
-  right: 8%;
-  width: 22%;
-  height: 22%;
-  min-width: 6px;
-  min-height: 6px;
-  border: 2px solid var(--muted);
-  border-radius: 50%;
-}
-
-.is-latch.is-down::after {
-  background: var(--text);
-  border-color: var(--text);
-}
-
-/* Xbox colours follow the button the control sends, not its label. */
-.ctl-btn[data-button="A"],
-.ctl-btn[data-button="B"],
-.ctl-btn[data-button="X"],
-.ctl-btn[data-button="Y"] {
-  border-color: transparent;
-  color: var(--on-face);
-}
-
+/* Face buttons: only the letter is coloured. */
 .ctl-btn[data-button="A"] {
-  background: var(--face-a);
+  color: var(--face-a);
 }
 
 .ctl-btn[data-button="B"] {
-  background: var(--face-b);
+  color: var(--face-b);
 }
 
 .ctl-btn[data-button="X"] {
-  background: var(--face-x);
+  color: var(--face-x);
 }
 
 .ctl-btn[data-button="Y"] {
-  background: var(--face-y);
+  color: var(--face-y);
 }
 
-.ctl-btn[data-button="A"].is-down,
-.ctl-btn[data-button="B"].is-down,
-.ctl-btn[data-button="X"].is-down,
-.ctl-btn[data-button="Y"].is-down {
-  border-color: var(--text);
-  filter: brightness(1.15);
+.ctl-btn[data-button].is-down {
+  color: var(--bg);
 }
 
-.ctl-btn[data-button="A"].is-down {
-  background: var(--face-a);
-}
-
-.ctl-btn[data-button="B"].is-down {
-  background: var(--face-b);
-}
-
-.ctl-btn[data-button="X"].is-down {
-  background: var(--face-x);
-}
-
-.ctl-btn[data-button="Y"].is-down {
-  background: var(--face-y);
-}
-
-/* ---- Sticks ----------------------------------------------------------------------------------------------------- */
+/* ---- Sticks: a ring and a knob at 46% of it --------------------------------------------------------------------- */
 
 .ctl-stick {
   border-radius: 50%;
 }
 
-/* A floating stick shows its touch area; the base jumps under the finger (JS sets --ox/--oy on the base). */
-.ctl-stick.is-floating {
-  border: 2px dashed var(--panel-edge);
-  border-radius: calc(var(--u) * 3);
-  background: var(--panel);
-}
-
 .stick-base {
   position: absolute;
-  left: var(--ox, 50%);
-  top: var(--oy, 50%);
-  width: calc(var(--u) * var(--s, 36));
-  aspect-ratio: 1;
-  transform: translate(-50%, -50%);
-  border: 3px solid var(--ctl-edge);
+  inset: 0;
+  border: 1.5px solid var(--edge);
   border-radius: 50%;
-  background: var(--ctl);
+  background: var(--fill);
   pointer-events: none;
-}
-
-.ctl-stick.is-active .stick-base {
-  border-color: var(--text);
 }
 
 .stick-knob {
@@ -248,13 +179,18 @@ input[type="text"] {
   height: 46%;
   margin: -23% 0 0 -23%;
   border-radius: 50%;
-  background: var(--muted);
-  border: 3px solid var(--text);
+  background: rgba(255, 255, 255, 0.55);
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
   pointer-events: none;
+  will-change: transform;
+}
+
+.ctl-stick.is-active .stick-base {
+  border-color: rgba(255, 255, 255, 0.85);
 }
 
 .ctl-stick.is-active .stick-knob {
-  background: var(--text);
+  background: rgba(255, 255, 255, 0.85);
 }
 
 /* ---- D-pad ------------------------------------------------------------------------------------------------------ */
@@ -267,10 +203,10 @@ input[type="text"] {
 
 .arm {
   position: relative;
-  background: var(--ctl);
-  border: 2px solid var(--ctl-edge);
+  background: var(--fill);
+  border: 1.5px solid var(--edge);
   pointer-events: none;
-  transition: background-color 60ms ease-out;
+  transition: background-color 80ms linear;
 }
 
 .arm::before {
@@ -278,7 +214,7 @@ input[type="text"] {
   position: absolute;
   left: 50%;
   top: 50%;
-  border: 8px solid transparent;
+  border: 7px solid transparent;
   transform: translate(-50%, -50%);
 }
 
@@ -303,466 +239,332 @@ input[type="text"] {
 }
 
 .arm-up::before {
-  border-bottom: 12px solid var(--muted);
+  border-bottom: 11px solid var(--text);
   border-top-width: 0;
 }
 
 .arm-down::before {
-  border-top: 12px solid var(--muted);
+  border-top: 11px solid var(--text);
   border-bottom-width: 0;
 }
 
 .arm-left::before {
-  border-right: 12px solid var(--muted);
+  border-right: 11px solid var(--text);
   border-left-width: 0;
 }
 
 .arm-right::before {
-  border-left: 12px solid var(--muted);
+  border-left: 11px solid var(--text);
   border-right-width: 0;
 }
 
 .arm.is-down {
-  background: var(--ctl-down);
-  border-color: var(--text);
+  background: rgba(255, 255, 255, 0.85);
+  transition: none;
+}
+
+.arm.is-down::before {
+  filter: invert(1);
 }
 
 /* The centre square of the cross, so the shape reads as one piece. */
 .ctl-dpad::after {
   content: "";
   grid-area: 2 / 2;
-  background: var(--ctl);
-  border-top: 2px solid transparent;
-  border-bottom: 2px solid transparent;
+  background: var(--fill);
   pointer-events: none;
 }
 
 /* ---- Edit mode on the field ------------------------------------------------------------------------------------- */
 
 .is-editing .ctl {
-  cursor: move;
-  outline: 1px dashed rgba(243, 246, 251, 0.45);
+  outline: 1px dashed rgba(255, 255, 255, 0.45);
   outline-offset: 2px;
 }
 
 .is-editing .ctl.is-selected {
-  outline: 3px solid var(--focus);
+  outline: 3px solid var(--text);
   outline-offset: 3px;
 }
 
-.resize-handle {
-  position: absolute;
-  right: -16px;
-  bottom: -16px;
-  width: 26px;
-  height: 26px;
-  border: 3px solid var(--bg);
-  border-radius: 50%;
-  background: var(--focus);
-  cursor: nwse-resize;
-  touch-action: none;
-}
+/* ---- Chrome: the menu button, Done, the card -------------------------------------------------------------------- */
 
-/* A larger invisible hit area: a finger cannot hit a 26 px dot reliably. */
-.resize-handle::after {
-  content: "";
-  position: absolute;
-  inset: -12px;
-}
-
-/* ---- Status strip ----------------------------------------------------------------------------------------------- */
-
-.strip {
+.menu,
+.done {
   position: fixed;
-  z-index: 3;
+  z-index: 8;
   top: max(2px, env(safe-area-inset-top));
   left: 50%;
   transform: translateX(-50%);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  max-width: 96vw;
-  padding: 1px 8px;
-  border-radius: 16px;
-  background: rgba(11, 13, 18, 0.78);
-  pointer-events: none;
-}
-
-.strip > *,
-.strip-actions > * {
-  pointer-events: auto;
-}
-
-.strip-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  pointer-events: none;
-}
-
-.dot {
-  flex: none;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--warn);
-}
-
-.strip[data-state="connected"] .dot {
-  background: var(--ok);
-}
-
-.strip[data-state="full"] .dot,
-.strip[data-state="kicked"] .dot,
-.strip[data-state="notoken"] .dot {
-  background: var(--bad);
-}
-
-.status {
-  font-size: 12px;
-  line-height: 1.25;
-  font-weight: 600;
-  white-space: nowrap;
-}
-
-.save {
-  font-size: 12px;
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.strip-btn {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 28px;
-  height: 26px;
   margin: 0;
   padding: 0;
-  border: 2px solid var(--ctl-edge);
-  border-radius: 9px;
-  background: var(--ctl);
-  font-size: 12px;
-  line-height: 1;
   cursor: pointer;
 }
 
-.text-btn {
-  padding: 0 10px;
-  font-weight: 600;
-}
-
-.strip-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-
-.strip-select {
-  max-width: 120px;
-  height: 26px;
-  padding: 0 6px;
-  border: 2px solid var(--ctl-edge);
-  border-radius: 10px;
-  background: var(--ctl);
-  font-size: 13px;
-  text-overflow: ellipsis;
-}
-
-/* Edit needs a 600 ms press; the fill shows how far along it is. */
-.edit-btn {
-  position: relative;
-  overflow: hidden;
-}
-
-.edit-btn.is-arming::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  background: var(--text);
-  opacity: 0.4;
-  transform-origin: left center;
-  animation: arm 600ms linear forwards;
-}
-
-@keyframes arm {
-  from {
-    transform: scaleX(0);
-  }
-  to {
-    transform: scaleX(1);
-  }
-}
-
-/* Full-screen icon: four corner brackets drawn with borders, no image needed. */
-.fs-icon {
-  position: relative;
-  width: 16px;
-  height: 16px;
-  border: 2px solid var(--text);
-  border-radius: 3px;
-  -webkit-mask: linear-gradient(#000 0 0) top left / 6px 6px no-repeat, linear-gradient(#000 0 0) top right / 6px 6px no-repeat,
-    linear-gradient(#000 0 0) bottom left / 6px 6px no-repeat, linear-gradient(#000 0 0) bottom right / 6px 6px no-repeat;
-  mask: linear-gradient(#000 0 0) top left / 6px 6px no-repeat, linear-gradient(#000 0 0) top right / 6px 6px no-repeat,
-    linear-gradient(#000 0 0) bottom left / 6px 6px no-repeat, linear-gradient(#000 0 0) bottom right / 6px 6px no-repeat;
-}
-
-/* While editing, the panel header takes the strip's place; saving is reported there. */
-.editing .strip {
-  display: none;
-}
-
-/* ---- Editor panel ----------------------------------------------------------------------------------------------- */
-
-.panel {
-  position: fixed;
-  z-index: 4;
-  top: 0;
-  bottom: 0;
-  right: 0;
+/* A 56 x 52 pt hit area; the glyph inside is small. */
+.menu {
   display: flex;
   flex-direction: column;
-  width: min(300px, 46vw);
-  padding-right: env(safe-area-inset-right);
-  border-left: 2px solid var(--panel-edge);
-  background: rgba(19, 23, 34, 0.97);
-  font-size: 13px;
-}
-
-.panel.panel-left {
-  right: auto;
-  left: 0;
-  padding-right: 0;
-  padding-left: env(safe-area-inset-left);
-  border-left: 0;
-  border-right: 2px solid var(--panel-edge);
-}
-
-/* Collapsed: only the header stays, centred at the top (where the status strip is in play mode), so the whole screen can be edited. */
-.panel.collapsed {
-  top: 0;
-  bottom: auto;
-  left: 50%;
-  right: auto;
-  width: auto;
-  padding: 0;
-  transform: translateX(-50%);
-  border: 2px solid var(--panel-edge);
-  border-top: 0;
-  border-radius: 0 0 12px 12px;
-}
-
-.panel.collapsed .panel-head {
-  padding: 3px 8px;
-}
-
-.panel-head {
-  display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-}
-
-.save-btn {
-  flex: 1;
-  min-width: 0;
-  min-height: 32px;
-  padding: 0 2px;
+  justify-content: center;
+  gap: 1px;
+  width: 56px;
+  height: 52px;
   border: 0;
-  background: none;
-  color: var(--muted);
-  font-size: 12px;
-  text-align: left;
-  white-space: nowrap;
+  border-radius: 14px;
+  background: rgba(11, 13, 18, 0.55);
+  color: var(--text);
 }
 
-.save-btn:not(:disabled) {
-  color: var(--warn);
-  text-decoration: underline;
-  cursor: pointer;
+.gear {
+  width: 24px;
+  height: 24px;
+  fill: none;
+  stroke: currentColor;
 }
 
-.panel-body {
-  flex: 1;
-  min-height: 0;
-  padding: 0 10px 14px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  touch-action: pan-y;
-  -webkit-overflow-scrolling: touch;
+.gear-teeth {
+  stroke-width: 3.4;
+  stroke-dasharray: 3 3.96;
 }
 
-.tabs {
-  display: flex;
-  gap: 4px;
-  margin-bottom: 6px;
+.gear-ring {
+  stroke-width: 1.6;
 }
 
-.tab {
-  flex: 1;
-  min-height: 36px;
-  border: 2px solid var(--ctl-edge);
-  border-radius: 10px;
-  background: var(--ctl);
-  font-size: 13px;
+.gear-hub {
+  stroke-width: 1.6;
+}
+
+.menu-label {
+  font-size: 10px;
+  line-height: 1;
   font-weight: 600;
-  cursor: pointer;
+  color: var(--muted);
 }
 
-.tab[aria-selected="true"] {
-  background: var(--text);
-  border-color: var(--text);
-  color: var(--bg);
-}
-
-.panel-msg {
-  min-height: 1.3em;
-  margin: 2px 0 4px;
+.menu-dot {
   color: var(--warn);
 }
 
-.panel-title {
-  margin: 4px 0 2px;
-  font-size: 15px;
+.menu[data-state="connected"] .menu-dot {
+  color: var(--ok);
 }
 
-.panel-hint {
-  margin: 6px 0;
-  color: var(--muted);
-  line-height: 1.35;
-}
-
-.row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  align-items: center;
-  gap: 2px 8px;
-  padding: 5px 0;
-}
-
-.row-label {
-  min-width: 0;
-}
-
-.row input[type="range"] {
-  grid-column: 1 / -1;
-  grid-row: 2;
-  width: 100%;
-  height: 28px;
-  margin: 0;
-  touch-action: none;
-  accent-color: var(--text);
-}
-
-.row-value {
-  grid-column: 2;
-  grid-row: 1;
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
-}
-
-.row-check {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 36px;
-}
-
-.row-check input {
-  width: 22px;
-  height: 22px;
-  margin: 0;
-  accent-color: var(--text);
-}
-
-.row-select,
-.row-text {
-  min-width: 0;
-  max-width: 150px;
-  height: 36px;
-  padding: 0 8px;
-  border: 2px solid var(--ctl-edge);
-  border-radius: 10px;
-  background: var(--ctl);
-}
-
-.panel-actions {
-  display: flex;
-  gap: 6px;
-  margin-top: 8px;
-}
-
-.panel-actions.wrap {
-  flex-wrap: wrap;
-}
-
-.panel-actions > * {
-  flex: 1 1 0;
-  min-width: 0;
-}
-
-.panel-actions.wrap > * {
-  flex-basis: 45%;
-}
-
-.panel-btn {
-  min-height: 40px;
-  padding: 0 8px;
-  border: 2px solid var(--ctl-edge);
-  border-radius: 10px;
-  background: var(--ctl);
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.panel-btn.danger {
-  border-color: var(--bad);
+.menu[data-state="full"] .menu-dot,
+.menu[data-state="kicked"] .menu-dot,
+.menu[data-state="notoken"] .menu-dot {
   color: var(--bad);
 }
 
-.panel-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
-}
-
-/* ---- Hint and overlays ------------------------------------------------------------------------------------------ */
-
-.hint {
-  position: fixed;
-  z-index: 5;
-  left: 50%;
-  top: 36%;
-  transform: translateX(-50%);
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
-  width: min(86vw, 300px);
-  padding: 12px;
-  border: 2px solid var(--ctl-edge);
-  border-radius: 14px;
-  background: var(--panel);
-  font-size: 14px;
-  line-height: 1.3;
-  text-align: center;
-}
-
-.hint-close {
-  min-height: 44px;
+/* Done replaces the gear in edit mode: big, high contrast, above everything. */
+.done {
+  z-index: 30;
+  width: 108px;
+  height: 52px;
   border: 0;
-  border-radius: 10px;
+  border-radius: 16px;
   background: var(--text);
   color: var(--bg);
+  font-size: 19px;
+  font-weight: 800;
+}
+
+.card {
+  position: fixed;
+  z-index: 7;
+  width: 280px;
+  height: 136px;
+  padding: 8px 14px;
+  transform: translate(-50%, -50%);
+  border: 1.5px solid var(--edge);
+  border-radius: 18px;
+  background: rgba(21, 26, 38, 0.96);
+  font-size: 14px;
+}
+
+.card.is-settings {
+  width: 300px;
+  height: 168px;
+}
+
+.card-title {
+  margin: 0 0 2px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 44px;
+}
+
+.card-label {
+  font-weight: 600;
+}
+
+.card-msg {
+  position: absolute;
+  left: 14px;
+  bottom: 3px;
+  margin: 0;
+  font-size: 11px;
+  color: var(--warn);
+}
+
+.slots {
+  display: flex;
+  gap: 6px;
+}
+
+.card-btn,
+.switch {
+  min-width: 44px;
+  height: 44px;
+  margin: 0;
+  padding: 0 10px;
+  border: 1.5px solid var(--edge);
+  border-radius: 12px;
+  background: var(--fill);
   font-size: 15px;
   font-weight: 700;
   cursor: pointer;
 }
 
+.card-btn[aria-pressed="true"] {
+  background: var(--text);
+  border-color: var(--text);
+  color: var(--bg);
+}
+
+.card-btn.is-empty {
+  border-style: dashed;
+  color: var(--muted);
+}
+
+.switch[aria-checked="true"] {
+  background: var(--ok);
+  border-color: var(--ok);
+  color: var(--bg);
+}
+
+/* Sliders: one row each (label, track, value); pointer driven, a 44 pt thumb on a 44 pt tall track. */
+.slider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 44px;
+}
+
+.slider-label {
+  flex: 0 0 74px;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.slider-value {
+  flex: 0 0 40px;
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.slider-track {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  --p: 0;
+  touch-action: none;
+}
+
+.slider-track::before {
+  content: "";
+  position: absolute;
+  left: 22px;
+  right: 22px;
+  top: 50%;
+  height: 4px;
+  margin-top: -2px;
+  border-radius: 2px;
+  background: var(--edge);
+}
+
+.slider-fill {
+  position: absolute;
+  left: 22px;
+  top: 50%;
+  width: calc((100% - 44px) * var(--p));
+  height: 4px;
+  margin-top: -2px;
+  border-radius: 2px;
+  background: var(--text);
+}
+
+.slider-thumb {
+  position: absolute;
+  top: 0;
+  left: calc((100% - 44px) * var(--p));
+  width: 44px;
+  height: 44px;
+}
+
+.slider-thumb::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--text);
+}
+
+/* The editor must not cover the field in play, and a card never needs the haptic switch label. */
+.haptic-switch {
+  position: fixed;
+  left: -100px;
+  top: -100px;
+  width: 1px;
+  height: 1px;
+  opacity: 0.01;
+  pointer-events: none;
+}
+
+.diag {
+  position: fixed;
+  z-index: 9;
+  left: 50%;
+  top: 50%;
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  transform: translate(-50%, -50%);
+  border: 1.5px solid var(--edge);
+  border-radius: 14px;
+  background: rgba(21, 26, 38, 0.96);
+}
+
+.diag-btn {
+  width: 48px;
+  height: 48px;
+  border: 1.5px solid var(--edge);
+  border-radius: 12px;
+  background: var(--fill);
+  font-size: 18px;
+  font-weight: 700;
+}
+
+/* ---- Overlays --------------------------------------------------------------------------------------------------- */
+
 .overlay {
   position: fixed;
   inset: 0;
-  z-index: 10;
+  z-index: 40;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -789,10 +591,10 @@ input[type="text"] {
 
 .action {
   min-width: 140px;
-  min-height: 48px;
+  min-height: 52px;
   padding: 0 24px;
   border: 0;
-  border-radius: 24px;
+  border-radius: 26px;
   background: var(--text);
   color: var(--bg);
   font-size: 17px;
@@ -800,17 +602,9 @@ input[type="text"] {
   cursor: pointer;
 }
 
-.action.small {
-  min-width: 64px;
-  min-height: 34px;
-  padding: 0 14px;
-  border-radius: 12px;
-  font-size: 14px;
-}
-
 .rotate-overlay {
   display: none;
-  z-index: 20;
+  z-index: 50;
 }
 
 @media (orientation: portrait) {
@@ -842,11 +636,6 @@ input[type="text"] {
   .phone-icon {
     animation: none;
     transform: rotate(90deg);
-  }
-
-  .edit-btn.is-arming::after {
-    animation: none;
-    transform: scaleX(1);
   }
 
   .key,
