@@ -9,6 +9,8 @@ import type { App, Dialog, Net } from 'electron';
 import { ASSET_URL_PREFIX, UPDATE_MANIFEST_URL, UPDATE_SIGNATURE_URL, Updater } from '../core/update/update.js';
 import type { StagedUpdate } from '../core/update/update.js';
 import { planApply, runApply } from '../core/update/apply.js';
+import type { UpdateStatus } from '../contracts.js';
+import type { UpdateCheckResult } from '../core/update/update.js';
 
 const FIRST_CHECK_MS = 20_000;
 const CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
@@ -23,6 +25,8 @@ export interface UpdatesOptions {
   /** 'agent' = background host agent without a window: stage only, apply at the next launch. */
   mode: 'gui' | 'agent';
   isStreaming(): boolean;
+  /** Tests sign with their own key; production leaves this unset and uses the one built into the app. */
+  publicKeyB64?: string;
   log(level: 'info' | 'warn' | 'error', msg: string, data?: Record<string, unknown>): void;
 }
 
@@ -30,13 +34,22 @@ export interface Updates {
   /** Call before opening any window. True = an installer was started and the app is exiting. */
   applyStagedAtLaunch(): boolean;
   start(): void;
+  /** The "Check for updates" button: the timer's check, run now. A ready update opens the same dialog as the timer's. */
+  checkNow(): Promise<UpdateStatus>;
 }
 
 const allowedUrl = (u: string) => u === UPDATE_MANIFEST_URL || u === UPDATE_SIGNATURE_URL || u.startsWith(ASSET_URL_PREFIX);
 
 export function createUpdates(o: UpdatesOptions): Updates {
   const { app } = o;
-  if (!app.isPackaged) return { applyStagedAtLaunch: () => false, start: () => undefined };
+  if (!app.isPackaged) {
+    const unsupported = async (): Promise<UpdateStatus> => ({
+      state: 'unsupported',
+      current: app.getVersion(),
+      message: 'Updates only work in the installed app, not in a development build.',
+    });
+    return { applyStagedAtLaunch: () => false, start: () => undefined, checkNow: unsupported };
+  }
 
   const fetchOk = async (url: string) => {
     if (!allowedUrl(url)) throw new Error('refusing to fetch a URL outside the LanPlay release');
@@ -49,6 +62,7 @@ export function createUpdates(o: UpdatesOptions): Updates {
     platform: process.platform,
     arch: process.arch,
     stageDir: o.stageDir,
+    ...(o.publicKeyB64 ? { publicKeyB64: o.publicKeyB64 } : {}),
     async fetchBytes(url, maxBytes) {
       const res = await fetchOk(url);
       const len = Number(res.headers.get('content-length') ?? 0);
@@ -100,37 +114,72 @@ export function createUpdates(o: UpdatesOptions): Updates {
   };
 
   const askedFor = new Set<string>();
-  const offer = async (version: string, notes: string): Promise<void> => {
-    if (o.mode === 'agent' || askedFor.has(version)) return;
+  let dialogOpen = false;
+  /** `again`: the user asked (manual check), so a version they already answered "Later" to is offered once more. */
+  const offer = async (version: string, notes: string, again = false): Promise<void> => {
+    if (o.mode === 'agent' || dialogOpen || (!again && askedFor.has(version))) return;
     if (o.isStreaming()) {
       setTimeout(() => void offer(version, notes), BUSY_RETRY_MS).unref();
       return;
     }
     askedFor.add(version);
-    const r = await o.dialog.showMessageBox({
-      type: 'info',
-      title: 'LanPlay update',
-      message: `LanPlay ${version} is ready.`,
-      detail: `${notes ? notes + '\n\n' : ''}LanPlay will close, update and open again. Streams end while it updates.`,
-      buttons: ['Restart and update', 'Later'],
-      defaultId: 0,
-      cancelId: 1,
-      noLink: true,
-    });
+    dialogOpen = true;
+    let r: { response: number };
+    try {
+      r = await o.dialog.showMessageBox({
+        type: 'info',
+        title: 'LanPlay update',
+        message: `LanPlay ${version} is ready.`,
+        detail: `${notes ? notes + '\n\n' : ''}LanPlay will close, update and open again. Streams end while it updates.`,
+        buttons: ['Restart and update', 'Later'],
+        defaultId: 0,
+        cancelId: 1,
+        noLink: true,
+      });
+    } finally {
+      dialogOpen = false;
+    }
     if (r.response === 0) {
       const s = updater.staged();
       if (s) apply(s);
     }
   };
 
+  // The timer and the button share one run, so two checks never download the same installer at once.
+  let running: Promise<UpdateCheckResult> | null = null;
+  const checkOnce = (): Promise<UpdateCheckResult> => (running ??= updater.check().finally(() => (running = null)));
+
   const check = async (): Promise<void> => {
-    const r = await updater.check();
+    const r = await checkOnce();
     if (r.status === 'ready') {
       o.log('info', 'update ready', { version: r.version });
       await offer(r.version, r.notes);
     } else if (r.status === 'error') {
       o.log(r.reason === 'network' ? 'info' : 'warn', 'update check failed', { reason: r.reason, message: r.message });
     }
+  };
+
+  const checkNow = async (): Promise<UpdateStatus> => {
+    const current = app.getVersion();
+    let r: UpdateCheckResult;
+    try {
+      r = await checkOnce();
+    } catch (e) {
+      o.log('warn', 'update check crashed', { error: (e as Error).message });
+      return { state: 'error', current, message: `Could not check for updates: ${(e as Error).message}` };
+    }
+    if (r.status === 'error') {
+      o.log('warn', 'manual update check failed', { reason: r.reason, message: r.message });
+      return { state: 'error', current, message: `Could not check for updates: ${r.message}` };
+    }
+    if (r.status === 'up-to-date') {
+      const message = r.reason === 'no-asset' ? 'A newer version exists but is not available for this computer yet.' : 'You have the latest version.';
+      return { state: 'up-to-date', current, message };
+    }
+    // Not awaited: the dialog stays open until the user answers, and the screen should show its result now.
+    void offer(r.version, r.notes, true).catch((e: Error) => o.log('warn', 'update dialog failed', { error: e.message }));
+    const message = o.isStreaming() ? `Update ${r.version} is ready. It will be offered when your stream ends.` : `Update ${r.version} is ready to install.`;
+    return { state: 'ready', current, latest: r.version, message };
   };
 
   return {
@@ -145,5 +194,6 @@ export function createUpdates(o: UpdatesOptions): Updates {
       setTimeout(run, FIRST_CHECK_MS).unref();
       setInterval(run, CHECK_EVERY_MS).unref();
     },
+    checkNow,
   };
 }

@@ -39,7 +39,32 @@ namespace LP.App {
   export interface RoleChooser { choose(mode: Mode): Promise<boolean> }
 
   /** What the chooser needs to know about this computer: its wording and whether it may host at all. */
-  export interface ChooserEnv { platform?: string; hostSupported?: boolean | undefined }
+  export interface ChooserEnv { platform?: string; hostSupported?: boolean | undefined; version?: string | undefined }
+
+  /** "LanPlay 0.4.0 - Check for updates". The result line is the button's reply; the update itself is the dialog main opens. */
+  function updateLine(api: T.Api, version: string | undefined): HTMLElement {
+    const result = h('span', { role: 'status', 'aria-live': 'polite' });
+    const button = h('button', { type: 'button', class: 'link' }, 'Check for updates');
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      button.disabled = true;
+      result.className = '';
+      result.textContent = 'Checking...';
+      api.invoke('update:check').then(
+        (r) => {
+          result.className = r.state === 'error' ? 'error-text' : '';
+          result.textContent = r.message;
+        },
+        (e: unknown) => {
+          result.className = 'error-text';
+          result.textContent = 'Could not check for updates: ' + String((e as Error)?.message ?? e);
+        },
+      ).finally(() => {
+        button.disabled = false;
+      });
+    });
+    return h('footer', { class: 'update-line' }, h('span', null, version ? `LanPlay ${version}` : 'LanPlay'), button, result);
+  }
 
   /**
    * fixedRole: what this computer can be in v1 (main decides: Windows = host, macOS = client, see app:info). When set,
@@ -48,18 +73,21 @@ namespace LP.App {
    */
   export function start(root: HTMLElement, api: T.Api, store: Store = browserStore(), fixedRole: Mode | null = null, chooser: RoleChooser | null = null, env: ChooserEnv = {}): { destroy(): void } {
     let current: { destroy(): void } | null = null;
+    // The screens own everything they are mounted into, so the footer lives beside them and survives role switches.
+    const slot = h('div');
+    Dom.setChildren(root, [slot, updateLine(api, env.version)]);
 
     function pick(mode: Mode): void {
       if (!chooser) return show(mode);
-      Dom.setChildren(root, [h('main', { class: 'screen first' }, h('p', { class: 'lead', role: 'status' }, 'Saving your choice...'))]);
+      Dom.setChildren(slot, [h('main', { class: 'screen first' }, h('p', { class: 'lead', role: 'status' }, 'Saving your choice...'))]);
       chooser.choose(mode).then(
         (relaunching) => {
-          if (relaunching) Dom.setChildren(root, [h('main', { class: 'screen first' }, h('p', { class: 'lead', role: 'status' }, 'Restarting LanPlay for this choice...'))]);
+          if (relaunching) Dom.setChildren(slot, [h('main', { class: 'screen first' }, h('p', { class: 'lead', role: 'status' }, 'Restarting LanPlay for this choice...'))]);
           else show(mode);
         },
         (e: unknown) => {
           firstRun();
-          root.querySelector('main')?.appendChild(h('p', { class: 'error', role: 'alert' }, 'Could not save your choice: ' + String((e as Error)?.message ?? e)));
+          slot.querySelector('main')?.appendChild(h('p', { class: 'error', role: 'alert' }, 'Could not save your choice: ' + String((e as Error)?.message ?? e)));
         },
       );
     }
@@ -70,8 +98,8 @@ namespace LP.App {
       if (!fixedRole) store.set(mode);
       // A Mac that cannot host (macOS < 14, Intel) has nothing to switch to, so it gets no link to the chooser.
       const opts = fixedRole || env.hostSupported === false ? {} : { onSwitchMode: () => show(null), switchLabel: chooser ? 'Change role' : 'Change mode' };
-      if (mode === 'client') current = Client.mount(root, api, opts);
-      else if (mode === 'host') current = Host.mount(root, api, opts);
+      if (mode === 'client') current = Client.mount(slot, api, opts);
+      else if (mode === 'host') current = Host.mount(slot, api, opts);
       else firstRun();
     }
 
@@ -83,7 +111,7 @@ namespace LP.App {
       const host = mac
         ? big('This Mac hosts games', 'Play games that run on this computer from another device. LanPlay sets it up for you.', 'host')
         : big('This PC hosts games', 'This is the gaming PC. LanPlay sets it up for you.', 'host');
-      Dom.setChildren(root, [h('main', { class: 'screen first' },
+      Dom.setChildren(slot, [h('main', { class: 'screen first' },
         h('h1', null, 'LanPlay'),
         h('p', { class: 'lead' }, mac ? 'Play games from one computer on another in your home. What is this Mac for?' : 'Play PC games on another computer in your home. What is this computer for?'),
         h('div', { class: 'bigs' }, first, host))]);
@@ -113,9 +141,9 @@ namespace LP.App {
         if (info.canChooseRole) {
           const chooser: RoleChooser = { choose: (m) => api.invoke('app:role-set', { role: m }).then((r) => r.relaunching) };
           const known = info.roleStored || info.platform === 'darwin';
-          return start(root, api, memoryStore(known ? role : null), null, chooser, { platform: info.platform, hostSupported: info.hostSupported });
+          return start(root, api, memoryStore(known ? role : null), null, chooser, { platform: info.platform, hostSupported: info.hostSupported, version: info.version });
         }
-        return start(root, api, browserStore(), role);
+        return start(root, api, browserStore(), role, null, { version: info.version });
       },
       () => start(root, api),
     );

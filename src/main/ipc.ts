@@ -34,6 +34,7 @@ export const IPC_VALIDATORS: { [C in IpcInvokeChannel]: Validator<C> } = {
     if (r !== 'client' && r !== 'host') throw new IpcValidationError('invalid role');
     return { role: r };
   },
+  'update:check': none,
   'client:system-info': none,
   'client:discover-start': none,
   'client:discover-stop': none,

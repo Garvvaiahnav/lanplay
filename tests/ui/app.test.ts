@@ -257,3 +257,102 @@ describe('Mac: role chooser reachable from the client screen, never asked on fir
     expect([...root.querySelectorAll('button.big .big-title')].map((t) => t.textContent)).toEqual(['Play on this screen', 'This PC hosts games']);
   });
 });
+
+describe('version line and Check for updates', () => {
+  const check = (root: HTMLElement) => buttonByText(root, 'Check for updates');
+  const result = (root: HTMLElement) => q(root, '.update-line [role="status"]');
+  const START = (root: HTMLElement, a: ReturnType<typeof api>, role: 'client' | 'host' | null = 'client') =>
+    LPG.App.start(root, a, memStore(role), null, null, { version: '0.4.0' });
+
+  it('shows the version and the button on the first-run chooser, the client screen and the host screen', async () => {
+    for (const role of [null, 'client', 'host'] as const) {
+      const root = document.body.appendChild(document.createElement('div'));
+      const h = START(root, api(), role);
+      await flush();
+      expect(q(root, '.update-line').textContent).toContain('LanPlay 0.4.0');
+      expect(check(root)).toBeTruthy();
+      h.destroy();
+    }
+  });
+
+  it('still shows the button when the version is unknown (app:info failed)', () => {
+    const root = document.body.appendChild(document.createElement('div'));
+    LPG.App.start(root, api(), memStore('client'));
+    expect(q(root, '.update-line').textContent).toContain('LanPlay');
+    expect(q(root, '.update-line').textContent).not.toContain('undefined');
+    expect(check(root)).toBeTruthy();
+  });
+
+  it('keeps the footer when the screen changes', async () => {
+    const root = document.body.appendChild(document.createElement('div'));
+    const h = LPG.App.start(root, api(), memStore(), null, null, { version: '0.4.0' });
+    (root.querySelector('button.big') as HTMLButtonElement).click();
+    await flush();
+    expect(root.querySelectorAll('.update-line')).toHaveLength(1);
+    h.destroy();
+  });
+
+  it('shows Checking... while waiting, then the reply, and allows only one check at a time', async () => {
+    const a = api();
+    let finish!: (v: unknown) => void;
+    a.handlers['update:check'] = () => new Promise((r) => (finish = r));
+    const root = document.body.appendChild(document.createElement('div'));
+    START(root, a);
+    check(root).click();
+    check(root).click();
+    expect(result(root).textContent).toBe('Checking...');
+    expect(check(root).disabled).toBe(true);
+    expect(a.called('update:check')).toHaveLength(1);
+    finish({ state: 'up-to-date', current: '0.4.0', message: 'You have the latest version.' });
+    await flush();
+    expect(result(root).textContent).toBe('You have the latest version.');
+    expect(check(root).disabled).toBe(false);
+  });
+
+  it('shows a found update, and the reply text of an error or unsupported build', async () => {
+    const a = api();
+    const root = document.body.appendChild(document.createElement('div'));
+    START(root, a);
+    for (const reply of [
+      { state: 'ready', current: '0.4.0', latest: '0.5.0', message: 'Update 0.5.0 is ready to install.' },
+      { state: 'error', current: '0.4.0', message: 'Could not check for updates: offline' },
+      { state: 'unsupported', current: '0.4.0', message: 'Updates only work in the installed app.' },
+    ]) {
+      a.handlers['update:check'] = () => reply;
+      check(root).click();
+      await flush();
+      expect(result(root).textContent).toBe(reply.message);
+      expect(result(root).classList.contains('error-text')).toBe(reply.state === 'error');
+    }
+  });
+
+  it('shows the failure when the call itself is rejected', async () => {
+    const a = api();
+    a.handlers['update:check'] = () => {
+      throw new Error('Updates are not available here.');
+    };
+    const root = document.body.appendChild(document.createElement('div'));
+    START(root, a);
+    check(root).click();
+    await flush();
+    expect(result(root).textContent).toBe('Could not check for updates: Updates are not available here.');
+    expect(check(root).disabled).toBe(false);
+  });
+
+  it('boot passes the app version to the footer', async () => {
+    const a = api();
+    a.handlers['app:info'] = () => ({ role: 'client', version: '0.4.0', platform: 'darwin', arch: 'arm64', logFile: '' });
+    const w = window as unknown as { __LANPLAY_NO_AUTOSTART__?: boolean; lanplay?: unknown };
+    document.body.innerHTML = '<div id="app"></div>';
+    w.__LANPLAY_NO_AUTOSTART__ = false;
+    w.lanplay = a;
+    try {
+      LPG.App.boot();
+      await flush();
+    } finally {
+      w.__LANPLAY_NO_AUTOSTART__ = true;
+      delete w.lanplay;
+    }
+    expect(q(document.getElementById('app')!, '.update-line').textContent).toContain('LanPlay 0.4.0');
+  });
+});

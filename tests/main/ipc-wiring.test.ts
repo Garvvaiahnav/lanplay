@@ -48,6 +48,10 @@ describe('IPC router', () => {
     expect(() => IPC_VALIDATORS['host:agent-decide']({ requestId: 'x', approve: true })).toThrow();
     expect(() => IPC_VALIDATORS['client:stream-start']({ hostId: 'a', settings: null })).toThrow();
   });
+  it('update:check takes no payload', () => {
+    expect(IPC_VALIDATORS['update:check'](undefined)).toBeUndefined();
+    expect(() => IPC_VALIDATORS['update:check']({ force: true })).toThrow();
+  });
   it('validates the macOS host channels', () => {
     for (const pane of ['screen-recording', 'accessibility', 'microphone', 'local-network', 'login-items', 'firewall'] as const) {
       expect(IPC_VALIDATORS['host:open-settings']({ pane })).toEqual({ pane });

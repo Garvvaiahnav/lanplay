@@ -201,6 +201,7 @@ async function start(): Promise<void> {
   });
   // A verified update downloaded earlier is installed first: the installer starts and this process exits.
   if (updates.applyStagedAtLaunch()) return;
+  env.checkForUpdates = updates.checkNow; // `env` is built before the updater, which needs the stream menu
   applySecurity(
     { app, session: session.defaultSession, openExternal: (u) => shell.openExternal(u), protocol, netFetch: (u, i) => net.fetch(u, i) },
     RENDERER_DIR,

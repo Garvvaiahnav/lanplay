@@ -3,7 +3,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { LANPLAY, SUNSHINE, SUNSHINE_MAC } from '../contracts.js';
-import type { AppInfo, ClientService, DiagnosticsService, HostSetupStatus, IpcEventChannel, IpcEventMap, Role, SelfCheckReport, ServiceDeps } from '../contracts.js';
+import type { AppInfo, ClientService, DiagnosticsService, HostSetupStatus, IpcEventChannel, IpcEventMap, Role, SelfCheckReport, ServiceDeps, UpdateStatus } from '../contracts.js';
 import { createMacClientService } from '../core/client/service.js';
 import { clientDiagnosticsFiles, macSystemInfo, winClientSystemInfo } from '../core/client/diagnostics-client.js';
 import { moonlightLogDir } from '../core/client/platform.js';
@@ -38,6 +38,8 @@ export interface WiringEnv {
   relaunch?: (role: Role) => void;
   /** Phone controllers (host role only); main builds it because it needs Electron paths and the elevated setup. */
   controllers?: ControllerService | null;
+  /** Manual update check (main: createUpdates().checkNow). Absent where nothing can update itself. */
+  checkForUpdates?: () => Promise<UpdateStatus>;
   /** Opens a URL in the default handler (main: shell.openExternal). The macOS host screen uses it for System Settings. */
   openExternal?: (url: string) => Promise<void>;
   /** The user's home folder and uid, for the macOS LaunchAgents. Default: the real ones (tests pass a temp folder). */
@@ -208,6 +210,10 @@ export function buildHandlers(
       // Let the IPC reply reach the renderer before the process exits.
       setTimeout(() => env.relaunch?.(r), 300);
       return { relaunching: true };
+    },
+    'update:check': async () => {
+      if (!env.checkForUpdates) throw new Error('Updates are not available here.');
+      return env.checkForUpdates(); // createUpdates shares one in-flight check, so a double click cannot start two
     },
     'selfcheck:run': () => once('selfcheck', () => s.selfCheck()),
     'diagnostics:collect': async () => {

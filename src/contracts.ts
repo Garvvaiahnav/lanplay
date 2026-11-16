@@ -1035,6 +1035,17 @@ export interface AppInfo {
   roleStored?: boolean;
 }
 
+/** Answer to a manual "Check for updates" ('update:check'). An update is downloaded and verified before 'ready'. */
+export interface UpdateStatus {
+  state: 'up-to-date' | 'ready' | 'error' | 'unsupported';
+  /** The running version. */
+  current: string;
+  /** The newer version, only when state is 'ready'. */
+  latest?: string;
+  /** One sentence the screen shows as is. */
+  message: string;
+}
+
 export interface ClientSystemInfo {
   chip: AppleChipInfo;
   moonlightPath: string | null;
@@ -1101,6 +1112,8 @@ export interface IpcInvokeMap {
   'app:info': [void, AppInfo];
   /** Windows: store the chosen role; main relaunches with --role when it differs from the running role. */
   'app:role-set': [{ role: Role }, { relaunching: boolean }];
+  /** Runs the same signed check as the timer; a ready update opens the usual "Restart and update" dialog. */
+  'update:check': [void, UpdateStatus];
   'client:system-info': [void, ClientSystemInfo];
   'client:discover-start': [void, HostInfo[]];
   'client:discover-stop': [void, void];
@@ -1155,6 +1168,7 @@ export type IpcResponse<C extends IpcInvokeChannel> = IpcInvokeMap[C][1];
 export const IPC_INVOKE_CHANNELS = Object.freeze([
   'app:info',
   'app:role-set',
+  'update:check',
   'client:system-info',
   'client:discover-start',
   'client:discover-stop',

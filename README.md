@@ -22,7 +22,8 @@ The host PC can turn phones into Xbox controllers (no app on the phone, fully cu
 ## Updates
 LanPlay checks GitHub Releases at start and every 6 hours. A new version is downloaded, verified against an Ed25519-signed
 manifest (public key in `src/core/update/update.ts`) and its SHA-256, then offered: "Restart and update". Nothing
-unsigned is ever run. See `docs/RELEASING.md` for how a release is signed and published.
+unsigned is ever run. The footer of every screen shows the version and a "Check for updates" button that runs the same check
+on demand. See `docs/RELEASING.md` for how a release is signed and published.
 
 ## Build from source
 - **Windows host or viewer:** `npm ci`, `node scripts/fetch-vendor.mjs --windows`, then

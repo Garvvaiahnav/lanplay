@@ -69,6 +69,21 @@ describe('buildHandlers', () => {
     expect(Array.isArray(info.localAddresses)).toBe(true);
   });
 
+  it('update:check runs the injected check, and fails clearly where nothing can update', async () => {
+    const s: Services = { client: null, host: null, controllers: null, macHost: null, diagnostics: { collect: async () => ({ zipPath: '', bytes: 0 }) }, selfCheck: async () => ({}) as SelfCheckReport, resolvedPaths: {} };
+    const status = { state: 'up-to-date', current: '0.1.0', message: 'You have the latest version.' } as const;
+    const calls: number[] = [];
+    const wired = env();
+    const h = buildHandlers(wired, s, () => undefined, () => undefined);
+    await expect(h['update:check']!()).rejects.toThrow(/not available/);
+    wired.checkForUpdates = async () => {
+      calls.push(1);
+      return status;
+    };
+    expect(await h['update:check']!()).toEqual(status);
+    expect(calls).toHaveLength(1);
+  });
+
   it('--self-check writes the report next to the logs and returns the exit code', async () => {
     const e = env();
     const out: string[] = [];
