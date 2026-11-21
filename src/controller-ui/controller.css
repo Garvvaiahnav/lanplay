@@ -69,7 +69,7 @@ button {
 
 .noscript {
   margin: 24px;
-  font-size: 18px;
+  font-size: 17px;
 }
 
 /* ---- Field and controls ----------------------------------------------------------------------------------------- */
@@ -103,7 +103,7 @@ button {
   border: 1.5px solid var(--edge);
   background: var(--fill);
   color: var(--text);
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: 0.02em;
   line-height: 1;
   /* Releasing fades out; pressing is instant (the .is-down rule below has no transition). */
@@ -120,7 +120,7 @@ button {
 }
 
 .shape-rect {
-  border-radius: calc(var(--u) * 1.6);
+  border-radius: 6px;
 }
 
 .shape-pill {
@@ -230,22 +230,22 @@ button {
 
 .arm-up {
   grid-area: 1 / 2;
-  border-radius: 10px 10px 0 0;
+  border-radius: 8px 8px 0 0;
 }
 
 .arm-down {
   grid-area: 3 / 2;
-  border-radius: 0 0 10px 10px;
+  border-radius: 0 0 8px 8px;
 }
 
 .arm-left {
   grid-area: 2 / 1;
-  border-radius: 10px 0 0 10px;
+  border-radius: 8px 0 0 8px;
 }
 
 .arm-right {
   grid-area: 2 / 3;
-  border-radius: 0 10px 10px 0;
+  border-radius: 0 8px 8px 0;
 }
 
 .arm-up::before {
@@ -303,7 +303,7 @@ button {
 .done {
   position: fixed;
   z-index: 8;
-  top: max(2px, env(safe-area-inset-top));
+  top: max(4px, env(safe-area-inset-top));
   left: 50%;
   transform: translateX(-50%);
   margin: 0;
@@ -317,11 +317,10 @@ button {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 1px;
   width: 56px;
   height: 52px;
   border: 0;
-  border-radius: 14px;
+  border-radius: 8px;
   background: rgba(11, 13, 18, 0.55);
   color: var(--text);
 }
@@ -347,24 +346,30 @@ button {
 }
 
 .menu-label {
-  font-size: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
   line-height: 1;
   font-weight: 600;
   color: var(--muted);
 }
 
 .menu-dot {
-  color: var(--warn);
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--warn);
 }
 
 .menu[data-state="connected"] .menu-dot {
-  color: var(--ok);
+  background: var(--ok);
 }
 
 .menu[data-state="full"] .menu-dot,
 .menu[data-state="kicked"] .menu-dot,
 .menu[data-state="notoken"] .menu-dot {
-  color: var(--bad);
+  background: var(--bad);
 }
 
 /* Done replaces the gear in edit mode: big, high contrast, above everything. */
@@ -373,11 +378,11 @@ button {
   width: 108px;
   height: 52px;
   border: 0;
-  border-radius: 16px;
+  border-radius: 8px;
   background: var(--text);
   color: var(--bg);
-  font-size: 19px;
-  font-weight: 800;
+  font-size: 17px;
+  font-weight: 600;
 }
 
 /* Width and height are set from JS (rows of 44 pt plus padding, see cardHeight); a card taller than the screen scrolls. */
@@ -388,9 +393,9 @@ button {
   padding: 8px 12px;
   transform: translate(-50%, -50%);
   border: 1.5px solid var(--edge);
-  border-radius: 18px;
+  border-radius: 8px;
   background: rgba(21, 26, 38, 0.96);
-  font-size: 14px;
+  font-size: 15px;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -400,8 +405,8 @@ button {
 
 .card-title {
   margin: 0;
-  font-size: 14px;
-  font-weight: 700;
+  font-size: 15px;
+  font-weight: 600;
 }
 
 /* Every row is exactly 44 pt: the card's height is the sum of them. */
@@ -417,16 +422,30 @@ button {
   font-weight: 600;
 }
 
+/* A row with a label over a one-line fact (stay awake, home screen): 52 pt, see cardHeight. */
+.card-row.is-two {
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 0;
+  height: 52px;
+}
+
+.card-fact {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 /* A short error line over the bottom edge of the card's visible part, wherever it is scrolled to. */
 .card-msg {
   position: sticky;
   bottom: 0;
-  height: 14px;
-  margin: -14px 0 0;
+  height: 16px;
+  margin: -16px 0 0;
   padding: 0 4px;
   background: rgba(21, 26, 38, 0.96);
-  font-size: 11px;
-  line-height: 14px;
+  font-size: 13px;
+  line-height: 16px;
   color: var(--warn);
 }
 
@@ -436,7 +455,7 @@ button {
 
 .slots {
   display: flex;
-  gap: 6px;
+  gap: 4px;
 }
 
 .card-btn,
@@ -445,12 +464,12 @@ button {
   height: 44px;
   margin: 0;
   touch-action: pan-y; /* a finger that starts on a button can still scroll the card; a scroll cancels the tap */
-  padding: 0 10px;
+  padding: 0 12px;
   border: 1.5px solid var(--edge);
-  border-radius: 12px;
+  border-radius: 6px;
   background: var(--fill);
   font-size: 15px;
-  font-weight: 700;
+  font-weight: 600;
   cursor: pointer;
 }
 
@@ -494,7 +513,7 @@ button {
 .opts {
   display: flex;
   flex: 1;
-  gap: 6px;
+  gap: 4px;
 }
 
 .opt {
@@ -531,13 +550,13 @@ button {
   min-width: 0;
   height: 44px;
   margin: 0;
-  padding: 0 10px;
+  padding: 0 12px;
   border: 1.5px solid var(--edge);
-  border-radius: 12px;
+  border-radius: 6px;
   background: var(--fill);
   color: var(--text);
   font: inherit;
-  font-size: 16px;
+  font-size: 17px;
   -webkit-user-select: text;
   user-select: text;
   touch-action: manipulation;
@@ -547,7 +566,7 @@ button {
 .slider {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   height: 44px;
 }
 
@@ -579,21 +598,19 @@ button {
   position: absolute;
   left: 22px;
   right: 22px;
-  top: 50%;
+  top: calc(50% - 2px);
   height: 4px;
-  margin-top: -2px;
-  border-radius: 2px;
+  border-radius: 999px;
   background: var(--edge);
 }
 
 .slider-fill {
   position: absolute;
   left: 22px;
-  top: 50%;
+  top: calc(50% - 2px);
   width: calc((100% - 44px) * var(--p));
   height: 4px;
-  margin-top: -2px;
-  border-radius: 2px;
+  border-radius: 999px;
   background: var(--text);
 }
 
@@ -653,7 +670,7 @@ button {
   padding: 8px;
   transform: translate(-50%, -50%);
   border: 1.5px solid var(--edge);
-  border-radius: 14px;
+  border-radius: 8px;
   background: rgba(21, 26, 38, 0.96);
 }
 
@@ -665,15 +682,15 @@ button {
   width: 280px;
   height: 72px;
   border: 1.5px solid var(--edge);
-  border-radius: 12px;
+  border-radius: 6px;
   background: var(--fill);
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .diag-out {
   margin: 0;
   max-width: 280px;
-  font-size: 12px;
+  font-size: 13px;
   line-height: 1.4;
   white-space: pre-line;
   color: var(--muted);
@@ -688,10 +705,10 @@ button {
   width: 48px;
   height: 48px;
   border: 1.5px solid var(--edge);
-  border-radius: 12px;
+  border-radius: 6px;
   background: var(--fill);
-  font-size: 18px;
-  font-weight: 700;
+  font-size: 17px;
+  font-weight: 600;
 }
 
 /* ---- Overlays --------------------------------------------------------------------------------------------------- */
@@ -704,7 +721,7 @@ button {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 14px;
+  gap: 12px;
   padding: 24px;
   background: var(--bg);
   text-align: center;
@@ -714,14 +731,14 @@ button {
   margin: 0;
   max-width: 28ch;
   font-size: 22px;
-  font-weight: 700;
+  font-weight: 600;
   line-height: 1.3;
 }
 
 .overlay-sub {
   margin: 0;
   color: var(--muted);
-  font-size: 16px;
+  font-size: 15px;
 }
 
 .action {
@@ -729,12 +746,18 @@ button {
   min-height: 52px;
   padding: 0 24px;
   border: 0;
-  border-radius: 26px;
+  border-radius: 999px;
   background: var(--text);
   color: var(--bg);
   font-size: 17px;
-  font-weight: 700;
+  font-weight: 600;
   cursor: pointer;
+}
+
+.action.quiet {
+  border: 1.5px solid var(--edge);
+  background: transparent;
+  color: var(--text);
 }
 
 .rotate-overlay {
@@ -747,7 +770,7 @@ button {
 .sheet {
   z-index: 60;
   justify-content: flex-start;
-  gap: 10px;
+  gap: 8px;
   padding: max(16px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -764,14 +787,14 @@ button {
 
 .sheet .overlay-sub {
   max-width: 52ch;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .sheet-steps {
   margin: 0;
   padding-left: 1.3em;
   text-align: left;
-  font-size: 18px;
+  font-size: 17px;
   line-height: 1.6;
 }
 
@@ -796,29 +819,41 @@ button {
   width: 44px;
   height: 76px;
   border: 4px solid var(--text);
-  border-radius: 10px;
-  animation: turn 2.4s ease-in-out infinite;
-}
-
-@keyframes turn {
-  0%,
-  25% {
-    transform: rotate(0deg);
-  }
-  65%,
-  100% {
-    transform: rotate(90deg);
-  }
+  border-radius: 6px;
+  transform: rotate(90deg);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .phone-icon {
-    animation: none;
-    transform: rotate(90deg);
-  }
-
   .key,
   .arm {
     transition: none;
   }
+}
+
+/* The player number on connect and on re-attach. */
+.slot-toast {
+  position: fixed;
+  z-index: 9;
+  left: 50%;
+  top: 50%;
+  margin: 0;
+  padding: 12px 24px;
+  transform: translate(-50%, -50%);
+  border-radius: 8px;
+  background: rgba(21, 26, 38, 0.96);
+  font-size: 22px;
+  font-weight: 600;
+  pointer-events: none;
+}
+
+/* The wake-lock fallback: a muted video that must be rendered, kept out of sight and out of the way of fingers. */
+.wake-video {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  z-index: 0;
+  width: 4px;
+  height: 4px;
+  opacity: 0.01;
+  pointer-events: none;
 }

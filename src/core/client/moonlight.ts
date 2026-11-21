@@ -3,9 +3,9 @@
 import { execFile, spawn } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
-import { MOONLIGHT } from '../../contracts.js';
+import { MOONLIGHT, SUNSHINE } from '../../contracts.js';
 import { MOONLIGHT_WIN } from './platform.js';
-import type { CreateMoonlightRunner, ExecResult, MoonlightProcessHandle, MoonlightRunner, MoonlightRunnerOptions, MoonlightStreamArgsInput, ResolvedCodec } from '../../contracts.js';
+import type { CreateMoonlightRunner, ExecResult, HostInfo, MoonlightProcessHandle, MoonlightRunner, MoonlightRunnerOptions, MoonlightStreamArgsInput, ResolvedCodec } from '../../contracts.js';
 import { tail } from '../shared/exec.js';
 
 const F = MOONLIGHT.streamFlags;
@@ -13,11 +13,31 @@ const F = MOONLIGHT.streamFlags;
 /** --video-codec values are case-sensitive keys of m_VideoCodecMap (commandlineparser.cpp#L308-L313). */
 export const CODEC_FLAG_VALUE: Record<ResolvedCodec, string> = { h264: 'H.264', hevc: 'HEVC', av1: 'AV1' };
 
-/** Host argument must be an IP literal: a leading "-" would be read as an option. */
+/**
+ * Host argument: an IP literal, optionally with a port ("1.2.3.4:47989", "[2001:db8::1]:47989"). Names and anything that could
+ * be read as an option are refused. D11: bundled Moonlight 6.2.0 accepts ip:port for list, pair and stream (checked against a
+ * local fake Sunshine on a non-default port), so a port is passed through.
+ */
 export function assertHostArg(host: string): string {
   const h = String(host ?? '').trim();
-  if (!net.isIP(h)) throw new Error(`Moonlight host must be an IP address, got "${h}"`);
-  return h;
+  if (net.isIP(h)) return h;
+  const v4 = /^([0-9.]+):(\d{1,5})$/.exec(h);
+  if (v4 && net.isIPv4(v4[1]!) && validPort(v4[2]!)) return h;
+  const v6 = /^\[([0-9a-fA-F:.]+)\]:(\d{1,5})$/.exec(h);
+  if (v6 && net.isIPv6(v6[1]!) && validPort(v6[2]!)) return h;
+  throw new Error(`Moonlight host must be an IP address (optionally with :port), got "${h}"`);
+}
+
+function validPort(p: string): boolean {
+  const n = Number(p);
+  return n >= 1 && n <= 65535;
+}
+
+/** What to hand Moonlight for a host: the plain address, plus the port only for an internet host on a non-default port. */
+export function moonlightTarget(host: Pick<HostInfo, 'preferredAddress' | 'httpPort' | 'remote'>): string {
+  const ip = host.preferredAddress;
+  if (!host.remote || !host.httpPort || host.httpPort === SUNSHINE.httpPort) return ip;
+  return net.isIPv6(ip) ? `[${ip}]:${host.httpPort}` : `${ip}:${host.httpPort}`;
 }
 
 export function buildStreamArgs(input: MoonlightStreamArgsInput): string[] {

@@ -11,9 +11,10 @@
  *   4. the test hook
  *
  * Design notes
- *  - Layouts live on the HOST (per phone IP). The page loads them with GET /api/layouts, edits a local copy, and saves the whole
- *    store with ONE PUT /api/layouts when the user taps Done. The phone keeps only the player-name digits and a "home screen
- *    sheet was shown" flag (both through storageGet/storageSet, which survive blocked storage).
+ *  - Layouts live on the HOST (per phone id). The page loads them with GET /api/layouts, edits a local copy, and saves the whole
+ *    store with ONE PUT /api/layouts when the user taps Done. The phone keeps only its random id (sent in hello, so the host can
+ *    give the same slot and layouts back after a reconnect), the player-name digits, the haptic strength and a "home screen
+ *    sheet was shown" flag (all through storageGet/storageSet, which survive blocked storage).
  *  - Input first: a pointer event updates the held state and sends the frame from inside the handler; painting happens after, with
  *    transforms only, and no layout is read while a finger is down (geometry is measured on resize, not on touch).
  *  - There is no animation-frame loop: Safari drops rAF to 30 fps in Low Power Mode. Sends are event-driven with timers only for
@@ -30,7 +31,13 @@
  *    UNVERIFIED on a real iPhone: ?diag=1 has a test switch that shows whether and when the click arrives.
  *  - Home screen: iOS Safari that is not running standalone gets a one-time "Add to Home Screen" sheet and a permanent row in the
  *    settings card (full screen, no address bar). Android Chrome's beforeinstallprompt, when it fires, backs the same row.
- *  - Nothing is logged: the page URL carries the session token.
+ *  - Link health: once welcomed, a {"t":"p","n":N} goes out every second and the host echoes it. The echo gives the round trip shown
+ *    in the settings card. No echo for 2 s means the link is dead (Wi-Fi gone, TCP still "open"): the socket is dropped and a new
+ *    one opened at once, which the host matches to the old slot by the phone id. The slot number is shown for 1.5 s on every welcome.
+ *  - Android Chrome: the first tap asks for full screen (navigationUI hidden), then locks landscape, and takes a screen wake lock;
+ *    where navigator.wakeLock is missing (plain http) a muted looping 2 x 2 video does the same job. Every one of these APIs is
+ *    optional: the page plays the same without them. iOS has none of the first two and keeps its own behaviour.
+ *  - Nothing is logged: the page URL carries the link token.
  */
 (() => {
   'use strict';
@@ -155,6 +162,12 @@
   const STICK_SEND_MS = 8; // at most one stick frame per 8 ms, plus a trailing one
   const HARD_SEND_GAP_MS = 1000 / 240; // never more than 240 frames per second
   const KEEPALIVE_MS = 500;
+  const PING_MS = 1000; // a link probe every second while welcomed
+  const PING_DEAD_MS = 2000; // no echo for this long: the link is dead
+  const CONNECT_MS = 4000; // a socket that is neither open nor welcomed after this long is abandoned
+  const RTT_WARN_MS = 40; // the dot goes amber above this median round trip
+  const RTT_SAMPLES = 5;
+  const SLOT_TOAST_MS = 1500;
   const RECONNECT_BASE_MS = 500;
   const RECONNECT_MAX_MS = 5000;
   const SAVE_RETRY_MS = 5000;
@@ -163,6 +176,11 @@
   const WS_OPEN = 1;
   const NAME_KEY = 'lanplay.pad.number';
   const HOME_SEEN_KEY = 'lanplay.home.seen';
+  const ID_KEY = 'lanplay.pad.id';
+  const HAPTIC_KEY = 'lanplay.haptic.strength';
+  const ID_CHARS = 24;
+  const ID_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-'; // 64 symbols: a byte maps without bias
+  const HAPTIC_MS = { light: 10, strong: 25 } as const;
   const TURBO_HALF_MS = 50; // rapid fire: 50 ms down, 50 ms up (10 presses a second)
   const CONFIRM_MS = 2000; // a second tap on Delete within this long confirms it
   const FLOATING_ZONE = 1.5; // a floating stick's touch area is this many times its base size (the CSS base is 1 / 1.5 of it)
@@ -173,6 +191,7 @@
   const DEADZONE_RANGE = { min: 0, max: 0.5 } as const;
   // The card is 44 pt rows inside 8 pt padding and a 1.5 pt border; its height is worked out from the rows, not measured (see cardHeight).
   const ROW_H = 44;
+  const ROW_TWO_H = 52; // a label over a one-line fact
   const CARD_PAD = 19;
   const CARD_W = { settings: 300, control: 280, more: 328 } as const; // the wide one fits six 44 pt chips in a row
   const CHOICE_COLS = 6;
@@ -194,8 +213,12 @@
     x: number;
     y: number;
   }
-  type Phase = 'notoken' | 'connecting' | 'connected' | 'retrying' | 'full' | 'kicked';
-  type ServerMessage = { t: 'welcome'; slot: number } | { t: 'full' } | { t: 'kicked' };
+  type Phase = 'notoken' | 'connecting' | 'connected' | 'retrying' | 'full' | 'kicked' | 'replaced';
+  /** Phases that end the reconnect loop: the page waits for the user (full, replaced) or for the host (kicked). */
+  const isFinal = (p: Phase): boolean => p === 'full' || p === 'kicked' || p === 'replaced';
+  /** Close reason the host sends when another page of the same phone (same phone id) took the slot: see protocol.ts. */
+  const REPLACED_REASON = 'replaced';
+  type ServerMessage = { t: 'welcome'; slot: number } | { t: 'full' } | { t: 'kicked' } | { t: 'p'; n: number };
 
   const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
   const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
@@ -503,7 +526,7 @@
   /** Height (px) of a wrapped choice row: a label line and `count` chips in rows of CHOICE_COLS. */
   function gridHeight(count: number): number {
     const lines = Math.max(1, Math.ceil(count / CHOICE_COLS));
-    return 24 + lines * ROW_H + (lines - 1) * 6;
+    return 24 + lines * ROW_H + (lines - 1) * 4;
   }
 
   /** The three ways a button can behave, as the "Mode" choice shows them (latch wins if a stored button has both flags). */
@@ -787,6 +810,8 @@
     enabled(): boolean;
     /** Android sink: navigator.vibrate. */
     vibrate(ms: number): void;
+    /** Length of one press tick (10 when absent). */
+    tickMs?(): number;
     now(): number;
     setTimer(fn: () => void, ms: number): unknown;
     clearTimer(handle: unknown): void;
@@ -801,7 +826,7 @@
   }
 
   /**
-   * Android: a 10 ms vibrate per press and a pulse train that follows the stick pull. Everything else does nothing here: iOS has no
+   * Android: a vibrate per press (10 ms, 25 ms on Strong) and a pulse train that follows the stick pull. Everything else does nothing here: iOS has no
    * programmatic haptic any more (a script-made switch click or a timer is not a trusted gesture), its ticks are real touches on
    * the overlays. Never throws.
    */
@@ -855,7 +880,7 @@
     }
     return {
       tick(): void {
-        if (deps.mode === 'android' && deps.enabled()) safe(() => deps.vibrate(10));
+        if (deps.mode === 'android' && deps.enabled()) safe(() => deps.vibrate(deps.tickMs ? deps.tickMs() : 10));
       },
       setStick(d: number): void {
         if (deps.mode !== 'android') return;
@@ -882,15 +907,17 @@
 
   // ---- Add to Home Screen (pure) -----------------------------------------------------------------------------------------
 
-  type HomeMode = 'sheet' | 'prompt';
+  type HomeMode = 'sheet' | 'prompt' | 'steps';
   /**
-   * What the "Add to Home Screen" row does: 'prompt' calls the install prompt Chrome handed over, 'sheet' shows the steps (iOS has
-   * no API for it), null hides the row (already installed and running standalone, or nothing to offer).
+   * What the "Add to Home Screen" row does: 'prompt' calls the install prompt Chrome handed over (it needs https, so on a LAN
+   * address it does not come), 'sheet' shows the steps (iOS has no API for it), 'steps' is one line of text for Android Chrome,
+   * null hides the row (already installed and running standalone, or nothing to offer).
    */
   function homeScreenMode(ua: string, maxTouchPoints: number, standalone: boolean, hasPrompt: boolean): HomeMode | null {
     if (standalone) return null;
     if (hasPrompt) return 'prompt';
-    return isIosDevice(ua, maxTouchPoints) ? 'sheet' : null;
+    if (isIosDevice(ua, maxTouchPoints)) return 'sheet';
+    return /Android/i.test(ua) ? 'steps' : null;
   }
 
   // ---- Protocol helpers --------------------------------------------------------------------------------------------
@@ -934,25 +961,50 @@
         return { t: 'full' };
       case 'kicked':
         return { t: 'kicked' };
+      case 'p': {
+        const n = j['n'];
+        return typeof n === 'number' && Number.isSafeInteger(n) && n >= 0 ? { t: 'p', n } : null;
+      }
       default:
         return null;
     }
   }
+
+  /** A random phone id of ID_CHARS symbols from random bytes (at least ID_CHARS of them). */
+  function newPhoneId(bytes: ArrayLike<number>): string {
+    let out = '';
+    for (let i = 0; i < ID_CHARS; i++) out += ID_ALPHABET.charAt((bytes[i] ?? 0) & 63);
+    return out;
+  }
+  const isPhoneId = (v: unknown): v is string => typeof v === 'string' && /^[A-Za-z0-9_-]{16,32}$/.test(v);
+
+  /** Median of the newest round trips (ms); null before the first echo. One Wi-Fi hiccup does not move it. */
+  function medianRtt(samples: readonly number[]): number | null {
+    if (samples.length === 0) return null;
+    const sorted = [...samples].sort((a, b) => a - b);
+    return sorted[sorted.length >> 1] as number;
+  }
+  const linkText = (ms: number | null): string => 'Link: ' + (ms === null ? '...' : Math.max(0, Math.round(ms)) + ' ms');
+
+  type HapticLevel = 'light' | 'strong';
+  const hapticLevelOf = (v: string | null): HapticLevel => (v === 'strong' ? 'strong' : 'light');
 
   function statusText(phase: Phase, slot: number | null): string {
     switch (phase) {
       case 'notoken':
         return 'Open the link or QR code from the LanPlay host screen';
       case 'connecting':
-        return 'Connecting…';
+        return 'Connecting...';
       case 'connected':
         return slot === null ? 'Connected' : 'Player ' + slot;
       case 'retrying':
-        return 'Disconnected — retrying…';
+        return 'Disconnected — retrying...';
       case 'full':
         return 'All 4 player slots are taken';
       case 'kicked':
         return 'Removed from this PC';
+      case 'replaced':
+        return 'Open in another tab';
     }
   }
 
@@ -1043,6 +1095,10 @@
     const retryBtn = must('retry');
     const sheet = must('a2hs');
     const sheetClose = must('a2hs-close');
+    const fsOffer = must('fs-offer');
+    const fsGo = must('fs-go');
+    const fsSkip = must('fs-skip');
+    const slotToast = must('slot-toast');
 
     // Monotonic: a wall-clock step (NTP, manual time change) must not stall the send gap or the minimum-press timer.
     const now = (): number => performance.now();
@@ -1244,6 +1300,7 @@
       mode: hmode,
       enabled: () => !!store && activeLayout(store).haptics,
       vibrate: rawVibrate,
+      tickMs: () => HAPTIC_MS[hapticLevelOf(storageGet(HAPTIC_KEY))],
       now,
       setTimer: (fn, ms) => setTimeout(fn, ms),
       clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
@@ -1342,7 +1399,7 @@
 
     // ---- Play: pointer handling (state, then send, then paint, then haptics) ----
     function inputEnabled(): boolean {
-      return mode === 'play' && layoutState === 'ready' && !portrait && phase !== 'notoken' && phase !== 'full' && phase !== 'kicked';
+      return mode === 'play' && layoutState === 'ready' && !portrait && phase !== 'notoken' && !isFinal(phase);
     }
 
     function playDown(e: PointerEvent): void {
@@ -1651,13 +1708,96 @@
       return fresh;
     })();
     const name = playerName(ua, navigator.maxTouchPoints ?? 0, number);
+    /** Random, kept on the phone: the host gives this phone its slot and layouts back after a reconnect. Without storage it lasts until the page is reloaded. */
+    const phoneId = (() => {
+      const stored = storageGet(ID_KEY);
+      if (isPhoneId(stored)) return stored;
+      const bytes = new Uint8Array(ID_CHARS);
+      try {
+        crypto.getRandomValues(bytes);
+      } catch {
+        for (let i = 0; i < ID_CHARS; i++) bytes[i] = Math.floor(Math.random() * 256);
+      }
+      const fresh = newPhoneId(bytes);
+      storageSet(ID_KEY, fresh);
+      return fresh;
+    })();
+    const helloFrame = JSON.stringify({ t: 'hello', name, id: phoneId });
     let attempt = 0;
     let everDropped = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
+    // ---- Link health: a probe every second, the round trip, and the dead-link rule ----
+    let pingN = 0;
+    const pingSentAt = new Map<number, number>(); // probes sent and not echoed yet
+    let pingTimer: ReturnType<typeof setInterval> | null = null;
+    let deadTimer: ReturnType<typeof setTimeout> | null = null;
+    let connectTimer: ReturnType<typeof setTimeout> | null = null;
+    let rtts: number[] = [];
+    let rtt: number | null = null;
+    let slow = false;
+    /** The "Link: 6 ms" text of the open settings card; null while the card is not showing it. */
+    let linkEl: HTMLElement | null = null;
+    const paintLink = (): void => {
+      if (linkEl?.isConnected) linkEl.textContent = linkText(rtt);
+    };
+
+    function stopPing(): void {
+      if (pingTimer !== null) clearInterval(pingTimer);
+      if (deadTimer !== null) clearTimeout(deadTimer);
+      pingTimer = null;
+      deadTimer = null;
+      pingSentAt.clear();
+      rtts = [];
+      rtt = null;
+      slow = false;
+      paintLink();
+    }
+
+    /** Arm the dead-link timer for the oldest probe that has not been echoed. */
+    function armDead(sock: WebSocket): void {
+      if (deadTimer !== null) clearTimeout(deadTimer);
+      deadTimer = null;
+      let oldest = Infinity;
+      for (const at of pingSentAt.values()) oldest = Math.min(oldest, at);
+      if (oldest === Infinity) return;
+      deadTimer = setTimeout(() => {
+        deadTimer = null;
+        lost(sock, true);
+      }, Math.max(0, oldest + PING_DEAD_MS - now()));
+    }
+
+    function sendPing(sock: WebSocket): void {
+      if (sock !== ws || !welcomed || sock.readyState !== WS_OPEN) return;
+      pingN += 1;
+      try {
+        sock.send('{"t":"p","n":' + pingN + '}');
+      } catch {
+        return; // the close event follows
+      }
+      pingSentAt.set(pingN, now());
+      if (deadTimer === null) armDead(sock);
+    }
+
+    function onPong(sock: WebSocket, n: number): void {
+      const sentAt = pingSentAt.get(n);
+      if (sentAt === undefined) return;
+      for (const k of pingSentAt.keys()) if (k <= n) pingSentAt.delete(k); // the link is ordered: everything before n arrived too
+      armDead(sock);
+      rtts.push(Math.max(0, now() - sentAt));
+      if (rtts.length > RTT_SAMPLES) rtts.shift();
+      rtt = medianRtt(rtts);
+      paintLink();
+      const nowSlow = rtt !== null && rtt > RTT_WARN_MS;
+      if (nowSlow !== slow) {
+        slow = nowSlow;
+        render();
+      }
+    }
+
     /** green: playing; amber: connecting, retrying, or the last save has not reached the host; red: blocked. */
     function dotState(): string {
-      if (phase === 'connected' && unsaved) return 'retrying';
+      if (phase === 'connected' && (unsaved || slow)) return 'retrying';
       return phase;
     }
 
@@ -1666,11 +1806,12 @@
       menu.dataset['state'] = dotState();
       menuSlot.textContent = slot === null ? 'P?' : 'P' + slot;
       menu.setAttribute('aria-label', 'Menu, ' + text);
-      const blocked = phase === 'notoken' || phase === 'full' || phase === 'kicked';
+      const blocked = phase === 'notoken' || isFinal(phase);
       const layoutFailed = !blocked && layoutState === 'failed';
       noticeEl.hidden = !(blocked || layoutFailed);
       noticeText.textContent = blocked ? text : layoutFailed ? 'Cannot load your layout' : '';
-      retryBtn.hidden = !(phase === 'full' || layoutFailed);
+      retryBtn.hidden = !(phase === 'full' || phase === 'replaced' || layoutFailed);
+      retryBtn.textContent = phase === 'replaced' ? 'Reconnect' : 'Try again';
       menu.hidden = blocked || mode === 'edit';
       done.hidden = mode !== 'edit';
     }
@@ -1681,7 +1822,7 @@
     }
 
     function connect(): void {
-      if (destroyed || !token || phase === 'full' || phase === 'kicked') return;
+      if (destroyed || !token || isFinal(phase)) return;
       setPhase(everDropped ? 'retrying' : 'connecting');
       let sock: WebSocket;
       try {
@@ -1694,10 +1835,15 @@
       }
       ws = sock;
       welcomed = false;
+      if (connectTimer !== null) clearTimeout(connectTimer);
+      connectTimer = setTimeout(() => {
+        connectTimer = null;
+        if (!welcomed) lost(sock, false); // never opened, or opened and never answered: do not wait for the browser's own timeout
+      }, CONNECT_MS);
       sock.onopen = () => {
         if (sock !== ws) return;
         try {
-          sock.send(JSON.stringify({ t: 'hello', name }));
+          sock.send(helloFrame);
         } catch {
           /* the close event follows */
         }
@@ -1706,37 +1852,77 @@
         if (sock !== ws) return;
         const msg = parseServerMessage(ev.data);
         if (!msg) return;
-        if (msg.t === 'welcome') {
+        if (msg.t === 'p') {
+          if (welcomed) onPong(sock, msg.n);
+        } else if (msg.t === 'welcome') {
           welcomed = true;
           slot = msg.slot;
           attempt = 0;
           everDropped = false;
           lastSent = null;
+          if (connectTimer !== null) clearTimeout(connectTimer);
+          connectTimer = null;
+          stopPing();
+          pingTimer = setInterval(() => sendPing(sock), PING_MS);
+          sendPing(sock);
           setPhase('connected');
+          showSlot(msg.slot);
           flushNow();
           offerSheet();
           retrySave(); // the layout did not reach the host last time: try again now that we are back (not while editing)
         } else {
-          // 'full' and 'kicked' are final: no reconnect until the user asks (full) or the host re-adds the phone.
+          // 'full' and 'kicked' are final: no reconnect until the user asks (full) or the host re-adds the phone. ('replaced' arrives as a close reason.)
           releaseAll();
           setPhase(msg.t);
           sock.close();
         }
       };
-      sock.onclose = () => {
-        if (sock !== ws) return;
-        ws = null;
-        welcomed = false;
-        slot = null;
-        lastSent = null;
-        stopKeepalive();
-        releaseAll();
-        if (phase === 'full' || phase === 'kicked') return;
-        everDropped = true;
-        setPhase('retrying');
-        scheduleReconnect();
+      // Another page of this phone (a second tab) said hello with the same phone id and the host closed this socket: final, because
+      // reconnecting would take the slot back and the two pages would trade it forever. Only the user's Reconnect continues.
+      sock.onclose = (ev: CloseEvent) => {
+        if (sock === ws && ev && ev.reason === REPLACED_REASON) lost(sock, false, 'replaced');
+        else lost(sock, false);
       };
       // onerror needs no handling: a failed socket always fires close next.
+    }
+
+    /**
+     * The socket is gone, or must be treated as gone (no echo, no welcome): detach it first, so its own close event is ignored, then
+     * close it and come back. `atOnce` skips the backoff: a link that was healthy a moment ago is retried immediately.
+     */
+    function lost(sock: WebSocket, atOnce: boolean, final?: Phase): void {
+      if (sock !== ws) return;
+      ws = null;
+      welcomed = false;
+      slot = null;
+      lastSent = null;
+      stopKeepalive();
+      stopPing();
+      if (connectTimer !== null) clearTimeout(connectTimer);
+      connectTimer = null;
+      releaseAll();
+      try {
+        sock.close();
+      } catch {
+        /* already closed */
+      }
+      if (final) {
+        if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        setPhase(final);
+        return;
+      }
+      if (isFinal(phase)) return;
+      everDropped = true;
+      setPhase('retrying');
+      if (atOnce) {
+        if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        attempt = 0;
+        connect();
+      } else {
+        scheduleReconnect();
+      }
     }
 
     function scheduleReconnect(): void {
@@ -1749,10 +1935,17 @@
       }, delay);
     }
 
-    /** Come back to the foreground (or the network returned): do not wait out the backoff. */
-    function reconnectNow(): void {
-      if (destroyed || !token || phase === 'full' || phase === 'kicked' || welcomed) return;
-      if (ws && ws.readyState === 0) return; // an attempt is already in flight
+    /**
+     * Come back to the foreground (or the network returned): do not wait out the backoff. When the network has just returned, an
+     * attempt still in flight started while it was down, so it is replaced; coming back to the foreground leaves it alone.
+     */
+    function reconnectNow(networkBack = false): void {
+      if (destroyed || !token || isFinal(phase) || welcomed) return;
+      if (ws && ws.readyState === 0) {
+        if (!networkBack) return; // an attempt is already in flight
+        lost(ws, true);
+        return;
+      }
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       reconnectTimer = null;
       attempt = 0;
@@ -1768,7 +1961,7 @@
           init.headers = { 'Content-Type': 'application/json' };
           init.body = JSON.stringify(body);
         }
-        const res = await fetch(path + '?t=' + encodeURIComponent(token), init);
+        const res = await fetch(path + '?t=' + encodeURIComponent(token) + '&id=' + encodeURIComponent(phoneId), init); // the host files layouts under the phone id
         let parsed: unknown = null;
         try {
           parsed = await res.json();
@@ -1908,7 +2101,7 @@
     let drag: EditDrag | null = null;
 
     function enterEdit(): void {
-      if (mode === 'edit' || layoutState !== 'ready' || !store || phase === 'notoken' || phase === 'full' || phase === 'kicked') return;
+      if (mode === 'edit' || layoutState !== 'ready' || !store || phase === 'notoken' || isFinal(phase)) return;
       neutralise(); // the pad stays neutral while editing: only keepalives go out
       mode = 'edit';
       document.body.classList.add('editing');
@@ -2078,6 +2271,9 @@
     };
     /** Whether the "More" panel is open on the control card. It stays as the player left it until the page is reloaded. */
     let moreOpen = false;
+    /** Whether the settings card shows its Device rows (stay awake, full screen, home screen). */
+    let deviceOpen = false;
+    let wakeEl: HTMLElement | null = null;
 
     function placeCardNow(): void {
       const c = selectedId ? controls.get(selectedId) : undefined;
@@ -2408,20 +2604,73 @@
           },
         }),
       );
-      addRow(
-        makeToggle(
-          'Haptics',
-          () => !!store && activeLayout(store).haptics,
-          () => {
+      if (hmode === 'android') {
+        // Off is the layout's haptics flag (the host stores it); Light and Strong are how long a press vibrates, kept on this phone.
+        const level = hapticLevelOf(storageGet(HAPTIC_KEY));
+        const current: 'off' | HapticLevel = layout.haptics ? level : 'off';
+        addRow(
+          makeChoice('Haptics', [['off', 'Off'], ['light', 'Light'], ['strong', 'Strong']] as const, current, (v) => {
             if (!store) return;
-            const next = !activeLayout(store).haptics;
-            edit(setHaptics(store, next));
-            if (next) haptics.tick(); // one tick when it is switched on
-          },
-        ),
+            if (v === 'off') {
+              edit(setHaptics(store, false));
+            } else {
+              storageSet(HAPTIC_KEY, v);
+              edit(setHaptics(store, true));
+              haptics.tick(); // one tick of the chosen strength
+            }
+            showCard();
+          }),
+        );
+      } else {
+        addRow(
+          makeToggle(
+            'Haptics',
+            () => !!store && activeLayout(store).haptics,
+            () => {
+              if (!store) return;
+              const next = !activeLayout(store).haptics;
+              edit(setHaptics(store, next));
+              if (next) haptics.tick(); // one tick when it is switched on
+            },
+          ),
+        );
+      }
+      const device = el('div', 'card-row');
+      linkEl = el('span', 'card-label', linkText(rtt));
+      device.appendChild(linkEl);
+      const more = el('button', 'card-btn more', deviceOpen ? 'Less' : 'More');
+      more.type = 'button';
+      more.setAttribute('aria-expanded', deviceOpen ? 'true' : 'false');
+      tap(
+        more,
+        () => {
+          deviceOpen = !deviceOpen;
+          showCard();
+        },
+        false,
       );
+      device.appendChild(more);
+      addRow(device);
+      if (!deviceOpen) return;
+
+      const awakeRow = el('div', 'card-row is-two');
+      awakeRow.appendChild(el('span', 'card-label', 'Stay awake'));
+      wakeEl = el('span', 'card-fact', wakeText(awake));
+      awakeRow.appendChild(wakeEl);
+      addRow(awakeRow, ROW_TWO_H);
+      if (canFullscreen() && !inFullscreen()) {
+        const b = el('button', 'card-btn wide', 'Full screen');
+        b.type = 'button';
+        tap(b, () => void enterFullscreen(), false);
+        addRow(b);
+      }
       const home = homeMode();
-      if (home) {
+      if (home === 'steps') {
+        const row = el('div', 'card-row is-two');
+        row.appendChild(el('span', 'card-label', 'Add to Home screen'));
+        row.appendChild(el('span', 'card-fact', 'Chrome menu, then Add to Home screen'));
+        addRow(row, ROW_TWO_H);
+      } else if (home) {
         const b = el('button', 'card-btn wide', 'Add to Home Screen');
         b.type = 'button';
         tap(b, () => (home === 'prompt' ? promptInstall() : openSheet()), false);
@@ -2435,7 +2684,8 @@
     }
     let installPrompt: InstallPrompt | null = null; // Android Chrome hands it over when the page qualifies (it needs https)
     let sheetOffered = false;
-    const isStandalone = (): boolean => (navigator as { standalone?: boolean }).standalone === true || (typeof matchMedia === 'function' && matchMedia('(display-mode: standalone)').matches);
+    const displayMode = (m: string): boolean => typeof matchMedia === 'function' && matchMedia('(display-mode: ' + m + ')').matches;
+    const isStandalone = (): boolean => (navigator as { standalone?: boolean }).standalone === true || displayMode('standalone') || displayMode('fullscreen');
     const homeMode = (): HomeMode | null => homeScreenMode(ua, navigator.maxTouchPoints ?? 0, isStandalone(), installPrompt !== null);
 
     function openSheet(): void {
@@ -2477,6 +2727,150 @@
       },
       on,
     );
+
+    // ---- The player number on connect and on re-attach ----
+    let toastTimer: ReturnType<typeof setTimeout> | null = null;
+    function showSlot(n: number): void {
+      slotToast.textContent = 'Player ' + n;
+      slotToast.hidden = false;
+      if (toastTimer !== null) clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        toastTimer = null;
+        slotToast.hidden = true;
+      }, SLOT_TOAST_MS);
+    }
+
+    // ---- Full screen, landscape lock, stay awake: each one optional, started by the first tap (browsers want a gesture) ----
+    const root = document.documentElement;
+    /** Android Chrome and the like. iOS has no such API (an iPad that has one is left alone too), and an installed page is full screen already. */
+    const canFullscreen = (): boolean => typeof root.requestFullscreen === 'function' && !isIosDevice(ua, navigator.maxTouchPoints ?? 0) && !isStandalone();
+    const inFullscreen = (): boolean => document.fullscreenElement != null;
+    let wasFullscreen = false;
+
+    function lockLandscape(): void {
+      try {
+        const o = screen.orientation as (ScreenOrientation & { lock?: (o: string) => Promise<void> }) | undefined;
+        const p = o && typeof o.lock === 'function' ? o.lock('landscape') : undefined;
+        if (p && typeof p.catch === 'function') p.catch(() => undefined);
+      } catch {
+        /* no orientation lock here: the rotate overlay does its job */
+      }
+    }
+    async function enterFullscreen(): Promise<void> {
+      if (!canFullscreen() || inFullscreen()) return;
+      try {
+        await root.requestFullscreen({ navigationUI: 'hide' });
+      } catch {
+        return; // refused: the settings card still offers it
+      }
+      lockLandscape();
+    }
+    function hideFsOffer(): void {
+      fsOffer.hidden = true;
+    }
+    document.addEventListener(
+      'fullscreenchange',
+      () => {
+        const inFs = inFullscreen();
+        if (inFs) hideFsOffer();
+        else if (wasFullscreen && canFullscreen() && !destroyed) {
+          neutralise(); // the offer covers the field
+          fsOffer.hidden = false;
+        }
+        wasFullscreen = inFs;
+        if (mode === 'edit' && !selectedId) showCard();
+      },
+      on,
+    );
+
+    type Awake = 'idle' | 'lock' | 'video' | 'none';
+    interface WakeSentinel {
+      release?(): Promise<void>;
+      addEventListener?(type: string, fn: () => void): void;
+    }
+    let awake: Awake = 'idle';
+    let sentinel: WakeSentinel | null = null;
+    let wakeVideo: HTMLVideoElement | null = null;
+    let firstTapDone = false;
+    const wakeText = (a: Awake): string => (a === 'lock' ? 'Wake lock' : a === 'video' ? 'Muted video' : a === 'none' ? 'Not available: set Auto-Lock to Never' : 'Starts on your first tap');
+    const paintWake = (): void => {
+      if (wakeEl?.isConnected) wakeEl.textContent = wakeText(awake);
+    };
+
+    /** The 2 x 2 muted looping video that keeps the screen on where navigator.wakeLock is missing (plain http). */
+    async function startVideo(): Promise<void> {
+      try {
+        if (!wakeVideo) {
+          const v = document.createElement('video');
+          v.className = 'wake-video';
+          v.muted = true;
+          v.loop = true;
+          v.setAttribute('muted', '');
+          v.setAttribute('loop', '');
+          v.setAttribute('playsinline', '');
+          v.setAttribute('aria-hidden', 'true');
+          v.tabIndex = -1;
+          v.src = 'wake.mp4';
+          document.body.appendChild(v);
+          wakeVideo = v;
+        }
+        await wakeVideo.play();
+        awake = 'video';
+      } catch {
+        awake = 'none';
+      }
+      paintWake();
+    }
+    async function startAwake(): Promise<void> {
+      const wl = (navigator as Navigator & { wakeLock?: { request?(type: 'screen'): Promise<WakeSentinel> } }).wakeLock;
+      if (wl && typeof wl.request === 'function') {
+        try {
+          const sen = await wl.request('screen');
+          if (destroyed) {
+            void sen.release?.();
+            return;
+          }
+          sentinel = sen;
+          sen.addEventListener?.('release', () => {
+            if (sentinel !== sen) return;
+            sentinel = null;
+            if (awake === 'lock') awake = 'idle'; // the browser let go (page hidden): taken again when it is shown
+            paintWake();
+          });
+          awake = 'lock';
+          paintWake();
+          return;
+        } catch {
+          /* refused (not a secure context, low battery): the video does the same */
+        }
+      }
+      await startVideo();
+    }
+    /** The page is visible again: the browser released the lock and paused the video while it was hidden. */
+    function keepAwakeAgain(): void {
+      if (destroyed || !firstTapDone) return;
+      if (awake === 'idle') void startAwake();
+      else if (awake === 'video') void wakeVideo?.play().catch(() => undefined);
+    }
+    function onFirstTap(): void {
+      if (firstTapDone) return;
+      firstTapDone = true;
+      document.removeEventListener('pointerup', onFirstTap, true);
+      void enterFullscreen();
+      void startAwake();
+    }
+    document.addEventListener('pointerup', onFirstTap, { capture: true, signal: ac.signal });
+
+    // ---- Accidental back: one history entry that is put back whenever it is used up ----
+    const holdBack = (): void => {
+      try {
+        history.pushState(null, '', location.href);
+      } catch {
+        /* no history API: back leaves the page, as it did */
+      }
+    };
+    holdBack();
+    window.addEventListener('popstate', holdBack, on);
 
     // ---- Orientation ----
     const portraitQuery = typeof matchMedia === 'function' ? matchMedia('(orientation: portrait)') : null;
@@ -2580,13 +2974,16 @@
       'visibilitychange',
       () => {
         if (document.visibilityState === 'hidden') neutralise();
-        else reconnectNow();
+        else {
+          reconnectNow();
+          keepAwakeAgain();
+        }
       },
       on,
     );
     window.addEventListener('blur', neutralise, on);
     window.addEventListener('pagehide', neutralise, on);
-    window.addEventListener('online', reconnectNow, on);
+    window.addEventListener('online', () => reconnectNow(true), on);
     window.addEventListener('resize', onResize, on);
     window.addEventListener('orientationchange', onResize, on);
     window.visualViewport?.addEventListener('resize', onResize, on);
@@ -2600,8 +2997,13 @@
     tap(menu, enterEdit);
     tap(done, finishEdit);
     tap(sheetClose, closeSheet);
+    tap(fsGo, () => {
+      hideFsOffer();
+      void enterFullscreen();
+    });
+    tap(fsSkip, hideFsOffer);
     tap(retryBtn, () => {
-      if (phase === 'full') {
+      if (phase === 'full' || phase === 'replaced') {
         attempt = 0;
         everDropped = false;
         setPhase('connecting');
@@ -2624,7 +3026,10 @@
         ac.abort();
         observer?.disconnect();
         stopKeepalive();
-        for (const t of [reconnectTimer, sendTimer, retryTimer, confirmTimer]) if (t !== null) clearTimeout(t);
+        for (const t of [reconnectTimer, sendTimer, retryTimer, confirmTimer, toastTimer, connectTimer, deadTimer]) if (t !== null) clearTimeout(t);
+        if (pingTimer !== null) clearInterval(pingTimer);
+        void sentinel?.release?.();
+        wakeVideo?.remove();
         for (const t of pendingRelease.values()) clearTimeout(t);
         if (turboTimer !== null) clearInterval(turboTimer);
         haptics.stop();
@@ -2662,6 +3067,7 @@
       SENSITIVITY_RANGE,
       CARD_W,
       ROW_H,
+      ROW_TWO_H,
       CARD_PAD,
       DIM_RANGE,
       FLOATING_ZONE,
@@ -2724,6 +3130,18 @@
       wsUrl,
       parseServerMessage,
       statusText,
+      newPhoneId,
+      isPhoneId,
+      medianRtt,
+      linkText,
+      hapticLevelOf,
+      PING_MS,
+      PING_DEAD_MS,
+      CONNECT_MS,
+      RTT_WARN_MS,
+      SLOT_TOAST_MS,
+      ID_KEY,
+      HAPTIC_KEY,
       boot,
     });
   } else {

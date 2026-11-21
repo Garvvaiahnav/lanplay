@@ -5,6 +5,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { IPC_INVOKE_CHANNELS } from '../../src/contracts.js';
 import type { AppPaths, SelfCheckReport } from '../../src/contracts.js';
+import { cleanDeviceName } from '../../src/core/host/agent.js';
 import { collectDiagnostics, extractRecords, readTailText } from '../../src/core/diagnostics.js';
 import { createJsonlLogger } from '../../src/core/shared/logger.js';
 import { DefaultRedactor } from '../../src/core/shared/redact.js';
@@ -63,6 +64,65 @@ describe('IPC router', () => {
     expect(() => IPC_VALIDATORS['host:confirm-input']({ ok: 'yes' })).toThrow();
     expect(() => IPC_VALIDATORS['host:sunshine-restart']({ force: true })).toThrow();
     expect(IPC_VALIDATORS['host:sunshine-restart'](undefined)).toBeUndefined();
+  });
+});
+
+describe('internet and code-pairing validators', () => {
+  const id = '0123456789abcdef0123456789ABCDEF';
+  it('host:pending-pair accepts a 4-digit pin and a 32-hex id', () => {
+    expect(IPC_VALIDATORS['host:pending-pair']({ id, pin: '0042', name: 'Friend PC' })).toEqual({ id, pin: '0042', name: 'Friend PC' });
+  });
+  it('host:pending-pair rejects a pin that is not exactly 4 digits', () => {
+    for (const pin of ['123', '12345', 'abcd', '12 4', '١٢٣٤', '', 1234, null, undefined]) {
+      expect(() => IPC_VALIDATORS['host:pending-pair']({ id, pin, name: 'x' })).toThrow();
+    }
+  });
+  it('host:pending-pair and host:pending-reject reject a malformed id', () => {
+    for (const bad of ['', 'xyz', id.slice(1), id + '0', id.replace('0', 'g'), '../etc/passwd', 5, null]) {
+      expect(() => IPC_VALIDATORS['host:pending-pair']({ id: bad, pin: '1234', name: 'x' })).toThrow();
+      expect(() => IPC_VALIDATORS['host:pending-reject']({ id: bad })).toThrow();
+    }
+    expect(IPC_VALIDATORS['host:pending-reject']({ id })).toEqual({ id });
+  });
+  it('host:pending-pair limits the device name', () => {
+    expect(() => IPC_VALIDATORS['host:pending-pair']({ id, pin: '1234', name: '' })).toThrow();
+    expect(() => IPC_VALIDATORS['host:pending-pair']({ id, pin: '1234', name: '   ' })).toThrow();
+    expect(() => IPC_VALIDATORS['host:pending-pair']({ id, pin: '1234', name: 'a'.repeat(65) })).toThrow();
+    expect(() => IPC_VALIDATORS['host:pending-pair']({ id, pin: '1234', name: 'x<script>' })).toThrow();
+    expect(IPC_VALIDATORS['host:pending-pair']({ id, pin: '1234', name: 'a'.repeat(64) }).name).toHaveLength(64);
+    expect(() => IPC_VALIDATORS['host:pending-pair']('x')).toThrow();
+  });
+  it('host:pending-pair accepts exactly the names the agent keeps (64 code points after NFC, 128 bytes)', () => {
+    const v = IPC_VALIDATORS['host:pending-pair'];
+    const kept = (name: string) => cleanDeviceName(name) === name.normalize('NFC').replace(/\s+/g, ' ').trim();
+    // a letter outside the BMP is 2 UTF-16 units but 1 code point: 30 of them are 60 units and 120 bytes, a name the agent keeps
+    const astral = '\u{1D504}'.repeat(30);
+    expect(astral.length).toBe(60);
+    expect(kept(astral)).toBe(true);
+    expect(v({ id, pin: '1234', name: astral }).name).toBe(astral);
+    // 33 of them are 132 bytes: the agent falls back to its default name, so the validator refuses it too
+    expect(kept('\u{1D504}'.repeat(33))).toBe(false);
+    expect(() => v({ id, pin: '1234', name: '\u{1D504}'.repeat(33) })).toThrow();
+    // 66 UTF-16 units but 63 code points: the old unit count refused it
+    const mixed = 'a'.repeat(60) + '\u{1D504}'.repeat(3);
+    expect(mixed.length).toBeGreaterThan(64);
+    expect(kept(mixed)).toBe(true);
+    expect(v({ id, pin: '1234', name: mixed }).name).toBe(mixed);
+    // decomposed e + combining accent is 128 units before NFC and 64 code points after: the agent keeps it, so does the validator
+    const decomposed = 'e\u0301'.repeat(64);
+    expect(kept(decomposed)).toBe(true);
+    expect(v({ id, pin: '1234', name: decomposed }).name).toBe(decomposed);
+    expect(() => v({ id, pin: '1234', name: 'a'.repeat(65) })).toThrow();
+    expect(() => v({ id, pin: '1234', name: 'a'.repeat(257) })).toThrow();
+  });
+  it('host:internet-set needs a boolean; the no-argument channels take nothing', () => {
+    expect(IPC_VALIDATORS['host:internet-set']({ on: true })).toEqual({ on: true });
+    expect(() => IPC_VALIDATORS['host:internet-set']({ on: 'yes' })).toThrow();
+    expect(() => IPC_VALIDATORS['host:internet-set'](undefined)).toThrow();
+    for (const c of ['host:internet-get', 'host:pending-list', 'client:recent-remote'] as const) {
+      expect(IPC_VALIDATORS[c](undefined)).toBeUndefined();
+      expect(() => IPC_VALIDATORS[c]({ x: 1 } as never)).toThrow();
+    }
   });
 });
 

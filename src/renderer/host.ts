@@ -7,28 +7,32 @@ namespace LP.Host {
   /** Wording that differs per platform. Windows is the default until app:info says otherwise. */
   const WORDS = {
     win: {
-      nameTitle: 'This PC is called',
-      nameHint: 'The other computer finds this PC by itself. If it cannot, type this name or the IP address there.',
-      sunTitle: 'Sunshine',
-      sunHint: 'Windows will ask for permission once. This installs Sunshine, opens the firewall for your home network and starts it at login. If Sunshine was already installed, its web page login is replaced by one only LanPlay knows.',
-      pairHint: 'You can close this window: LanPlay keeps running in the background so the other computer can connect. To stop it completely, use File > Exit.',
+      thing: 'this PC',
+      nameTitle: 'This PC',
+      nameHint: 'If the other computer cannot find this PC, type this name or address there.',
+      sunHint: 'Setup asks Windows for permission once, installs Sunshine, opens the firewall for your home network, starts it at login and replaces an existing Sunshine web login.',
+      pairHint: 'Closing this window keeps LanPlay running in the background. To stop it, use File > Exit.',
       install: 'Install and set up',
       running: 'Setting up. Approve the Windows prompt if it appears.',
       ready: 'Setup finished. This PC is ready.',
+      applying: 'Applying. Approve the Windows prompt if it appears.',
     },
     mac: {
-      nameTitle: 'This Mac is called',
-      nameHint: 'The other computer finds this Mac by itself. If it cannot, type this name or the IP address there.',
-      sunTitle: 'Set up this Mac',
-      sunHint: 'This installs a copy of Sunshine for LanPlay and starts it at login. macOS then asks you to let Sunshine record the screen (Screen Recording) and control the keyboard and mouse (Accessibility). The buttons for both appear below.',
-      pairHint: 'You can close this window: LanPlay keeps running in the background so the other computer can connect. To stop it completely, choose LanPlay > Quit LanPlay.',
+      thing: 'this Mac',
+      nameTitle: 'This Mac',
+      nameHint: 'If the other computer cannot find this Mac, type this name or address there.',
+      sunHint: 'Setup installs a copy of Sunshine, starts it at login and then asks you to allow Screen Recording and Accessibility.',
+      pairHint: 'Closing this window keeps LanPlay running in the background. To stop it, choose LanPlay > Quit LanPlay.',
       install: 'Set up this Mac',
       running: 'Setting up. macOS may say "Background items added": that is Sunshine and LanPlay starting at login.',
       ready: 'Setup finished. This Mac is ready.',
+      applying: 'Applying...',
     },
   } as const;
   /** How often to re-read the setup status while a permission is being granted in System Settings. */
   const GRANT_POLL_MS = 2000;
+  /** How often to look for devices that started pairing (Sunshine has no push for it) while the window is visible. */
+  const PENDING_POLL_MS = 3000;
 
   export function mount(root: HTMLElement, api: T.Api, opts: { onSwitchMode?: () => void; switchLabel?: string } = {}): Handle {
     let info: T.AppInfo | null = null;
@@ -50,6 +54,14 @@ namespace LP.Host {
     let pollTimer: ReturnType<typeof setInterval> | undefined;
     let pollBusy = false;
     let restartBusy = false;
+    let inet: T.InternetHostState | null = null;
+    let netBusy = false;
+    let pending: T.PendingCodePairing[] = [];
+    const pins = new Map<string, string>();
+    const rowBusy = new Set<string>();
+    const rowMsg = new Map<string, string>();
+    let pendingSig = '';
+    let pendingTimer: ReturnType<typeof setInterval> | undefined;
     const unsubs: Array<() => void> = [];
 
     const msg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -62,6 +74,7 @@ namespace LP.Host {
     const noteEl = h('p', { class: 'status', role: 'status', 'aria-live': 'polite' });
     const hostNameEl = h('code', { class: 'copyable' }, '...');
     const copyNameBtn = h('button', { type: 'button', class: 'btn ghost' }, 'Copy');
+    const addressEl = h('p', { class: 'hint' });
     const sunshineEl = h('ul', { class: 'chips', 'aria-label': 'Sunshine status' });
     const setupBtn = h('button', { type: 'button', class: 'btn primary' }, 'Set up / Repair');
     const stepsEl = h('ol', { class: 'steps', 'aria-label': 'Setup steps' });
@@ -77,8 +90,22 @@ namespace LP.Host {
       });
     });
     const agentLine = h('p', { class: 'hint' });
-    const pendingEl = h('ul', { class: 'list', 'aria-label': 'Waiting for approval' });
+    const approvalsEl = h('ul', { class: 'list', 'aria-label': 'Waiting for approval' });
     const devicesEl = h('ul', { class: 'list', 'aria-label': 'Paired devices' });
+    const codesEl = h('ul', { class: 'list', 'aria-label': 'Devices waiting for a code' });
+    const netSwitch = Dom.toggle('Allow connections from the internet', (on) => void setInternet(on));
+    const netOffBtn = h('button', { type: 'button', class: 'btn', onClick: () => void setInternet(false) }, 'Switch off');
+    const netBanner = h('div', { class: 'notice', role: 'status', hidden: true }, h('span', null, 'Internet play is on. Switch it off when you are not playing.'), netOffBtn);
+    const netExposure = h('div', { class: 'warn-lines' });
+    const netError = h('p', { class: 'hint err', role: 'status', 'aria-live': 'polite', hidden: true });
+    const netForward = h('p', null);
+    const netPorts = h('table', { class: 'ports', 'aria-label': 'Ports to forward' },
+      h('thead', null, h('tr', null, h('th', { scope: 'col' }, 'Protocol'), h('th', { scope: 'col' }, 'Ports'), h('th', { scope: 'col' }, 'Use'))),
+      h('tbody', null, ...Model.INTERNET_PORTS.map((r) => h('tr', null, h('td', null, r.protocol), h('td', null, r.ports), h('td', null, r.use)))));
+    const netNever = h('p', { class: 'hint' }, 'Never forward ' + Model.INTERNET_NEVER_PORTS + '.');
+    const netIpv6 = h('div', { class: 'ipv6' });
+    const netFacts = h('p', { class: 'hint' }, 'If your router shows a WAN address that differs from your public IP, your provider uses CGNAT and IPv4 hosting cannot work. Players x bitrate x 1.12 must stay under 70% of your upload speed.');
+    const netBody = h('div', { class: 'net-body', hidden: true }, netForward, netPorts, netNever, netIpv6, netFacts);
     const padSwitch = Dom.toggle('Let phones act as game controllers', (on) => {
       api.invoke('host:controllers-set-enabled', { on }).then(setCtl, (e: unknown) => {
         padSwitch.set(!on);
@@ -90,33 +117,34 @@ namespace LP.Host {
     const padLinksEl = h('div', { class: 'pad-links', 'aria-label': 'Phone controller links' });
     const padPlayersEl = h('ul', { class: 'list', 'aria-label': 'Connected phones' });
     const padNewLinkBtn = h('button', { type: 'button', class: 'btn' }, 'New link');
+    const padRow = h('div', { class: 'row' }, padDriverBtn, padNewLinkBtn);
     const checkBtn = h('button', { type: 'button', class: 'btn' }, 'Run self-check');
     const checkEl = h('ol', { class: 'steps', 'aria-label': 'Self-check results' });
     const diagBtn = h('button', { type: 'button', class: 'btn' }, 'Copy diagnostics');
     const diagEl = h('p', { class: 'hint', role: 'status', 'aria-live': 'polite' });
 
     // The headings that read differently per platform are kept so render() can reword them.
-    const nameTitle = h('h2', { id: 'h-name' }, 'This PC is called');
+    const nameTitle = h('h2', { id: 'h-name' }, 'This PC');
     const nameHint = h('p', { class: 'hint' });
-    const sunTitle = h('h2', { id: 'h-sun' }, 'Sunshine');
     const pairHint = h('p', { class: 'hint' });
     const card = (id: string, title: string | HTMLElement, ...kids: Dom.Child[]): HTMLElement =>
       h('section', { class: 'card', 'aria-labelledby': id }, typeof title === 'string' ? h('h2', { id }, title) : title, ...kids);
     const padCard = card('h-pad', 'Phone controllers', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Let phones act as game controllers'), padSwitch.el), padLine,
-      h('div', { class: 'row' }, padDriverBtn, padNewLinkBtn), padLinksEl, padPlayersEl,
-      h('p', { class: 'hint' }, 'Open the link on each phone (same Wi-Fi) or scan the code. Each phone becomes its own Xbox controller on this PC. On the phone, tap Edit to move buttons, change sensitivity and save layouts; they are kept on this PC. "New link" stops old links from working.'));
+      padRow, padLinksEl, padPlayersEl,
+      h('p', { class: 'hint' }, 'Open the link on each phone on the same Wi-Fi, or scan the code.'));
 
     const screen = h('main', { class: 'screen' },
       h('header', { class: 'top' }, h('h1', null, 'LanPlay host'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, opts.switchLabel ?? 'Change mode') : null),
       noteEl,
-      card('h-name', nameTitle, h('div', { class: 'row' }, hostNameEl, copyNameBtn), nameHint),
-      card('h-sun', sunTitle, sunshineEl, h('div', { class: 'row' }, setupBtn), sunHint, updateBanner, adminWarn, stepsEl),
-      card('h-pair', 'Pairing', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Auto-approve devices on my network'), autoSwitch.el),
-        h('p', { class: 'hint' }, 'On: any computer on your home network can pair without a code. Off: you approve each one here.'), agentLine,
-        pairHint, pendingEl),
-      card('h-dev', 'Paired devices', devicesEl),
+      netBanner,
+      card('h-name', nameTitle, h('div', { class: 'row' }, hostNameEl, copyNameBtn), addressEl, nameHint, sunshineEl, h('div', { class: 'row' }, setupBtn), sunHint, updateBanner, adminWarn, stepsEl, pairHint),
+      card('h-dev', 'Devices', devicesEl,
+        h('h3', { id: 'h-codes' }, 'Add a device with a code'), codesEl,
+        h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Auto-approve devices on my network'), autoSwitch.el),
+        agentLine, approvalsEl),
+      card('h-net', 'Internet', h('div', { class: 'row between' }, h('span', { class: 'label' }, 'Allow connections from the internet'), netSwitch.el), netExposure, netError, netBody),
       padCard,
-      card('h-health', 'Health', h('div', { class: 'row' }, checkBtn, diagBtn), h('p', { class: 'hint' }, 'If something does not work, press Copy diagnostics and send the zip file.'), diagEl, checkEl));
+      card('h-health', 'Health', h('div', { class: 'row' }, checkBtn, diagBtn), diagEl, checkEl));
     Dom.setChildren(root, [screen]);
 
     function chip(label: string, state: boolean | null): HTMLElement {
@@ -144,7 +172,6 @@ namespace LP.Host {
       const w = mac ? WORDS.mac : WORDS.win;
       nameTitle.textContent = w.nameTitle;
       nameHint.textContent = w.nameHint;
-      sunTitle.textContent = w.sunTitle;
       sunHint.textContent = w.sunHint;
       pairHint.textContent = w.pairHint;
       padCard.hidden = mac; // the Mac has no virtual gamepad backend yet
@@ -152,16 +179,21 @@ namespace LP.Host {
       noteEl.className = 'status' + (noteIsError ? ' error-text' : '');
       hostNameEl.textContent = info?.hostName ?? '(unknown)';
       copyNameBtn.disabled = !info?.hostName;
+      const addrs = info?.localAddresses?.length ? info.localAddresses : inet?.lanAddresses ?? [];
+      addressEl.textContent = addrs.length ? 'Address: ' + addrs.join(', ') : '';
+      addressEl.hidden = addrs.length === 0;
       const sum = Model.sunshineSummary(status);
       // No "Administrator rights" chip: LanPlay should NOT be run as administrator (setup asks Windows once); a yellow
       // "no" there only invites people to do exactly that. Admin status is still recorded in self-check and diagnostics.
       Dom.setChildren(sunshineEl, [chip('Installed', sum.installed), chip('Running', sum.running)]);
       adminWarn.hidden = mac || status?.isAdmin !== true;
-      setupBtn.disabled = setupBusy;
+      setupBtn.disabled = setupBusy || netBusy;
       setupBtn.textContent = setupBusy ? 'Working...' : sum.installed ? 'Set up / Repair' : w.install;
-      // On a Mac the permission buttons must be there after a relaunch too, so the last stored run is shown, not only a live one.
-      const shown = mac && !setupBusy ? status?.steps ?? [] : setupBusy || live.length > 0 ? live : [];
+      // Steps show during a run, after a run that failed, and (Mac) while a permission or confirmation is still open.
+      const stored = mac && !setupBusy ? status?.steps ?? [] : live;
+      const shown = setupBusy || netBusy || stored.some((s) => s.status !== 'pass' && (mac || s.status === 'fail')) ? stored : [];
       Dom.setChildren(stepsEl, shown.map((s) => stepRow(s, mac)));
+      stepsEl.hidden = shown.length === 0;
       const update = mac ? Model.sunshineUpdate(status) : null;
       updateBanner.hidden = !update;
       if (update) updateText.textContent = 'Sunshine update ready. Version ' + update.bundled + ' is waiting; this Mac still runs ' + update.installed + '. Restarting Sunshine ends a stream that is running.';
@@ -169,7 +201,7 @@ namespace LP.Host {
       restartBtn.textContent = restartBusy ? 'Restarting...' : 'Restart Sunshine';
       autoSwitch.set(agent?.autoApprove ?? true);
       agentLine.textContent = agent ? (agent.listening ? 'Pair agent is listening on port ' + agent.port + '.' : 'Pair agent is not running.' + (agent.lastError ? ' ' + agent.lastError : '')) : '';
-      Dom.setChildren(pendingEl, (agent?.pending ?? []).map((p) =>
+      Dom.setChildren(approvalsEl, (agent?.pending ?? []).map((p) =>
         h('li', { class: 'item' }, h('span', { class: 'iname' }, p.clientName, h('span', { class: 'sub' }, p.remoteAddress)),
           h('button', { type: 'button', class: 'btn primary', onClick: () => decide(p.requestId, true) }, 'Approve'),
           h('button', { type: 'button', class: 'btn', onClick: () => decide(p.requestId, false) }, 'Deny'))));
@@ -178,6 +210,8 @@ namespace LP.Host {
         return h('li', { class: 'item' }, h('span', { class: 'iname' }, d.name, h('span', { class: 'sub' }, Model.deviceVia(d) + (d.lastAddress ? ', ' + d.lastAddress : ''))),
           h('button', { type: 'button', class: 'btn' + (sure ? ' danger' : ''), 'aria-label': (sure ? 'Confirm revoke ' : 'Revoke ') + d.name, onClick: () => revoke(d) }, sure ? 'Really revoke?' : 'Revoke'));
       }));
+      renderPending();
+      renderNet(mac, w);
       renderPad();
       checkBtn.disabled = checkBusy;
       checkBtn.textContent = checkBusy ? 'Checking...' : 'Run self-check';
@@ -186,6 +220,128 @@ namespace LP.Host {
       diagBtn.textContent = diagBusy ? 'Collecting...' : 'Copy diagnostics';
       Dom.setChildren(diagEl, diagPath ? ['Saved: ' + diagPath + ' ', h('button', { type: 'button', class: 'link', onClick: () => void reveal() }, 'Show file')] : []);
       syncPoll();
+    }
+
+    function renderNet(mac: boolean, w: { thing: string }): void {
+      const on = inet?.enabled === true;
+      if (!netBusy) netSwitch.set(on);
+      netSwitch.el.disabled = netBusy;
+      netOffBtn.disabled = netBusy;
+      netBanner.hidden = !on;
+      netBody.hidden = !on;
+      Dom.setChildren(netExposure, Model.exposureText(mac).map((l) => h('p', { class: 'warn-line' }, l)));
+      netError.hidden = !inet?.lastError;
+      netError.textContent = inet?.lastError ?? '';
+      const lan = inet?.lanAddresses ?? [];
+      Dom.setChildren(netForward, ['Forward these to ' + w.thing + (lan.length ? ' at ' : ''), lan.length ? h('code', { class: 'copyable' }, lan.join(', ')) : null, ', the same port outside and inside.']);
+      const v6 = inet?.globalIpv6 ?? [];
+      Dom.setChildren(netIpv6, v6.length ? [h('p', { class: 'label' }, 'Global IPv6'), h('ul', { class: 'list', 'aria-label': 'Global IPv6 addresses' }, ...v6.map((a) => h('li', null, h('code', { class: 'copyable' }, a))))] : []);
+      netIpv6.hidden = v6.length === 0;
+    }
+
+    async function setInternet(on: boolean): Promise<void> {
+      if (netBusy) return;
+      netBusy = true;
+      live = [];
+      say((isMac() ? WORDS.mac : WORDS.win).applying);
+      try {
+        inet = await api.invoke('host:internet-set', { on });
+        // Main answers with the real state: when the PC refused the change the switch is back where it was.
+        if (inet.enabled === on) say(on ? 'Internet play is on.' : 'Internet play is off.', false);
+        else say((inet.enabled ? 'Internet play is still on.' : 'Internet play is still off.') + (inet.lastError ? ' ' + inet.lastError : ''), true);
+      } catch (e) {
+        netSwitch.set(!on);
+        say('Could not change internet play: ' + msg(e), true);
+      } finally {
+        netBusy = false;
+        render();
+      }
+    }
+
+    function pendingSignature(): string {
+      return JSON.stringify([pending, [...rowBusy], [...rowMsg]]);
+    }
+
+    /** Rebuilt only when the list or a row's state changed, so a poll never wipes a code that is being typed. */
+    function renderPending(): void {
+      const sig = pendingSignature();
+      if (sig === pendingSig) return;
+      pendingSig = sig;
+      const active = document.activeElement;
+      const focusId = active instanceof HTMLInputElement && codesEl.contains(active) ? active.id : '';
+      Dom.setChildren(codesEl, pending.length === 0 ? [h('li', { class: 'empty' }, 'Nothing waiting for a code.')] : pending.map(pendingRow));
+      if (focusId) document.getElementById(focusId)?.focus();
+    }
+
+    function pendingRow(p: T.PendingCodePairing): HTMLElement {
+      const busy = rowBusy.has(p.id);
+      const pin = h('input', { type: 'text', id: 'pin-' + p.id.replace(/[^A-Za-z0-9_-]/g, '_'), class: 'text pin', inputmode: 'numeric', maxlength: 4, autocomplete: 'off', placeholder: '0000', 'aria-label': 'Code for ' + p.name, value: pins.get(p.id) ?? '', disabled: busy });
+      const pairBtn = h('button', { type: 'button', class: 'btn primary', disabled: busy || !Model.validPin(pins.get(p.id) ?? '') }, busy ? 'Pairing...' : 'Pair');
+      const submit = (): void => pairWithCode(p);
+      pin.addEventListener('input', () => {
+        const v = pin.value.replace(/\D/g, '').slice(0, 4);
+        if (v !== pin.value) pin.value = v;
+        pins.set(p.id, v);
+        pairBtn.disabled = !Model.validPin(v);
+      });
+      pin.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && Model.validPin(pins.get(p.id) ?? '')) submit();
+      });
+      pairBtn.addEventListener('click', submit);
+      const msgText = rowMsg.get(p.id);
+      return h('li', { class: 'item' },
+        h('span', { class: 'iname' }, p.name, h('span', { class: 'sub' }, p.address)),
+        p.remote ? h('span', { class: 'badge tag' }, 'Internet') : null,
+        pin, pairBtn,
+        h('button', { type: 'button', class: 'btn', disabled: busy, 'aria-label': 'Reject ' + p.name, onClick: () => rejectPending(p) }, 'Reject'),
+        msgText ? h('span', { class: 'smsg err', role: 'alert' }, msgText) : null);
+    }
+
+    function pairWithCode(p: T.PendingCodePairing): void {
+      const pin = pins.get(p.id) ?? '';
+      if (!Model.validPin(pin) || rowBusy.has(p.id)) return;
+      rowBusy.add(p.id);
+      rowMsg.delete(p.id);
+      render();
+      api.invoke('host:pending-pair', { id: p.id, pin, name: p.name }).then(
+        (r) => {
+          rowBusy.delete(p.id);
+          pending = r.pending;
+          devices = r.devices;
+          pins.delete(p.id);
+          if (r.ok) say(p.name + ' is paired.');
+          else rowMsg.set(p.id, r.message ?? 'That code did not work.');
+          render();
+        },
+        (e: unknown) => {
+          rowBusy.delete(p.id);
+          rowMsg.set(p.id, msg(e));
+          render();
+        },
+      );
+    }
+
+    function rejectPending(p: T.PendingCodePairing): void {
+      api.invoke('host:pending-reject', { id: p.id }).then(
+        (list) => {
+          pins.delete(p.id);
+          rowMsg.delete(p.id);
+          pending = list;
+          render();
+        },
+        (e: unknown) => say('Could not reject ' + p.name + ': ' + msg(e), true),
+      );
+    }
+
+    async function refreshPending(): Promise<void> {
+      try {
+        pending = await api.invoke('host:pending-list');
+        for (const id of [...pins.keys()]) if (!pending.some((p) => p.id === id)) pins.delete(id);
+        for (const id of [...rowMsg.keys()]) if (!pending.some((p) => p.id === id)) rowMsg.delete(id);
+        if (!destroyed) render();
+      } catch {
+        /* Sunshine may not be ready yet; the list stays as it was. */
+      }
     }
 
     function isMac(): boolean {
@@ -234,6 +390,7 @@ namespace LP.Host {
       padDriverBtn.disabled = ctl?.setupRunning === true;
       padDriverBtn.textContent = ctl?.setupRunning ? 'Installing...' : 'Install driver';
       padNewLinkBtn.hidden = !ctl?.running;
+      padRow.hidden = padDriverBtn.hidden && padNewLinkBtn.hidden;
       const lines: string[] = [];
       if (ctl?.error) lines.push(ctl.error);
       else if (needDriver) lines.push('The virtual controller driver (ViGEmBus) is not installed. Windows will ask for permission once.');
@@ -393,7 +550,12 @@ namespace LP.Host {
     }));
     unsubs.push(api.on('host:agent-state-changed', (a) => {
       agent = a;
-      if (a.pending.length > 0 || devices.length >= 0) void refreshDevices();
+      void refreshDevices();
+      void refreshPending();
+      render();
+    }));
+    unsubs.push(api.on('host:internet-changed', (s) => {
+      inet = s;
       render();
     }));
 
@@ -413,12 +575,18 @@ namespace LP.Host {
     api.invoke('host:setup-status').then((s) => { status = s; render(); }, (e: unknown) => say('Could not read setup status: ' + msg(e), true));
     api.invoke('host:agent-state').then(setAgent, () => undefined);
     api.invoke('host:controllers-state').then(setCtl, () => undefined);
+    api.invoke('host:internet-get').then((s) => { inet = s; render(); }, () => undefined);
     void refreshDevices();
+    void refreshPending();
+    pendingTimer = setInterval(() => {
+      if (!document.hidden) void refreshPending();
+    }, PENDING_POLL_MS);
 
     return {
       destroy() {
         destroyed = true;
         if (pollTimer !== undefined) clearInterval(pollTimer);
+        if (pendingTimer !== undefined) clearInterval(pendingTimer);
         if (confirmTimer) clearTimeout(confirmTimer);
         for (const u of unsubs) u();
         Dom.clear(root);

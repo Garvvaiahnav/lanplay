@@ -94,18 +94,23 @@ export const SUNSHINE = Object.freeze({
 /**
  * sunshine.conf keys LanPlay writes (merge, never clobber unknown keys). Format "key = value".
  * Sources: https://github.com/LizardByte/Sunshine/blob/v2026.914.233613/docs/configuration.md
- *  - origin_web_ui_allowed (#L1623): choices pc | lan | wan; "lan: Only LAN devices may access the web ui"
- *  - upnp (#L1499): default disabled. We pin it to disabled (LAN only, no port forwarding).
+ *  - origin_web_ui_allowed (#L1623): choices pc | lan | wan; "pc: Only localhost may access the web ui" (D09: LanPlay only calls 127.0.0.1)
+ *  - upnp (#L1499): default disabled. `enabled` only while the "Allow connections from the internet" switch is on (D08).
+ *  - address_family: `both` (IPv4 + IPv6) while the internet switch is on, `ipv4` otherwise (D08).
+ *    UNVERIFIED: the value names `enabled`/`disabled` and `both`/`ipv4` were not checked against the docs at the pinned tag.
  *  - hevc_mode (#L2094): "0 advertise support for HEVC based on encoder capabilities (recommended)"
  *  - av1_mode (#L2136): same 0..3 scheme as hevc_mode
  *  - encoder (#L2239): "Default: Sunshine will use the first encoder that is available." -> we do NOT write it (= auto)
  */
-export const SUNSHINE_MANAGED_CONFIG: Readonly<Record<string, string>> = Object.freeze({
-  origin_web_ui_allowed: 'lan',
-  upnp: 'disabled',
-  hevc_mode: '0',
-  av1_mode: '0',
-});
+export function sunshineManagedConfig(internet: boolean): Readonly<Record<string, string>> {
+  return Object.freeze({
+    origin_web_ui_allowed: 'pc',
+    upnp: internet ? 'enabled' : 'disabled',
+    address_family: internet ? 'both' : 'ipv4',
+    hevc_mode: '0',
+    av1_mode: '0',
+  });
+}
 
 /**
  * Sunshine REST endpoints we call (all on https://127.0.0.1:47990, Basic auth, JSON).
@@ -223,6 +228,8 @@ export const LANPLAY = Object.freeze({
   sunshineAdminUser: 'lanplay',
   /** Firewall rule display name for the agent (TCP+UDP 47920, remoteip=LocalSubnet). */
   agentFirewallRuleName: 'LanPlay Pair Agent',
+  /** Firewall rule display name for internet play (Windows only; created/removed by the `firewall-internet` step). */
+  internetFirewallRuleName: 'LanPlay Internet Play',
   /** Log file name pattern; <date> = YYYY-MM-DD (local time). Elevated helper writes "lanplay-<date>.elevated.log". */
   logFilePattern: 'lanplay-<date>.log',
   elevatedLogFilePattern: 'lanplay-<date>.elevated.log',
@@ -270,6 +277,8 @@ export interface HostInfo {
   paired?: boolean;
   /** ISO timestamp. */
   lastSeen: string;
+  /** True when the user typed an address that is not private (an internet host). Only `addManual` may set it; discovery never adds such a host. */
+  remote?: boolean;
 }
 
 export type ResolutionId = '1080p' | '1440p' | '4k';
@@ -278,15 +287,15 @@ export type CodecChoice = 'auto' | 'hevc' | 'av1' | 'h264';
 export type ResolvedCodec = Exclude<CodecChoice, 'auto'>;
 export type AudioConfig = 'stereo'; // v1 scope: stereo only
 export type DisplayMode = 'fullscreen' | 'borderless' | 'windowed';
-export type PresetId = 'lowest-latency' | 'balanced' | 'best-picture' | 'custom';
+export type PresetId = 'lowest-latency' | 'balanced' | 'best-picture' | 'internet' | 'custom';
 
-export const BITRATE_LIMITS_MBPS = Object.freeze({ min: 20, max: 150, advancedMax: 500, step: 5 } as const);
+export const BITRATE_LIMITS_MBPS = Object.freeze({ min: 5, max: 150, advancedMax: 500, step: 5 } as const);
 
 export interface StreamSettings {
   presetId: PresetId;
   resolution: ResolutionId;
   fps: FpsOption;
-  /** Integer Mbps. 20..150, or up to 500 when `advancedBitrate` is true. Passed to moonlight as Kbps (x1000). */
+  /** Integer Mbps. 5..150, or up to 500 when `advancedBitrate` is true. Passed to moonlight as Kbps (x1000). */
   bitrateMbps: number;
   advancedBitrate: boolean;
   codec: CodecChoice;
@@ -305,7 +314,7 @@ export interface Preset {
   settings: Omit<StreamSettings, 'presetId' | 'appName' | 'advancedBitrate' | 'audio'>;
 }
 
-/** Canonical presets. UI shows these three; any manual change flips presetId to 'custom'. */
+/** Canonical presets. UI shows these four; any manual change flips presetId to 'custom'. */
 export const PRESETS: readonly Preset[] = Object.freeze([
   {
     id: 'lowest-latency',
@@ -324,6 +333,12 @@ export const PRESETS: readonly Preset[] = Object.freeze([
     label: 'Best picture',
     description: '4K at 60 fps, high bitrate, V-Sync on.',
     settings: { resolution: '4k', fps: 60, bitrateMbps: 150, codec: 'auto', displayMode: 'fullscreen', vsync: true, framePacing: true },
+  },
+  {
+    id: 'internet',
+    label: 'Internet',
+    description: '1080p at 60 fps, 15 Mbps.',
+    settings: { resolution: '1080p', fps: 60, bitrateMbps: 15, codec: 'auto', displayMode: 'fullscreen', vsync: false, framePacing: true },
   },
 ] as const);
 
@@ -483,13 +498,14 @@ export type HostStepId =
   | 'locate-sunshine'
   | 'install-sunshine' // msiexec /i <msi> /qn /norestart /l*v <log>
   | 'service' // SunshineService exists, start=auto, running
-  | 'config' // SUNSHINE_MANAGED_CONFIG merged into sunshine.conf
+  | 'config' // sunshineManagedConfig() merged into sunshine.conf
   | 'credentials' // sunshine.exe --creds lanplay <random>; secret stored
   | 'restart-service'
   | 'web-ui' // 47990 listening, TLS cert == pinned cacert.pem fingerprint
   | 'api-auth' // GET /api/clients/list -> 200 with our creds
   | 'firewall-sunshine' // rule "Sunshine" present (re-add via netsh if missing)
   | 'firewall-agent' // rule "LanPlay Pair Agent" TCP+UDP 47920 LocalSubnet
+  | 'firewall-internet' // rule "LanPlay Internet Play" (TCP 47984,47989,48010 + UDP 47998-48000, RemoteAddress Any): created when the internet switch is on, removed when off
   | 'agent-autostart' // app.setLoginItemSettings({openAtLogin:true,args:['--agent']})
   | 'agent-listening'; // TCP 47920 accepts, GET /v1/info ok, UDP probe answered
 
@@ -505,6 +521,7 @@ export const HOST_STEP_ORDER: readonly HostStepId[] = Object.freeze([
   'api-auth',
   'firewall-sunshine',
   'firewall-agent',
+  'firewall-internet',
   'agent-autostart',
   'agent-listening',
 ] as const);
@@ -560,6 +577,7 @@ export type PsScriptName =
   | 'test-admin' // {isAdmin:boolean}
   | 'get-firewall-rules' // -Names <a>,<b> -> {rules:[{name,enabled,direction,action,protocol,localPort,remoteAddress,program}]}
   | 'set-agent-firewall-rule' // -Port 47920 -Name "LanPlay Pair Agent" (idempotent New/Set-NetFirewallRule)
+  | 'set-internet-firewall-rule' // ELEVATED child only: create or remove the LanPlay Internet Play rule (TCP 47984, 47989, 48010; UDP 47998-48000)
   | 'get-listeners' // -Ports 47984,... -> {listeners:[{port,protocol,pid,process}]}
   | 'get-system-info' // {os,build,gpus:[{name,driverVersion}],isAdmin,userName}
   | 'setup-controllers' // ELEVATED child only: -InstallerPath -Port -ResultFile [-Program]; installs ViGEmBus + firewall, writes the result JSON to -ResultFile
@@ -739,7 +757,7 @@ export interface PairedDevice {
   name: string;
   enabled: boolean;
   /** Known only for devices paired through LanPlay (agent keeps a small JSON ledger in %ProgramData%\LanPlay). */
-  pairedVia?: 'lanplay' | 'other';
+  pairedVia?: 'lanplay' | 'other' | 'code';
   pairedAt?: string;
   lastAddress?: string;
 }
@@ -762,6 +780,45 @@ export interface PairAgent {
   revoke(uuid: string): Promise<void>;
   /** Emits whenever state/pending changes (for IPC push). Returns unsubscribe. */
   onChange(cb: (s: AgentState) => void): () => void;
+  /** Local only (IPC), never reachable over the agent's HTTP port. Every pending Sunshine pairing (LAN and internet), each with the `remote` flag. */
+  listPending(): Promise<PendingCodePairing[]>;
+  /** Local only. The host owner typed the 4-digit code the device shows: submit it to Sunshine; on success write the ledger with pairedVia 'code'. */
+  pairWithCode(id: string, pin: string, name: string): Promise<CodePairResult>;
+  /** Local only. Cancel one pending pairing in Sunshine. */
+  rejectPending(id: string): Promise<PendingCodePairing[]>;
+}
+
+/** One pending Sunshine pairing as the host screen lists it ("Add a device with a code"). */
+export interface PendingCodePairing {
+  /** 32 hex chars (Sunshine pairing id). */
+  id: string;
+  /** Untrusted device name reported by Moonlight. */
+  name: string;
+  /** Address of the Moonlight client as Sunshine saw it. */
+  address: string;
+  /** True when `address` is not private (the device is on the internet). */
+  remote: boolean;
+}
+
+/** Answer to `pairWithCode`. A wrong code is `ok: false` with a sentence for the screen, never an exception. */
+export interface CodePairResult {
+  ok: boolean;
+  /** One sentence the screen shows as is when `ok` is false. */
+  message?: string;
+  /** The pending list after the attempt. */
+  pending: PendingCodePairing[];
+  /** The paired-devices list after the attempt. */
+  devices: PairedDevice[];
+}
+
+/** State of the host's "Allow connections from the internet" switch. */
+export interface InternetHostState {
+  enabled: boolean;
+  /** This PC's private IPv4 addresses (what a router forwards to). */
+  lanAddresses: string[];
+  /** This PC's global IPv6 addresses (for the IPv6 alternative). */
+  globalIpv6: string[];
+  lastError?: string;
 }
 
 export interface PairAgentOptions {
@@ -792,18 +849,21 @@ export type PairErrorCode =
   | 'moonlight-missing'
   | 'moonlight-failed'
   | 'verify-failed' // `Moonlight list` still says not paired
+  | 'code-timeout' // remote host: the host owner did not enter the code in 180 s
   | 'timeout';
 
 export type PairResult =
   | { ok: true; hostId: string; alreadyPaired: boolean; durationMs: number }
   | { ok: false; hostId: string; code: PairErrorCode; message: string; retryable: boolean; durationMs: number };
 
-export type PairPhase = 'checking' | 'starting-moonlight' | 'contacting-agent' | 'waiting-approval' | 'confirming' | 'verifying' | 'done';
+export type PairPhase = 'checking' | 'starting-moonlight' | 'contacting-agent' | 'waiting-approval' | 'show-code' | 'confirming' | 'verifying' | 'done';
 
 export interface PairProgress {
   hostId: string;
   phase: PairPhase;
   message: string;
+  /** Only with phase 'show-code': the 4-digit code the player reads out to the host owner. */
+  code?: string;
 }
 
 export interface MoonlightStreamArgsInput {
@@ -1003,6 +1063,8 @@ export interface HostSetupHandoff {
   sunshineAdminPassword: string;
   logDir: string;
   sharedData: string;
+  /** The "Allow connections from the internet" switch for this run (D07). Absent (an older parent) = false. */
+  internet?: boolean;
 }
 
 export interface HostSetupResult {
@@ -1088,7 +1150,7 @@ export interface ControllerPlayerView {
 export interface ControllerLink {
   /** This PC's home-network address the link uses. */
   address: string;
-  /** http://<address>:<port>/?t=<token>: contains the session token, show it only on the host screen. */
+  /** http://<address>:<port>/?t=<token>: contains the controller token, show it only on the host screen. */
   url: string;
   /** SVG QR code of the url as a data: URL (img-src allows data:). */
   qrDataUrl: string;
@@ -1139,10 +1201,18 @@ export interface IpcInvokeMap {
   'host:controllers-state': [void, ControllersState];
   'host:controllers-set-enabled': [{ on: boolean }, ControllersState];
   'host:controllers-kick': [{ id: string }, ControllersState];
-  /** New session token: old phone links stop working. */
+  /** New controller token: old phone links stop working. */
   'host:controllers-new-link': [void, ControllersState];
   /** Elevated (UAC): install the virtual-controller driver and open the LAN port. */
   'host:controllers-setup': [void, ControllersState];
+  'host:internet-get': [void, InternetHostState];
+  /** Elevated (UAC) Set up / Repair run with the switch on or off. */
+  'host:internet-set': [{ on: boolean }, InternetHostState];
+  'host:pending-list': [void, PendingCodePairing[]];
+  /** The host owner typed the code the device shows. `name` is the device name to store. */
+  'host:pending-pair': [{ id: string; pin: string; name: string }, CodePairResult];
+  'host:pending-reject': [{ id: string }, PendingCodePairing[]];
+  'client:recent-remote': [void, string[]];
   'selfcheck:run': [void, SelfCheckReport];
   'diagnostics:collect': [void, { zipPath: string; bytes: number }];
   /** Only accepts a zipPath previously returned by diagnostics:collect (main keeps the allow-list). */
@@ -1157,6 +1227,7 @@ export interface IpcEventMap {
   'host:setup-progress': StepRecord;
   'host:agent-state-changed': AgentState;
   'host:controllers-changed': ControllersState;
+  'host:internet-changed': InternetHostState;
 }
 
 export type IpcInvokeChannel = keyof IpcInvokeMap;
@@ -1193,6 +1264,12 @@ export const IPC_INVOKE_CHANNELS = Object.freeze([
   'host:controllers-kick',
   'host:controllers-new-link',
   'host:controllers-setup',
+  'host:internet-get',
+  'host:internet-set',
+  'host:pending-list',
+  'host:pending-pair',
+  'host:pending-reject',
+  'client:recent-remote',
   'selfcheck:run',
   'diagnostics:collect',
   'diagnostics:reveal',
@@ -1205,6 +1282,7 @@ export const IPC_EVENT_CHANNELS = Object.freeze([
   'host:setup-progress',
   'host:agent-state-changed',
   'host:controllers-changed',
+  'host:internet-changed',
 ] as const satisfies readonly IpcEventChannel[]);
 
 /** Every IPC reply is wrapped so errors cross the bridge as data (no stack traces / paths with secrets). */
@@ -1238,6 +1316,8 @@ export interface ClientService {
   startStream(hostId: string, settings: StreamSettings, onState: (s: StreamState) => void): Promise<StreamState>;
   stopStream(hostId: string): Promise<void>;
   selfCheck(): Promise<SelfCheckReport>;
+  /** The last 5 typed internet addresses (newest first), persisted as `client.recentRemote`. */
+  recentRemote(): string[];
 }
 
 export interface HostService {
@@ -1248,6 +1328,9 @@ export interface HostService {
   runElevatedSetup(handoffPath: string, resultPath: string): Promise<number>;
   agent: PairAgent;
   selfCheck(): Promise<SelfCheckReport>;
+  getInternet(): Promise<InternetHostState>;
+  /** Persists `host.internet`, then runs the elevated Set up / Repair (config, firewall-internet, Sunshine restart). */
+  setInternet(on: boolean, onProgress: (s: StepRecord) => void): Promise<InternetHostState>;
 }
 
 export interface ServiceDeps {

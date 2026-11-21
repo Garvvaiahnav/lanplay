@@ -1,7 +1,7 @@
 // Pure logic for the Sunshine.app that LanPlay bundles and runs from a private copy on macOS (docs/MAC-HOST-DESIGN.md 2.4).
 // Disk and processes are injected, so everything here is testable without a Mac.
 import path from 'node:path';
-import { SUNSHINE_MANAGED_CONFIG, SUNSHINE_MAC } from '../../../contracts.js';
+import { SUNSHINE_MAC, sunshineManagedConfig } from '../../../contracts.js';
 import type { ProcessRunner } from '../../../contracts.js';
 import type { AgentSpec, ArgvCall } from './launchd.js';
 
@@ -63,11 +63,12 @@ export function bundledSunshineApp(resourcesPath: string): string {
 
 /**
  * Keys LanPlay owns in sunshine.conf on macOS. The paths are absolute because Sunshine resolves relative ones under
- * ~/.config/sunshine; system_tray is off because LanPlay is the UI.
+ * ~/.config/sunshine; system_tray is off because LanPlay is the UI. `internet` is the "Allow connections from the internet"
+ * switch: it turns UPnP on and IPv6 hosting on (there is no firewall rule to add on macOS).
  */
-export function macManagedConfig(paths: SunshineMacPaths): Record<string, string> {
+export function macManagedConfig(paths: SunshineMacPaths, internet = false): Record<string, string> {
   return {
-    ...SUNSHINE_MANAGED_CONFIG,
+    ...sunshineManagedConfig(internet),
     pkey: paths.pkey,
     cert: paths.cert,
     log_path: paths.log,

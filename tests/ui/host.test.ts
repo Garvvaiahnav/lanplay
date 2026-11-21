@@ -210,13 +210,12 @@ describe('host screen on macOS', () => {
   it('speaks Mac: no Windows, administrator or UAC wording, and one "Set up this Mac" card', async () => {
     setupMac([], { 'host:setup-status': () => macStatus([], { lastRunAt: null, install: null }) });
     await ready();
-    expect(root.textContent).toContain('This Mac is called');
-    expect(q(root, 'section[aria-labelledby="h-sun"] h2').textContent).toBe('Set up this Mac');
+    expect(q(root, 'section[aria-labelledby="h-name"] h2').textContent).toBe('This Mac');
     expect(buttonByText(root, 'Set up this Mac')).toBeTruthy();
     const shown = root.cloneNode(true) as HTMLElement;
     shown.querySelectorAll('[hidden]').forEach((e) => e.remove());
     expect(shown.textContent).not.toMatch(/Windows|administrator|This PC|PC /);
-    expect(q(root, 'section[aria-labelledby="h-sun"]').textContent).toMatch(/Screen Recording.*Accessibility/);
+    expect(q(root, 'section[aria-labelledby="h-name"]').textContent).toMatch(/Screen Recording.*Accessibility/);
   });
 
   it('after setup it offers Set up / Repair like Windows', async () => {
@@ -270,7 +269,7 @@ describe('host screen on macOS', () => {
     buttonByText(root, 'I did this').click();
     await flush();
     expect(api.called('host:confirm-input')).toEqual([{ ok: true }]);
-    expect(root.querySelector('.badge.pass')).toBeTruthy();
+    expect(root.querySelector('[aria-label="Setup steps"]')?.hasAttribute('hidden')).toBe(true);
     expect([...root.querySelectorAll('button')].some((b) => b.textContent === 'I did this')).toBe(false);
     expect([...root.querySelectorAll('button')].some((b) => /settings$/.test(b.textContent ?? ''))).toBe(false);
   });
@@ -387,5 +386,242 @@ describe('host screen on macOS', () => {
     await flush();
     expect(q(root, '.status').textContent).toMatch(/Could not restart Sunshine: launchctl exit 5/);
     expect(buttonByText(root, 'Restart Sunshine').disabled).toBe(false);
+  });
+});
+
+const PEND = [
+  { id: 'a'.repeat(32), name: 'Friend laptop', address: '203.0.113.9', remote: true },
+  { id: 'b'.repeat(32), name: 'Phone', address: '192.168.1.55', remote: false },
+];
+const NET_OFF = { enabled: false, lanAddresses: ['192.168.1.20'], globalIpv6: [] as string[] };
+const NET_ON = { enabled: true, lanAddresses: ['192.168.1.20'], globalIpv6: ['2001:db8::20'] };
+const pinFor = (id: string): HTMLInputElement => q<HTMLInputElement>(root, '#pin-' + id);
+const type = (el: HTMLInputElement, v: string): void => {
+  el.value = v;
+  el.dispatchEvent(new Event('input'));
+};
+
+describe('Add a device with a code', () => {
+  it('lists every pending pairing with name, address and an Internet tag only on remote ones', async () => {
+    setup({ 'host:pending-list': () => PEND });
+    await ready();
+    const rows = [...root.querySelectorAll('[aria-label="Devices waiting for a code"] .item')];
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.textContent).toMatch(/Friend laptop.*203\.0\.113\.9/);
+    expect(rows[0]?.querySelector('.tag')?.textContent).toBe('Internet');
+    expect(rows[1]?.querySelector('.tag')).toBeNull();
+    expect(q(root, '#h-codes').textContent).toBe('Add a device with a code');
+  });
+
+  it('says nothing is waiting when the list is empty', async () => {
+    setup({ 'host:pending-list': () => [] });
+    await ready();
+    expect(q(root, '[aria-label="Devices waiting for a code"]').textContent).toBe('Nothing waiting for a code.');
+  });
+
+  it('Pair stays off until four digits are typed, keeps only digits, then pairs with that code and name', async () => {
+    const paired = { uuid: 'u9', name: 'Friend laptop', enabled: true, pairedVia: 'code', lastAddress: '203.0.113.9' };
+    setup({
+      'host:pending-list': () => PEND,
+      'host:pending-pair': () => ({ ok: true, pending: [PEND[1]], devices: [...DEVICES, paired] }),
+    });
+    await ready();
+    const id = PEND[0]!.id;
+    const pairBtn = (): HTMLButtonElement => [...q(root, '[aria-label="Devices waiting for a code"] .item').querySelectorAll('button')].find((b) => b.textContent === 'Pair')!;
+    expect(pairBtn().disabled).toBe(true);
+    type(pinFor(id), '48a2');
+    expect(pinFor(id).value).toBe('482');
+    expect(pairBtn().disabled).toBe(true);
+    type(pinFor(id), '4821');
+    expect(pairBtn().disabled).toBe(false);
+    pairBtn().click();
+    await ready();
+    expect(api.called('host:pending-pair')).toEqual([{ id, pin: '4821', name: 'Friend laptop' }]);
+    expect(root.querySelectorAll('[aria-label="Devices waiting for a code"] .item')).toHaveLength(1);
+    expect(root.querySelectorAll('[aria-label="Paired devices"] .item')).toHaveLength(3);
+    expect(root.textContent).toContain('paired with a code, 203.0.113.9');
+    expect(q(root, '.status').textContent).toBe('Friend laptop is paired.');
+  });
+
+  it('Enter in the code box pairs too', async () => {
+    setup({ 'host:pending-list': () => PEND, 'host:pending-pair': () => ({ ok: true, pending: [], devices: DEVICES }) });
+    await ready();
+    const id = PEND[0]!.id;
+    type(pinFor(id), '1234');
+    pinFor(id).dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+    await ready();
+    expect(api.called('host:pending-pair')).toEqual([{ id, pin: '1234', name: 'Friend laptop' }]);
+  });
+
+  it('a wrong code shows the sentence under that row, keeps the row and clears the box', async () => {
+    setup({ 'host:pending-list': () => PEND, 'host:pending-pair': () => ({ ok: false, message: 'That code is not right.', pending: PEND, devices: DEVICES }) });
+    await ready();
+    const id = PEND[0]!.id;
+    type(pinFor(id), '0000');
+    pinFor(id).dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+    await ready();
+    expect(root.querySelectorAll('[aria-label="Devices waiting for a code"] .item')).toHaveLength(2);
+    expect(q(root, '[aria-label="Devices waiting for a code"] .smsg').textContent).toBe('That code is not right.');
+    expect(pinFor(id).value).toBe('');
+    expect(root.querySelectorAll('[aria-label="Paired devices"] .item')).toHaveLength(2);
+  });
+
+  it('Reject asks main to cancel that pairing and shows the list it returns', async () => {
+    setup({ 'host:pending-list': () => PEND, 'host:pending-reject': () => [PEND[1]] });
+    await ready();
+    q(root, '[aria-label="Reject Friend laptop"]').click();
+    await ready();
+    expect(api.called('host:pending-reject')).toEqual([{ id: PEND[0]!.id }]);
+    expect(root.querySelectorAll('[aria-label="Devices waiting for a code"] .item')).toHaveLength(1);
+  });
+
+  it('a poll does not wipe a code that is being typed, and picks up a new device', async () => {
+    let list: unknown[] = [PEND[0]];
+    setup({ 'host:pending-list': () => list });
+    await ready();
+    const id = PEND[0]!.id;
+    type(pinFor(id), '48');
+    pinFor(id).focus();
+    list = [PEND[0], PEND[1]];
+    await vi.advanceTimersByTimeAsync(3100);
+    expect(root.querySelectorAll('[aria-label="Devices waiting for a code"] .item')).toHaveLength(2);
+    expect(pinFor(id).value).toBe('48');
+    expect(document.activeElement).toBe(pinFor(id));
+  });
+
+  it('stops polling when the screen is destroyed', async () => {
+    setup({ 'host:pending-list': () => [] });
+    await ready();
+    handle.destroy();
+    const n = api.called('host:pending-list').length;
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(api.called('host:pending-list')).toHaveLength(n);
+  });
+});
+
+describe('Internet card', () => {
+  const card = (): HTMLElement => q(root, 'section[aria-labelledby="h-net"]');
+  const sw = (): HTMLElement => q(card(), '[role="switch"]');
+
+  it('is off by default: the switch is off, the exposure text is beside it, the body and the banner are hidden', async () => {
+    setup({ 'host:internet-get': () => NET_OFF });
+    await ready();
+    expect(sw().getAttribute('aria-label')).toBe('Allow connections from the internet');
+    expect(sw().getAttribute('aria-checked')).toBe('false');
+    expect(card().textContent).toMatch(/opens Sunshine to the whole internet/);
+    expect(card().textContent).toMatch(/runs as SYSTEM/);
+    expect(q(card(), '.net-body').hidden).toBe(true);
+    expect(q(root, '.notice').hidden).toBe(true);
+  });
+
+  it('cards come in the planned order', async () => {
+    setup({ 'host:internet-get': () => NET_OFF });
+    await ready();
+    const titles = [...root.querySelectorAll('section.card')].filter((c) => !(c as HTMLElement).hidden).map((c) => c.querySelector('h2')?.textContent);
+    expect(titles).toEqual(['This PC', 'Devices', 'Internet', 'Phone controllers', 'Health']);
+  });
+
+  it('switching on calls main, then shows the banner, the ports table, the LAN address and the global IPv6 address', async () => {
+    setup({ 'host:internet-get': () => NET_OFF, 'host:internet-set': () => NET_ON });
+    await ready();
+    sw().click();
+    await ready();
+    expect(api.called('host:internet-set')).toEqual([{ on: true }]);
+    expect(sw().getAttribute('aria-checked')).toBe('true');
+    expect(q(root, '.notice').hidden).toBe(false);
+    const body = q(card(), '.net-body');
+    expect(body.hidden).toBe(false);
+    const rows = [...body.querySelectorAll('tbody tr')].map((r) => [...r.querySelectorAll('td')].map((c) => c.textContent));
+    expect(rows).toEqual([['TCP', '47984', 'HTTPS (pairing, launch)'], ['TCP', '47989', 'HTTP (status, pairing start)'], ['TCP', '48010', 'RTSP'], ['UDP', '47998, 47999, 48000', 'video, control, audio']]);
+    expect(body.textContent).toContain('192.168.1.20');
+    expect(body.textContent).toContain('2001:db8::20');
+    expect(body.textContent).toMatch(/Never forward 47990, 47920, 47921/);
+    expect(body.textContent).toMatch(/CGNAT/);
+    expect(q(root, '.status').textContent).toBe('Internet play is on.');
+  });
+
+  it('the banner has a Switch off button that turns it off', async () => {
+    setup({ 'host:internet-get': () => NET_ON, 'host:internet-set': () => NET_OFF });
+    await ready();
+    expect(q(root, '.notice').hidden).toBe(false);
+    buttonByText(q(root, '.notice'), 'Switch off').click();
+    await ready();
+    expect(api.called('host:internet-set')).toEqual([{ on: false }]);
+    expect(q(root, '.notice').hidden).toBe(true);
+    expect(q(card(), '.net-body').hidden).toBe(true);
+  });
+
+  it('a refused switch rolls back and says why; main\'s own error text is shown', async () => {
+    setup({ 'host:internet-get': () => NET_OFF, 'host:internet-set': () => { throw new Error('Windows permission was refused.'); } });
+    await ready();
+    sw().click();
+    await ready();
+    expect(sw().getAttribute('aria-checked')).toBe('false');
+    expect(q(root, '.status').textContent).toBe('Could not change internet play: Windows permission was refused.');
+    expect(q(root, '.status').className).toContain('error-text');
+    expect((sw() as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('a switch that main reverted says so with main\'s error, not "Internet play is on."', async () => {
+    const reverted = { ...NET_OFF, lastError: 'Could not create the firewall rule: Access is denied.' };
+    setup({ 'host:internet-get': () => NET_OFF, 'host:internet-set': () => reverted });
+    await ready();
+    sw().click();
+    await ready();
+    expect(api.called('host:internet-set')).toEqual([{ on: true }]);
+    expect(sw().getAttribute('aria-checked')).toBe('false');
+    expect(q(root, '.notice').hidden).toBe(true);
+    expect(q(root, '.status').textContent).toBe('Internet play is still off. Could not create the firewall rule: Access is denied.');
+    expect(q(root, '.status').className).toContain('error-text');
+    expect(q(root, '.status').textContent).not.toContain('is on.');
+  });
+
+  it('turning off that main could not apply says it is still on', async () => {
+    const stuck = { ...NET_ON, lastError: 'Sunshine did not come back.' };
+    setup({ 'host:internet-get': () => NET_ON, 'host:internet-set': () => stuck });
+    await ready();
+    buttonByText(q(root, '.notice'), 'Switch off').click();
+    await ready();
+    expect(q(root, '.status').textContent).toBe('Internet play is still on. Sunshine did not come back.');
+    expect(sw().getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('the switch is disabled while the elevated run is going', async () => {
+    let finish: (v: unknown) => void = () => undefined;
+    setup({ 'host:internet-get': () => NET_OFF, 'host:internet-set': () => new Promise((r) => { finish = r; }) });
+    await ready();
+    sw().click();
+    await flush();
+    expect((sw() as HTMLButtonElement).disabled).toBe(true);
+    expect(q(root, '.status').textContent).toMatch(/Approve the Windows prompt/);
+    finish(NET_ON);
+    await ready();
+    expect((sw() as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('host:internet-changed updates the card and shows main\'s last error', async () => {
+    setup({ 'host:internet-get': () => NET_OFF });
+    await ready();
+    api.emit('host:internet-changed', { ...NET_ON, lastError: 'UPnP did not answer.' } as never);
+    expect(q(root, '.notice').hidden).toBe(false);
+    expect(q(card(), '.hint.err').textContent).toBe('UPnP did not answer.');
+  });
+
+  it('the setup step list stays hidden unless a step failed', async () => {
+    setup({ 'host:internet-get': () => NET_OFF });
+    await ready();
+    expect(q(root, '[aria-label="Setup steps"]').hidden).toBe(true);
+  });
+
+  it('on a Mac: the card is there, with no Windows, PC or SYSTEM wording and no pair-agent hint on the switch', async () => {
+    setup({
+      'app:info': () => ({ role: 'host', version: '0.5.0', platform: 'darwin', arch: 'arm64', logFile: '/x.log', hostName: 'Garvs-Mac' }),
+      'host:setup-status': () => ({ lastRunAt: 'now', ok: true, steps: [], install: INSTALL, isAdmin: false }),
+      'host:internet-get': () => NET_ON,
+    });
+    await ready();
+    const text = card().textContent ?? '';
+    expect(text).toMatch(/this Mac/);
+    expect(text).not.toMatch(/Windows|PC|SYSTEM/);
   });
 });

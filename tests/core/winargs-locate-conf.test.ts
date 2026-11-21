@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { SUNSHINE_MANAGED_CONFIG } from '../../src/contracts.js';
+import { sunshineManagedConfig } from '../../src/contracts.js';
 import type { SunshineFactsPs } from '../../src/contracts.js';
 import { buildBatArgv, buildMsiexecArgs, buildPsArgv, parseWindowsCommandLine, quoteWindowsArg } from '../../src/core/host/winargs.js';
 import { applyLogPathOverride, findNsisInstall, locateSunshine, rootFromServiceExe, servicePathToExe } from '../../src/core/host/sunshine-locate.js';
@@ -142,6 +142,8 @@ describe('locateSunshine', () => {
   });
 });
 
+const SUNSHINE_MANAGED_CONFIG = sunshineManagedConfig(false);
+
 describe('mergeSunshineConf', () => {
   it('adds managed keys to an empty file and is idempotent', () => {
     const a = mergeSunshineConf('', SUNSHINE_MANAGED_CONFIG);
@@ -165,12 +167,27 @@ describe('mergeSunshineConf', () => {
     const src = '# my config\r\nsunshine_name = Gaming PC\r\norigin_web_ui_allowed = wan\r\nencoder = nvenc\r\nupnp = enabled\r\nupnp = enabled\r\n';
     const r = mergeSunshineConf(src, SUNSHINE_MANAGED_CONFIG);
     expect(r.changed).toBe(true);
-    expect(r.text).toBe('# my config\r\nsunshine_name = Gaming PC\r\norigin_web_ui_allowed = lan\r\nencoder = nvenc\r\nupnp = disabled\r\nhevc_mode = 0\r\nav1_mode = 0\r\n');
+    expect(r.text).toBe('# my config\r\nsunshine_name = Gaming PC\r\norigin_web_ui_allowed = pc\r\nencoder = nvenc\r\nupnp = disabled\r\naddress_family = ipv4\r\nhevc_mode = 0\r\nav1_mode = 0\r\n');
     expect(mergeSunshineConf(r.text, SUNSHINE_MANAGED_CONFIG).changed).toBe(false);
   });
 
   it('keeps a BOM and treats already-correct files as unchanged', () => {
-    const src = '\uFEFForigin_web_ui_allowed = lan\nupnp = disabled\nhevc_mode = 0\nav1_mode = 0\n';
+    const src = '\uFEFForigin_web_ui_allowed = pc\nupnp = disabled\naddress_family = ipv4\nhevc_mode = 0\nav1_mode = 0\n';
     expect(mergeSunshineConf(src, SUNSHINE_MANAGED_CONFIG).changed).toBe(false);
+  });
+
+  it('writes the internet-on values (D08) and switches back off cleanly, keeping the admin page on this PC (D09)', () => {
+    const on = sunshineManagedConfig(true);
+    expect(on).toMatchObject({ origin_web_ui_allowed: 'pc', upnp: 'enabled', address_family: 'both', hevc_mode: '0', av1_mode: '0' });
+    const off = sunshineManagedConfig(false);
+    expect(off).toMatchObject({ origin_web_ui_allowed: 'pc', upnp: 'disabled', address_family: 'ipv4' });
+    const src = '# mine\nsunshine_name = PC\nupnp = disabled\naddress_family = ipv4\n';
+    const a = mergeSunshineConf(src, on);
+    expect(a.changed).toBe(true);
+    expect(parseSunshineConf(a.text)).toMatchObject({ sunshine_name: 'PC', upnp: 'enabled', address_family: 'both', origin_web_ui_allowed: 'pc' });
+    expect(mergeSunshineConf(a.text, on).changed).toBe(false);
+    const b = mergeSunshineConf(a.text, off);
+    expect(b.changed).toBe(true);
+    expect(parseSunshineConf(b.text)).toMatchObject({ sunshine_name: 'PC', upnp: 'disabled', address_family: 'ipv4' });
   });
 });

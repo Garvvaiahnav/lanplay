@@ -70,6 +70,7 @@ export class ControllerService {
     return this.d.settings.get<boolean>(ENABLED_KEY, false) === true;
   }
 
+  /** Made once and kept in settings: saved links and home-screen shortcuts depend on it. Only newLink() replaces it. */
   private token(): string {
     const have = this.d.settings.get<string>(TOKEN_KEY, '');
     if (typeof have === 'string' && /^[A-Za-z0-9_-]{20,}$/.test(have)) return have;
@@ -92,7 +93,7 @@ export class ControllerService {
       port: this.port,
       links,
       driver: this.d.backend.status(),
-      players: this.manager.list().map((p) => ({ id: p.id, slot: p.slot, name: p.name, address: p.address, stale: p.stale })),
+      players: this.manager.list().map((p) => ({ id: p.id, slot: p.slot, name: p.name, address: p.address, stale: p.stale || p.detached })),
       setupRunning: this.setupRunning,
       error: this.error,
     };
@@ -111,7 +112,7 @@ export class ControllerService {
     return this.state();
   }
 
-  /** New session token: links and QR codes of the old one stop working (running phones stay connected until they reload). */
+  /** New access token (the token is otherwise persistent): links, QR codes and home-screen shortcuts made with the old one stop working; running phones stay connected until they reload. */
   async newLink(): Promise<ControllersState> {
     this.d.settings.set(TOKEN_KEY, '');
     if (this.server) {

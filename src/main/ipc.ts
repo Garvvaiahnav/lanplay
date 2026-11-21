@@ -2,6 +2,7 @@
 // Pure (no Electron import) so it is unit-tested directly.
 import { IPC_INVOKE_CHANNELS } from '../contracts.js';
 import type { IpcEnvelope, IpcInvokeChannel, IpcRequest, IpcResponse, Redactor, SettingsPane } from '../contracts.js';
+import { sanitizeClientName } from '../core/host/agent.js';
 import { settingsUrl } from '../core/host/mac/permissions-mac.js';
 
 export class IpcValidationError extends Error {}
@@ -26,6 +27,10 @@ const obj = (raw: unknown): Record<string, unknown> => {
   return raw;
 };
 const HOST_ID = /^[\x21-\x7e]{1,200}$/;
+/** Sunshine pairing id (the same 32-hex rule as sunshine-client.ts). */
+const PAIRING_ID = /^[0-9a-fA-F]{32}$/;
+/** Device name: the same character set and 64-char limit the pair agent applies to client names. */
+const DEVICE_NAME = /^[\p{L}\p{N} ._-]+$/u;
 
 export const IPC_VALIDATORS: { [C in IpcInvokeChannel]: Validator<C> } = {
   'app:info': none,
@@ -71,6 +76,19 @@ export const IPC_VALIDATORS: { [C in IpcInvokeChannel]: Validator<C> } = {
   'host:controllers-kick': (raw) => ({ id: str(obj(raw), 'id', /^[0-9a-f]{16}$/, 16) }),
   'host:controllers-new-link': none,
   'host:controllers-setup': none,
+  'host:internet-get': none,
+  'host:internet-set': (raw) => ({ on: bool(obj(raw), 'on') }),
+  'host:pending-list': none,
+  'host:pending-pair': (raw) => {
+    const o = obj(raw);
+    // The same rule as the agent's cleaner (sanitizeClientName in core/host/agent.ts: NFC, 1..64 code points, 128 bytes,
+    // allowed characters), so a name the agent keeps is never refused here. The unit cap only bounds the work before that.
+    const given = str(o, 'name', /^[\s\S]+$/, 256);
+    if (sanitizeClientName(given) === null) throw new IpcValidationError('invalid name');
+    return { id: str(o, 'id', PAIRING_ID, 32), pin: str(o, 'pin', /^[0-9]{4}$/, 4), name: given };
+  },
+  'host:pending-reject': (raw) => ({ id: str(obj(raw), 'id', PAIRING_ID, 32) }),
+  'client:recent-remote': none,
   'selfcheck:run': none,
   'diagnostics:collect': none,
   'diagnostics:reveal': (raw) => ({ zipPath: str(obj(raw), 'zipPath', /^[^\0]+$/, 4096) }),

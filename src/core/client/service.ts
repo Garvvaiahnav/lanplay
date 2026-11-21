@@ -20,20 +20,26 @@ import type {
   StreamState,
 } from '../../contracts.js';
 import { runRecorded, tail } from '../shared/exec.js';
+import { isPrivateAddress } from '../shared/ipnet.js';
 import { httpGet } from '../shared/netprobe.js';
 import { timedStep } from '../shared/steprec.js';
 import { defaultDiscoveryDeps, LanDiscovery, localIPv4Interfaces } from './discovery.js';
 import type { DiscoveryDeps } from './discovery.js';
-import { createMoonlightRunnerWith } from './moonlight.js';
+import { createMoonlightRunnerWith, moonlightTarget } from './moonlight.js';
 import { MOONLIGHT_WIN, platformLabel, readBundleVersion, readMoonlightVersion } from './platform.js';
 import { ClientPairingService } from './pairing.js';
 import type { PairingDeps } from './pairing.js';
 import { fetchServerInfo } from './serverinfo.js';
-import { detectAppleChip, normalizeStreamSettings, resolveCodec } from './settings.js';
+import { applyPreset, detectAppleChip, normalizeStreamSettings, resolveCodec } from './settings.js';
 
 export const SETTINGS_KEY = 'client.streamSettings';
 export const CLIENT_ID_KEY = 'client.id';
 export const LAST_HOST_KEY = 'client.lastHost';
+export const RECENT_REMOTE_KEY = 'client.recentRemote';
+const RECENT_REMOTE_MAX = 5;
+/** A remote stream that dies sooner than this probably connected over TCP but got no UDP video. */
+export const REMOTE_STREAM_HINT_MS = 15_000;
+export const UDP_HINT = 'The host answered, so TCP works. If there was no picture, UDP 47998-48000 is probably not forwarded.';
 
 export interface ClientServiceExtras {
   /** Absolute Moonlight binary (first existing candidate) or null when none was found. */
@@ -49,6 +55,8 @@ export interface ClientServiceExtras {
   selfCheckDiscoveryMs?: number;
   /** Defaults to process.platform. 'win32' = Windows client (Moonlight.exe, no codesign, %TEMP% logs, taskkill). */
   platform?: NodeJS.Platform;
+  /** Tests: clock for the 15 s remote-stream hint window. */
+  now?: () => number;
 }
 
 export { readBundleVersion };
@@ -73,7 +81,7 @@ export class MacClientService implements ClientService {
   ) {
     this.platform = x.platform ?? process.platform;
     this.cpuModel = x.cpuModel ?? os.cpus()[0]?.model ?? '';
-    this.discovery = new LanDiscovery({ ...defaultDiscoveryDeps(deps.log.child('client')), ...(x.discovery ?? {}) });
+    this.discovery = new LanDiscovery({ ...defaultDiscoveryDeps(deps.log.child('client')), onRemoteHost: (_h, typed) => this.rememberRemote(typed), ...(x.discovery ?? {}) });
     const mlOpts: MoonlightRunnerOptions = {
       binary: x.moonlightBinary ?? (this.platform === 'win32' ? MOONLIGHT_WIN.installedDefault : path.join('/Applications', MOONLIGHT.macBundleBinary)),
       prefixArgs: x.prefixArgs ?? [],
@@ -100,6 +108,21 @@ export class MacClientService implements ClientService {
       this.deps.settings.set(CLIENT_ID_KEY, id);
     }
     return id;
+  }
+
+  recentRemote(): string[] {
+    const v = this.deps.settings.get<unknown>(RECENT_REMOTE_KEY, []);
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string').slice(0, RECENT_REMOTE_MAX) : [];
+  }
+
+  /** Newest first, no duplicates, last 5. The first time an address is typed, the Internet preset is selected (D12); later edits stay. */
+  private rememberRemote(typed: string): void {
+    const t = typed.trim();
+    if (!t) return;
+    const before = this.recentRemote();
+    const known = before.some((x) => x.toLowerCase() === t.toLowerCase());
+    this.deps.settings.set(RECENT_REMOTE_KEY, [t, ...before.filter((x) => x.toLowerCase() !== t.toLowerCase())].slice(0, RECENT_REMOTE_MAX));
+    if (!known) this.setSettings(applyPreset('internet', this.getSettings()));
   }
 
   async systemInfo(): Promise<ClientSystemInfo> {
@@ -158,7 +181,7 @@ export class MacClientService implements ClientService {
     if (this.streams.has(hostId)) return { hostId, state: 'running', message: 'Already streaming.' };
     let handle: MoonlightProcessHandle;
     try {
-      handle = this.moonlight.startStream({ host: h.preferredAddress, settings, resolvedCodec: codec });
+      handle = this.moonlight.startStream({ host: moonlightTarget(h), settings, resolvedCodec: codec });
     } catch (e) {
       return { hostId, state: 'failed', message: (e as Error).message };
     }
@@ -166,12 +189,15 @@ export class MacClientService implements ClientService {
     log.log('info', 'stream', 'stream started', { hostId, codec, chip: chip.model, scms: h.serverCodecModeSupport ?? null, argv: handle.argv });
     this.streams.set(hostId, handle);
     onState({ hostId, state: 'starting' });
+    const clock = this.x.now ?? Date.now;
+    const startedAt = clock();
+    const withHint = (msg: string): string => (h.remote && clock() - startedAt < REMOTE_STREAM_HINT_MS ? `${msg} ${UDP_HINT}` : msg);
     const startup = this.x.streamStartupMs ?? 1500;
     const early = await Promise.race([handle.exited, new Promise<null>((r) => setTimeout(() => r(null), startup))]);
     if (early) {
       this.streams.delete(hostId);
       const msg = early.spawnError ? `Moonlight could not start: ${early.spawnError}` : `Moonlight exited right away (code ${early.exitCode}). ${tail(early.stderr || early.stdout, 300).trim()}`;
-      const st: StreamState = early.exitCode === 0 && !early.spawnError ? { hostId, state: 'ended', exitCode: 0 } : { hostId, state: 'failed', exitCode: early.exitCode, message: msg };
+      const st: StreamState = early.exitCode === 0 && !early.spawnError ? { hostId, state: 'ended', exitCode: 0 } : { hostId, state: 'failed', exitCode: early.exitCode, message: withHint(msg) };
       log.log(st.state === 'failed' ? 'warn' : 'info', 'stream', `stream ${st.state}`, { hostId, exitCode: early.exitCode, stderr: tail(early.stderr, 2000) });
       onState(st);
       return st;
@@ -179,7 +205,7 @@ export class MacClientService implements ClientService {
     void handle.exited.then((r) => {
       this.streams.delete(hostId);
       const st: StreamState = { hostId, state: 'ended', exitCode: r.exitCode };
-      if (r.exitCode !== 0 && r.exitCode !== null) st.message = `Moonlight stopped with code ${r.exitCode}. ${tail(r.stderr, 300).trim()}`;
+      if (r.exitCode !== 0 && r.exitCode !== null) st.message = withHint(`Moonlight stopped with code ${r.exitCode}. ${tail(r.stderr, 300).trim()}`);
       log.log('info', 'stream', 'stream ended', { hostId, exitCode: r.exitCode, signal: r.signal, stderr: tail(r.stderr, 2000) });
       onState(st);
     });
@@ -274,7 +300,7 @@ export class MacClientService implements ClientService {
     const last = this.deps.settings.get<{ id: string; name: string; address: string } | null>(LAST_HOST_KEY, null);
     const targets = new Map<string, { name: string; address: string }>();
     for (const h of found) targets.set(h.preferredAddress, { name: h.name, address: h.preferredAddress });
-    if (last && !targets.has(last.address)) targets.set(last.address, { name: last.name, address: last.address });
+    if (last && isPrivateAddress(last.address) && !targets.has(last.address)) targets.set(last.address, { name: last.name, address: last.address });
     for (const t of targets.values()) {
       push(
         await timedStep(`host:${t.address}`, `PC ${t.name} (${t.address})`, async (s) => {

@@ -1,19 +1,20 @@
-/* In-stream menu. Same calm palette as the main window; no external assets (CSP). */
+/* In-stream menu. Same palette, radius, type and spacing scale as the main window; no external assets (CSP). */
 :root {
   color-scheme: dark light;
   --bg: #1a1f28; --panel-2: #222936; --line: #2f3746; --text: #e8ecf3; --muted: #9aa5b8;
   --accent: #6aa9ff; --accent-text: #08111f; --bad: #ff6b6b;
-  font: 16px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 15px;
+  line-height: 1.4;
 }
 @media (prefers-color-scheme: light) {
   :root { --bg: #ffffff; --panel-2: #eef1f7; --line: #d5dbe6; --text: #161b24; --muted: #566074; --accent: #1f6feb; --accent-text: #ffffff; --bad: #c62828; }
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); overflow: hidden; user-select: none; }
-.menu { display: flex; flex-direction: column; gap: 10px; padding: 22px 24px; height: 100%; border: 1px solid var(--line); }
-h1 { margin: 0; font-size: 20px; }
-.sub { margin: 0 0 6px; color: var(--muted); font-size: 14px; }
-button { font: inherit; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel-2); color: var(--text); cursor: pointer; text-align: left; }
+.menu { display: flex; flex-direction: column; gap: 8px; padding: 24px; height: 100%; border: 1px solid var(--line); }
+h1 { margin: 0 0 4px; font-size: 22px; font-weight: 600; }
+button { font: inherit; min-height: 36px; padding: 0 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); color: var(--text); cursor: pointer; text-align: left; }
 button:hover { border-color: var(--accent); }
 button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; margin-top: auto; }

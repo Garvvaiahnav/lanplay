@@ -226,7 +226,7 @@ describe('discovery', () => {
     await expect(m.addManual('10.255.255.1')).rejects.toThrow(/No Sunshine host/);
   }, 20_000);
 
-  it('stays on the home network: public addresses are refused (manual entry) or ignored (mDNS answers)', async () => {
+  it('discovery stays on the home network: public mDNS answers are ignored; a typed public address is the only way in', async () => {
     const w = await world();
     const log = new MemoryLogger();
     const base = (await import('../../src/core/client/discovery.js')).defaultDiscoveryDeps(log);
@@ -246,9 +246,12 @@ describe('discovery', () => {
     await new Promise((r) => setTimeout(r, 100));
     d.stop();
     expect(asked).toEqual(['192.168.77.5']);
-    await expect(d.addManual('8.8.8.8')).rejects.toThrow(/not an address on a home network/);
-    await expect(d.addManual('2001:4860:4860::8888')).rejects.toThrow(/home network/);
-    expect(asked).toEqual(['192.168.77.5']);
+    await expect(d.addManual('8.8.8.8')).rejects.toThrow(/No answer|not Sunshine/);
+    expect(asked).toEqual(['192.168.77.5', '8.8.8.8']);
+    // The public IPv6 mDNS answer above was dropped (never fetched); the same address typed by the player is accepted and probed.
+    await expect(d.addManual('2001:4860:4860::8888')).rejects.toThrow(/No answer|not Sunshine/);
+    await expect(d.addManual('[2001:4860:4860::8888]:47989')).rejects.toThrow(/No answer|not Sunshine/);
+    expect(asked).toEqual(['192.168.77.5', '8.8.8.8', '2001:4860:4860::8888', '2001:4860:4860::8888']);
   });
 });
 

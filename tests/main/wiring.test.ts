@@ -1,12 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { SUNSHINE_MAC } from '../../src/contracts.js';
-import type { ClientService, ExecRequest, ExecResult, HostSetupStatus, IpcEventChannel, SelfCheckReport, ServiceDeps } from '../../src/contracts.js';
+import type { ClientService, ExecRequest, ExecResult, HostSetupStatus, InternetHostState, IpcEventChannel, IpcEventMap, SelfCheckReport, ServiceDeps, StepRecord } from '../../src/contracts.js';
 import { createPadBackendFor, MAC_PADS_UNAVAILABLE } from '../../src/core/controller/backend.js';
 import { plistPath } from '../../src/core/host/mac/launchd.js';
 import { MacHostService } from '../../src/core/host/mac/service-mac.js';
-import { MemoryLogger } from '../../src/core/shared/logger.js';
+import { MemoryLogger, resolveLogLevel } from '../../src/core/shared/logger.js';
 import { MemoryStore } from '../../src/core/shared/stores.js';
-import { buildHandlers, buildServices, hostSupported, releaseMacHost, runSelfCheckCli } from '../../src/main/wiring.js';
+import { buildHandlers, buildServices, createPollWhileActive, hostSupported, releaseMacHost, runSelfCheckCli } from '../../src/main/wiring.js';
 import type { MacHostControls, Services, WiringEnv } from '../../src/main/wiring.js';
 import os from 'node:os';
 import path from 'node:path';
@@ -195,5 +195,169 @@ describe('createPadBackendFor', () => {
   it('Windows keeps the ViGEm backend and other systems have none', () => {
     expect(createPadBackendFor('win32', { vigemDllPath: '/nowhere/ViGEmClient.dll' }).status()).toMatchObject({ ok: false, reason: 'dll-missing' });
     expect(createPadBackendFor('linux', { vigemDllPath: '/x' }).status()).toMatchObject({ ok: false, reason: 'error' });
+  });
+});
+
+describe('internet and code-pairing channels', () => {
+  const none = () => undefined;
+  const HOST_ONLY = ['host:internet-get', 'host:internet-set', 'host:pending-list', 'host:pending-pair', 'host:pending-reject'] as const;
+  const online: InternetHostState = { enabled: true, lanAddresses: ['192.168.1.5'], globalIpv6: [], };
+  const pendingOne = [{ id: 'a'.repeat(32), name: 'Phone', address: '203.0.113.7', remote: true }];
+  const hostServices = (calls: string[]): Services => ({
+    client: null,
+    host: {
+      setupStatus: async () => ({ lastRunAt: null, ok: false, steps: [], install: null, isAdmin: false }),
+      getInternet: async () => (calls.push('get'), online),
+      setInternet: async (on: boolean, onProgress: (s: StepRecord) => void) => {
+        calls.push(`set ${on}`);
+        onProgress({ stepId: 'firewall-internet' } as StepRecord);
+        await new Promise((r) => setTimeout(r, 10));
+        return { ...online, enabled: on };
+      },
+      agent: {
+        listPending: async () => (calls.push('list'), pendingOne),
+        pairWithCode: async (id: string, pin: string, name: string) => (calls.push(`pair ${id.slice(0, 2)} ${pin} ${name}`), { ok: true, pending: [], devices: [] }),
+        rejectPending: async (id: string) => (calls.push(`reject ${id.slice(0, 2)}`), []),
+      },
+    } as never,
+    controllers: null,
+    macHost: null,
+    diagnostics: { collect: async () => ({ zipPath: '', bytes: 0 }) },
+    selfCheck: async () => ({}) as SelfCheckReport,
+    resolvedPaths: {},
+  });
+  const clientServices = (): Services => ({
+    client: { recentRemote: () => ['203.0.113.7', '198.51.100.2:47989'], discovery: { start: none, stop: none, list: () => [], addManual: async () => ({}) }, getSettings: () => ({}) } as unknown as ClientService,
+    host: null,
+    controllers: null,
+    macHost: null,
+    diagnostics: { collect: async () => ({ zipPath: '', bytes: 0 }) },
+    selfCheck: async () => ({}) as SelfCheckReport,
+    resolvedPaths: {},
+  });
+
+  it('the host role answers the five host channels and has no client:recent-remote', async () => {
+    const calls: string[] = [];
+    const pushed: Array<[string, unknown]> = [];
+    const h = buildHandlers(env({ role: 'host' }), hostServices(calls), ((c: IpcEventChannel, p: IpcEventMap[IpcEventChannel]) => void pushed.push([c, p])) as never, none);
+    for (const c of HOST_ONLY) expect(h[c], c).toBeTypeOf('function');
+    expect(h['client:recent-remote']).toBeUndefined();
+    expect(await h['host:internet-get']!()).toEqual(online);
+    expect(await h['host:pending-list']!()).toEqual(pendingOne);
+    expect(await h['host:pending-pair']!({ id: 'b'.repeat(32), pin: '0427', name: 'Phone' })).toMatchObject({ ok: true });
+    expect(await h['host:pending-reject']!({ id: 'c'.repeat(32) })).toEqual([]);
+    expect(calls).toEqual(['get', 'list', 'pair bb 0427 Phone', 'reject cc']);
+    expect(pushed).toEqual([]);
+  });
+
+  it('internet-set runs once at a time, streams the step records and announces the new state', async () => {
+    const calls: string[] = [];
+    const pushed: Array<[string, unknown]> = [];
+    const h = buildHandlers(env({ role: 'host' }), hostServices(calls), ((c: IpcEventChannel, p: IpcEventMap[IpcEventChannel]) => void pushed.push([c, p])) as never, none);
+    const [a, b] = await Promise.all([h['host:internet-set']!({ on: false }), h['host:internet-set']!({ on: false })]);
+    expect(a).toEqual({ ...online, enabled: false });
+    expect(b).toEqual(a);
+    expect(calls).toEqual(['set false']);
+    expect(pushed.map(([c]) => c)).toEqual(['host:setup-progress', 'host:internet-changed']);
+    expect(pushed[1]![1]).toEqual({ ...online, enabled: false });
+  });
+
+  it('Set up / Repair and the internet switch never run at the same time, in either order', async () => {
+    const calls: string[] = [];
+    let finishSetup: () => void = () => undefined;
+    const base = hostServices(calls);
+    const host = {
+      ...(base.host as object),
+      runSetup: async () => {
+        calls.push('setup start');
+        await new Promise<void>((r) => (finishSetup = r));
+        calls.push('setup end');
+        return { lastRunAt: null, ok: true, steps: [], install: null, isAdmin: true };
+      },
+    };
+    const h = buildHandlers(env({ role: 'host' }), { ...base, host: host as never }, none, none);
+
+    // setup first: the switch is refused with a sentence, nothing reaches the host service
+    const setup = h['host:setup-run']!();
+    await expect(h['host:internet-set']!({ on: true })).rejects.toThrow(/Set up \/ Repair is still running/);
+    expect(calls).toEqual(['setup start']);
+    // the same action twice still shares the running promise
+    expect(h['host:setup-run']!()).toBe(setup);
+    finishSetup();
+    await setup;
+    expect(calls).toEqual(['setup start', 'setup end']);
+
+    // internet first: Set up / Repair is refused
+    const inet = h['host:internet-set']!({ on: true });
+    await expect(h['host:setup-run']!()).rejects.toThrow(/The internet switch is still running/);
+    expect(await inet).toMatchObject({ enabled: true });
+    expect(calls).toEqual(['setup start', 'setup end', 'set true']);
+
+    // the guard is released afterwards
+    const later = h['host:setup-run']!();
+    finishSetup();
+    await later;
+    expect(calls.at(-1)).toBe('setup end');
+  });
+
+  it('the client role answers client:recent-remote and none of the host channels', async () => {
+    const h = buildHandlers(env({ role: 'client' }), clientServices(), none, none);
+    expect(await h['client:recent-remote']!()).toEqual(['203.0.113.7', '198.51.100.2:47989']);
+    for (const c of [...HOST_ONLY, 'host:agent-state', 'host:setup-run'] as const) expect(h[c], c).toBeUndefined();
+  });
+});
+
+describe('idle timers', () => {
+  it('owns no timer until a stream is active, ticks no faster than the poll, and drops the timer when it ends', () => {
+    vi.useFakeTimers();
+    try {
+      let active = false;
+      let ticks = 0;
+      const poll = createPollWhileActive({ tick: () => void ticks++, pollMs: 60, isActive: () => active });
+      poll.sync();
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(60_000);
+      expect(ticks).toBe(0);
+      expect(poll.running).toBe(false);
+
+      active = true;
+      poll.sync();
+      poll.sync();
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(600);
+      expect(ticks).toBe(10);
+
+      active = false;
+      poll.sync();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(poll.running).toBe(false);
+      vi.advanceTimersByTime(10_000);
+      expect(ticks).toBe(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('building the services of either role leaves no repeating timer running', () => {
+    vi.useFakeTimers();
+    try {
+      for (const role of ['client', 'host'] as const) buildServices(env({ role, platform: 'darwin' }));
+      expect(vi.getTimerCount()).toBe(0);
+      vi.advanceTimersByTime(5_000);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('resolveLogLevel', () => {
+  it('logs info when packaged and debug in development; LANPLAY_LOG_LEVEL overrides both', () => {
+    expect(resolveLogLevel(true, {})).toBe('info');
+    expect(resolveLogLevel(false, {})).toBe('debug');
+    expect(resolveLogLevel(true, { LANPLAY_LOG_LEVEL: 'debug' })).toBe('debug');
+    expect(resolveLogLevel(false, { LANPLAY_LOG_LEVEL: 'WARN' })).toBe('warn');
+    expect(resolveLogLevel(true, { LANPLAY_LOG_LEVEL: 'toString' })).toBe('info');
+    expect(resolveLogLevel(true, { LANPLAY_LOG_LEVEL: 'loud' })).toBe('info');
   });
 });

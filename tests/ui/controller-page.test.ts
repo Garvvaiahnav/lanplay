@@ -75,18 +75,29 @@ const fixedPoint = (s: LayoutStore): void => expect(sanitizeStore(s)).toEqual(s)
 
 class FakeSocket {
   static all: FakeSocket[] = [];
+  /** Echo every {"t":"p","n":N} back like the host does; a test that wants a dead link sets this to false. */
+  static echo = true;
   readyState = 0;
   sent: string[] = [];
+  /** The link probes, kept apart from `sent` so frame counts stay about pad traffic. */
+  pings: number[] = [];
   times: number[] = [];
   closed = false;
   onopen: (() => void) | null = null;
   onmessage: ((e: { data: unknown }) => void) | null = null;
-  onclose: (() => void) | null = null;
+  onclose: ((e: { code: number; reason: string }) => void) | null = null;
   constructor(public url: string) {
     FakeSocket.all.push(this);
   }
   send(s: string): void {
     if (this.readyState !== 1) throw new Error('send on a socket that is not open');
+    const probe = /^\{"t":"p","n":(\d+)\}$/.exec(s);
+    if (probe) {
+      const n = Number(probe[1]);
+      this.pings.push(n);
+      if (FakeSocket.echo) setTimeout(() => this.readyState === 1 && this.receive({ t: 'p', n }), 0);
+      return;
+    }
     this.sent.push(s);
     this.times.push(Date.now());
   }
@@ -94,7 +105,7 @@ class FakeSocket {
     this.closed = true;
     if (this.readyState !== 3) {
       this.readyState = 3;
-      this.onclose?.();
+      this.onclose?.({ code: 1005, reason: '' });
     }
   }
   open(): void {
@@ -104,9 +115,9 @@ class FakeSocket {
   receive(o: unknown): void {
     this.onmessage?.({ data: typeof o === 'string' ? o : JSON.stringify(o) });
   }
-  drop(): void {
+  drop(reason = '', code = 1006): void {
     this.readyState = 3;
-    this.onclose?.();
+    this.onclose?.({ code, reason });
   }
   /** Parsed frames that went out; fails if the host's own parser would reject one. */
   frames(): Array<{ t: string } & Record<string, unknown>> {
@@ -136,7 +147,7 @@ interface FakeHost {
   store: LayoutStore;
   getStatus: number;
   putFail: number;
-  calls: Array<{ method: string; path: string; token: string | null; body?: LayoutStore }>;
+  calls: Array<{ method: string; path: string; token: string | null; id: string | null; body?: LayoutStore }>;
   puts(): LayoutStore[];
 }
 let host: FakeHost;
@@ -145,7 +156,7 @@ function installFetch(): void {
   vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
     const u = new URL(url, 'http://192.168.1.20:47921');
     const method = init?.method ?? 'GET';
-    const call: FakeHost['calls'][number] = { method, path: u.pathname, token: u.searchParams.get('t') };
+    const call: FakeHost['calls'][number] = { method, path: u.pathname, token: u.searchParams.get('t'), id: u.searchParams.get('id') };
     host.calls.push(call);
     const reply = (status: number, body: unknown) => ({ ok: status < 400, status, json: async () => body });
     if (u.pathname === '/api/layouts' && method === 'GET') return host.getStatus === 200 ? reply(200, host.store) : reply(host.getStatus, 'nope');
@@ -249,6 +260,7 @@ let vibrate: ReturnType<typeof vi.fn> | null = null;
 
 beforeEach(() => {
   FakeSocket.all = [];
+  FakeSocket.echo = true;
   portraitNow = false;
   mqListeners = new Set();
   visibility = 'visible';
@@ -261,7 +273,7 @@ beforeEach(() => {
   standaloneNow = false;
   vi.stubGlobal('matchMedia', (query: string) => ({
     get matches() {
-      return query.includes('standalone') ? standaloneNow : portraitNow;
+      return query.includes('display-mode') ? query.includes('standalone') && standaloneNow : portraitNow;
     },
     addEventListener: (_t: string, cb: () => void) => mqListeners.add(cb),
     removeEventListener: (_t: string, cb: () => void) => mqListeners.delete(cb),
@@ -325,7 +337,7 @@ describe('index.html, controller.css and the emitted script', () => {
 
   it('has the CSP, the iPhone meta tags and the icon link; no inline script, style or handlers', () => {
     expect(/Content-Security-Policy" content="([^"]+)"/.exec(html)?.[1]).toBe(
-      "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; manifest-src 'self'",
+      "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; manifest-src 'self'; media-src 'self'",
     );
     const viewport = /name="viewport" content="([^"]+)"/.exec(html)?.[1] ?? '';
     expect(viewport).toMatch(/viewport-fit=cover/);
@@ -385,9 +397,51 @@ describe('index.html, controller.css and the emitted script', () => {
     expect(script).not.toMatch(/^await /m);
     expect(script).not.toMatch(/\.(findLast|findLastIndex|toSorted|toReversed|toSpliced|with|at|replaceAll|groupBy)\(/);
     expect(script).not.toMatch(/\b(structuredClone|Object\.hasOwn|AbortSignal\.any)\b/);
-    expect(script).not.toMatch(/requestAnimationFrame|cancelAnimationFrame|getCoalescedEvents|wakeLock|requestFullscreen/);
+    expect(script).not.toMatch(/requestAnimationFrame|cancelAnimationFrame|getCoalescedEvents/);
     const body = script.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '').replace(/^"use strict";\s*/, '');
     expect(body.trimStart().startsWith('(() => {')).toBe(true);
+  });
+
+  it('css follows the cleanup rules: no gradient, blur, shadow or animation; 3 radii, 4 type sizes, 2 weights, 5 spacing steps', () => {
+    expect(css).not.toMatch(/gradient|backdrop-filter|filter:\s*blur|box-shadow|text-shadow|@keyframes|animation/);
+    const decls = [...css.matchAll(/(?:^|[;{}\s])([a-z-]+)\s*:\s*([^;{}]+);/g)].map((m) => [m[1] as string, (m[2] as string).trim()] as const);
+    const bad: string[] = [];
+    const px = (v: string): number[] => [...v.replace(/(?:max|min|calc|env|var)\([^)]*\)/g, '').matchAll(/(-?\d+(?:\.\d+)?)px/g)].map((m) => Number(m[1]));
+    for (const [prop, v] of decls) {
+      if (prop === 'border-radius') for (const t of v.split(/\s+/)) if (!['0', '6px', '8px', '999px', '50%', 'inherit'].includes(t)) bad.push(prop + ': ' + v);
+      if (prop === 'font-size' && /^\d/.test(v) && ![13, 15, 17, 22].includes(Number.parseFloat(v))) bad.push(prop + ': ' + v);
+      if (prop === 'font-weight' && ![400, 600].includes(Number(v))) bad.push(prop + ': ' + v);
+      if (/^(padding|margin|gap|row-gap|column-gap)(-|$)/.test(prop)) for (const n of px(v)) if (![0, 4, 8, 12, 16, 24].includes(Math.abs(n))) bad.push(prop + ': ' + v);
+    }
+    expect(bad).toEqual([]);
+    expect(decls.filter(([p]) => p === 'font-size').length).toBeGreaterThan(5); // the scan did read the file
+  });
+
+  it('has no emoji or symbol glyphs in the markup, and no animation on the rotate overlay', () => {
+    expect(html).not.toMatch(/[\u{1F000}-\u{1FAFF}\u2600-\u27BF\u25CF]/u);
+    expect(rule('.phone-icon')).not.toMatch(/animation/);
+    expect(rule('.phone-icon')).toMatch(/rotate\(90deg\)/); // drawn sideways, not turning
+  });
+
+  it('manifest: fullscreen, 192 and 512 icons that exist, and NO start_url (the saved URL keeps ?t=)', () => {
+    const m = JSON.parse(read('manifest.webmanifest')) as Record<string, unknown>;
+    expect(m).not.toHaveProperty('start_url');
+    expect(m['display']).toBe('fullscreen');
+    const icons = m['icons'] as Array<{ src: string; sizes: string }>;
+    for (const size of ['192x192', '512x512']) expect(icons.some((i) => i.sizes === size)).toBe(true);
+    for (const i of icons) expect(() => readFileSync(join(UI_DIR, i.src))).not.toThrow();
+    const png = (f: string): [number, number] => {
+      const b = readFileSync(join(UI_DIR, f));
+      return [b.readUInt32BE(16), b.readUInt32BE(20)];
+    };
+    expect(png('icon-192.png')).toEqual([192, 192]);
+    expect(png('icon-512.png')).toEqual([512, 512]);
+  });
+
+  it('wake.mp4 is a real mp4, and the build copies every page file', () => {
+    expect(readFileSync(join(UI_DIR, 'wake.mp4')).subarray(4, 8).toString('latin1')).toBe('ftyp');
+    const copy = readFileSync(join(ROOT, 'src', 'renderer', 'copy-static.mjs'), 'utf8');
+    for (const f of ['index.html', 'controller.css', 'apple-touch-icon.png', 'icon-192.png', 'icon-512.png', 'wake.mp4', 'manifest.webmanifest']) expect(copy, f).toContain("'" + f + "'");
   });
 
   it('never logs, never stores layouts on the phone, builds no HTML from strings', () => {
@@ -669,7 +723,7 @@ describe('control operations behind the More panel', () => {
     expect(T.dimRange(20)).toEqual({ min: 8, max: 40 });
     expect(T.dimRange(5)).toEqual({ min: 5, max: 40 });
     expect(T.dimRange(60)).toEqual({ min: 8, max: 60 });
-    expect(T.gridHeight(12)).toBe(24 + 2 * 44 + 6);
+    expect(T.gridHeight(12)).toBe(24 + 2 * 44 + 4);
     expect(T.gridHeight(6)).toBe(24 + 44);
     const stick = ctl(planStore(), 'stick-left');
     expect(T.controlBox(stick)).toEqual([38, 38]);
@@ -895,7 +949,8 @@ describe('haptic decisions', () => {
     expect(T.homeScreenMode(IPHONE_UA, 5, true, false)).toBeNull(); // already opened from the home screen
     expect(T.homeScreenMode('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5, false, true)).toBe('prompt');
     expect(T.homeScreenMode('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5, true, true)).toBeNull();
-    expect(T.homeScreenMode('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5, false, false)).toBeNull();
+    expect(T.homeScreenMode('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5, false, false)).toBe('steps'); // no install prompt on a LAN address: text steps
+    expect(T.homeScreenMode('Mozilla/5.0 (Linux; Android 14; Pixel 8) Chrome/120', 5, true, false)).toBeNull();
     expect(T.homeScreenMode('Mozilla/5.0 (X11; Linux x86_64) Firefox/120.0', 0, false, false)).toBeNull();
   });
 
@@ -1086,9 +1141,9 @@ describe('protocol helpers', () => {
     for (const bad of ['', 'nope', '[]', '{"t":"welcome","slot":0}', '{"t":"welcome","slot":2.5}', '{"t":"x"}', 5, null, 'x'.repeat(600)]) expect(T.parseServerMessage(bad)).toBeNull();
   });
   it('has the exact notice strings', () => {
-    expect(T.statusText('connecting', null)).toBe('Connecting…');
+    expect(T.statusText('connecting', null)).toBe('Connecting...');
     expect(T.statusText('connected', 2)).toBe('Player 2');
-    expect(T.statusText('retrying', null)).toBe('Disconnected — retrying…');
+    expect(T.statusText('retrying', null)).toBe('Disconnected — retrying...');
     expect(T.statusText('full', null)).toBe('All 4 player slots are taken');
     expect(T.statusText('kicked', null)).toBe('Removed from this PC');
     expect(T.statusText('notoken', null)).toBe('Open the link or QR code from the LanPlay host screen');
@@ -1196,7 +1251,7 @@ describe('connecting', () => {
     h = await mount({ welcome: false });
     expect(h.ws().url).toBe(SOCKET_URL('tok-123'));
     h.ws().open();
-    expect(h.ws().frames()).toEqual([{ t: 'hello', name: expect.stringMatching(/^Phone \d{2}$/) }]);
+    expect(h.ws().frames()).toEqual([{ t: 'hello', name: expect.stringMatching(/^Phone \d{2}$/), id: expect.stringMatching(/^[A-Za-z0-9_-]{16,32}$/) }]);
     h.ws().receive({ t: 'welcome', slot: 2 });
     expect(h.ws().states()).toEqual([NEUTRAL]);
   });
@@ -1756,7 +1811,7 @@ describe('reconnecting', () => {
     expect(FakeSocket.all).toHaveLength(2);
     const second = h.ws(1);
     second.open();
-    expect(second.frames()).toEqual([{ t: 'hello', name }]);
+    expect(second.frames()).toEqual([{ t: 'hello', name, id: h.ws(0).frames()[0]?.['id'] }]); // the same phone id
     ptr(h.ctl('btn-x'), 'pointerdown', 1);
     expect(second.count('s')).toBe(0);
     second.receive({ t: 'welcome', slot: 3 });
@@ -1839,6 +1894,55 @@ describe('full and kicked are final', () => {
     expect(FakeSocket.all).toHaveLength(1);
     window.dispatchEvent(new Event('blur'));
     expect(ws.sent.length).toBe(n);
+  });
+});
+
+describe('replaced by another tab of the same phone is final', () => {
+  it('close reason "replaced": no reconnect, one-line notice, Reconnect button; Reconnect starts a new socket', async () => {
+    h = await mount();
+    const ws = h.ws();
+    const n = ws.sent.length;
+    ws.drop('replaced', 1000);
+    expect(noticeVisible()).toBe(true);
+    expect(document.getElementById('notice-text')?.textContent).toBe('Open in another tab');
+    const btn = document.getElementById('retry') as HTMLElement;
+    expect(btn.hidden).toBe(false);
+    expect(btn.textContent).toBe('Reconnect');
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    expect(ws.sent.length).toBe(n);
+    vi.advanceTimersByTime(120_000);
+    window.dispatchEvent(new Event('online'));
+    visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+    visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(FakeSocket.all).toHaveLength(1);
+    tapAt(btn);
+    expect(FakeSocket.all).toHaveLength(2);
+    expect(noticeVisible()).toBe(false);
+    FakeSocket.all[1]!.open();
+    FakeSocket.all[1]!.receive({ t: 'welcome', slot: 1 });
+    expect(noticeVisible()).toBe(false);
+  });
+  it('any other close (network, idle) still retries', async () => {
+    h = await mount();
+    h.ws().drop('', 1006);
+    expect(noticeVisible()).toBe(false);
+    vi.advanceTimersByTime(10_000);
+    expect(FakeSocket.all.length).toBeGreaterThan(1);
+    h.ws().drop('idle', 1001);
+    vi.advanceTimersByTime(10_000);
+    expect(FakeSocket.all.length).toBeGreaterThan(2);
+  });
+  it('a stale socket closing with "replaced" after the page already moved on is ignored', async () => {
+    h = await mount();
+    const old = h.ws();
+    old.drop('', 1006); // the page drops it and reconnects
+    vi.advanceTimersByTime(10_000);
+    const next = FakeSocket.all[FakeSocket.all.length - 1]!;
+    expect(next).not.toBe(old);
+    old.onclose?.({ code: 1000, reason: 'replaced' });
+    expect(noticeVisible()).toBe(false);
   });
 });
 
@@ -2320,7 +2424,8 @@ describe('edit mode', () => {
     expect(h.ws().count('k')).toBeGreaterThanOrEqual(k + 3);
   });
 
-  it('with nothing selected, the settings card shows slots 1 2 3, Reset, Stick sensitivity and Haptics, centred', async () => {
+  it('with nothing selected, the settings card shows slots 1 2 3, Reset, Stick sensitivity, Haptics and Link, centred', async () => {
+    rect(doneEl(), FW / 2 - 54, 4, 108, 52); // Done sits at the top centre: the card starts below it
     await enter();
     expect(cardEl().hidden).toBe(false);
     expect(cardEl().classList.contains('is-settings')).toBe(true);
@@ -2330,14 +2435,18 @@ describe('edit mode', () => {
     expect(valueOf('Stick sensitivity')).toBe('1.0');
     expect(cardEl().querySelector('.switch')?.getAttribute('aria-checked')).toBe('true');
     expect(cardEl().style.left).toBe(String(FW / 2) + 'px');
-    // it sits where it covers no control, so every control can still be tapped to select it
+    // it sits where it hides the least, so every control can still be tapped to select it: the centre of each stays clear, and at
+    // least two thirds of each is in the open
     const b = cardBox();
     for (const c of T.activeLayout(host.store).controls) {
       const [w, hh] = T.controlBox(c) as [number, number];
       const cx = (c.x / 100) * FW;
       const cy = (c.y / 100) * FH;
-      const covers = cx + (w * FH) / 200 > b.l && cx - (w * FH) / 200 < b.r && cy + (hh * FH) / 200 > b.t && cy - (hh * FH) / 200 < b.b;
-      expect(covers, c.id).toBe(false);
+      const [bw, bh] = [(w * FH) / 100, (hh * FH) / 100];
+      const ox = Math.max(0, Math.min(cx + bw / 2, b.r) - Math.max(cx - bw / 2, b.l));
+      const oy = Math.max(0, Math.min(cy + bh / 2, b.b) - Math.max(cy - bh / 2, b.t));
+      expect(cx > b.l && cx < b.r && cy > b.t && cy < b.b, c.id + ' centre').toBe(false);
+      expect((ox * oy) / (bw * bh), c.id + ' covered').toBeLessThan(1 / 3);
     }
   });
 
@@ -2569,15 +2678,21 @@ describe('edit mode', () => {
     expect(valueOf('Stick sensitivity')).toBe('2.0');
     drag('Stick sensitivity', 0);
     expect(valueOf('Stick sensitivity')).toBe('0.5');
-    const sw = cardEl().querySelector('.switch') as HTMLElement;
+    const chip = (label: string): HTMLElement => [...cardEl().querySelectorAll<HTMLElement>('.choice[aria-label="Haptics"] .opt')].find((e) => e.textContent === label) as HTMLElement;
+    const checked = (): string[] => [...cardEl().querySelectorAll('.choice[aria-label="Haptics"] .opt[aria-checked="true"]')].map((e) => e.textContent ?? '');
+    expect(checked()).toEqual(['Light']);
     vibrate?.mockClear();
-    tapAt(sw);
-    expect(sw.getAttribute('aria-checked')).toBe('false');
+    tapAt(chip('Off'));
+    expect(checked()).toEqual(['Off']);
     expect(vibrate).not.toHaveBeenCalled(); // switching off is silent
-    tapAt(sw);
-    expect(sw.getAttribute('aria-checked')).toBe('true');
-    expect(vibrate).toHaveBeenCalledWith(10); // one tick when switched on
-    tapAt(sw); // off again, saved with Done
+    tapAt(chip('Light'));
+    expect(checked()).toEqual(['Light']);
+    expect(vibrate).toHaveBeenLastCalledWith(10); // one tick of the chosen strength
+    tapAt(chip('Strong'));
+    expect(checked()).toEqual(['Strong']);
+    expect(vibrate).toHaveBeenLastCalledWith(25);
+    expect(storage.get('lanplay.haptic.strength')).toBe('strong');
+    tapAt(chip('Off')); // off again, saved with Done
     tapAt(doneEl());
     await settle();
     const saved = host.puts()[0] as LayoutStore;
@@ -2672,6 +2787,11 @@ describe('Add to Home Screen', () => {
   const iosUa = (): void => void Object.defineProperty(navigator, 'userAgent', { configurable: true, value: IPHONE_UA });
   const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36';
   const homeRow = (): HTMLElement | undefined => [...cardEl().querySelectorAll<HTMLElement>('.card-btn')].find((b) => b.textContent === 'Add to Home Screen');
+  /** The home screen row lives under the card's Device "More" (collapsed by default). */
+  const openDevice = (): void => {
+    const more = cardEl().querySelector<HTMLElement>('.more');
+    if (more?.getAttribute('aria-expanded') === 'false') tapAt(more);
+  };
   const dismiss = (): void => tapAt(document.getElementById('a2hs-close') as Element);
 
   it('the sheet markup: three short steps with an inline share glyph, the two notes, a big Close; no inline styles', () => {
@@ -2799,6 +2919,7 @@ describe('Add to Home Screen', () => {
     expect(h.ws().states().at(-1)?.buttons).toBe(BTN.A);
     tapAt(menuEl());
     await settle();
+    openDevice();
     tapAt(homeRow() as Element);
     expect(sheet().hidden).toBe(false);
     expect(h.ws().states().at(-1)?.buttons).toBe(0);
@@ -2810,10 +2931,13 @@ describe('Add to Home Screen', () => {
     h = await mount();
     tapAt(menuEl());
     await settle();
+    expect(homeRow()).toBeUndefined(); // collapsed under Device / More
+    expect(parseFloat(cardEl().style.height)).toBe(T.CARD_PAD + 5 * T.ROW_H);
+    openDevice();
     const row = homeRow() as HTMLElement;
     expect(row).toBeTruthy();
-    expect(cardEl().querySelectorAll('.card-btn.wide')).toHaveLength(1);
-    expect(parseFloat(cardEl().style.height)).toBe(T.CARD_PAD + 5 * T.ROW_H);
+    expect(cardEl().querySelectorAll('.card-btn.wide')).toHaveLength(1); // no Full screen button on iOS
+    expect(parseFloat(cardEl().style.height)).toBe(T.CARD_PAD + 5 * T.ROW_H + T.ROW_TWO_H + T.ROW_H);
     tapAt(row);
     expect(sheet().hidden).toBe(false);
     expect(editing()).toBe(true);
@@ -2828,8 +2952,9 @@ describe('Add to Home Screen', () => {
     h = await mount();
     tapAt(menuEl());
     await settle();
+    openDevice();
     expect(homeRow()).toBeUndefined();
-    expect(parseFloat(cardEl().style.height)).toBe(T.CARD_PAD + 4 * T.ROW_H);
+    expect(parseFloat(cardEl().style.height)).toBe(T.CARD_PAD + 5 * T.ROW_H + T.ROW_TWO_H);
   });
 
   it('Android Chrome: the install prompt it hands over backs the same row, once', async () => {
@@ -2838,7 +2963,9 @@ describe('Add to Home Screen', () => {
     h = await mount();
     tapAt(menuEl());
     await settle();
-    expect(homeRow()).toBeUndefined(); // nothing to offer until the browser says the page is installable
+    openDevice();
+    expect(homeRow()).toBeUndefined(); // no install prompt on a LAN address: written steps instead
+    expect([...cardEl().querySelectorAll('.card-fact')].map((e) => e.textContent)).toContain('Chrome menu, then Add to Home screen');
     tapAt(doneEl());
     await settle();
     const prompt = vi.fn(async () => ({ outcome: 'dismissed' }));
@@ -2847,6 +2974,7 @@ describe('Add to Home Screen', () => {
     expect(ev.defaultPrevented).toBe(true); // no mini-infobar: the row is the way in
     tapAt(menuEl());
     await settle();
+    openDevice();
     expect(homeRow()).toBeTruthy();
     expect(sheet().hidden).toBe(true);
     tapAt(homeRow() as Element);
@@ -2863,6 +2991,7 @@ describe('Add to Home Screen', () => {
     window.dispatchEvent(new Event('appinstalled'));
     tapAt(menuEl());
     await settle();
+    openDevice();
     expect(homeRow()).toBeUndefined();
   });
 });
@@ -3072,12 +3201,12 @@ describe('edit mode: More, Add control, Duplicate, Delete', () => {
     expect(decl('.card-row')).toMatch(/height:\s*44px/);
     expect(decl('.choice')).toMatch(/height:\s*44px/);
     expect(decl('.card-input')).toMatch(/height:\s*44px/);
-    expect(decl('.card-input')).toMatch(/font-size:\s*16px/); // iOS zooms the page for anything smaller
+    expect(decl('.card-input')).toMatch(/font-size:\s*17px/); // iOS zooms the page for anything smaller
     expect(decl('.card-input')).toMatch(/user-select:\s*text/); // the page is user-select: none, which would stop typing
     expect(decl('.opt')).toMatch(/min-width:\s*44px/);
     expect(decl('.card')).toMatch(/overflow-y:\s*auto/);
     expect(decl('.card')).toMatch(/overscroll-behavior:\s*contain/);
-    expect(T.CARD_W.more - 24 - 3 - 5 * 6).toBeGreaterThanOrEqual(6 * 44); // six chips of 44 pt fit a wrapped row
+    expect(T.CARD_W.more - 24 - 3 - 5 * 4).toBeGreaterThanOrEqual(6 * 44); // six chips of 44 pt fit a wrapped row
   });
 
   it('the label field can be typed in: the page does not cancel its selection, and a resize (the keyboard) does not rebuild the card', () => {
@@ -3182,9 +3311,10 @@ describe('edit mode: More, Add control, Duplicate, Delete', () => {
     fixedPoint(st);
   });
 
-  it('the settings card has 4 rows (slots and Reset, Add, Stick sensitivity, Haptics) and no home screen row off iOS', () => {
-    expect(cardBox().b - cardBox().t).toBe(T.CARD_PAD + 4 * T.ROW_H);
-    expect(cardEl().textContent).not.toContain('Home Screen');
+  it('the settings card has 5 rows (slots and Reset, Add, Stick sensitivity, Haptics, Link and More); the device rows stay collapsed', () => {
+    expect(cardBox().b - cardBox().t).toBe(T.CARD_PAD + 5 * T.ROW_H);
+    expect(cardEl().textContent).not.toContain('Home');
+    expect(cardEl().textContent).not.toContain('Stay awake');
     expect(cardBox().r - cardBox().l).toBe(T.CARD_W.settings);
   });
 });
@@ -3238,6 +3368,531 @@ describe('a short phone (874x320)', () => {
     vi.advanceTimersByTime(10);
     ptr(h.ctl('stick-right'), 'pointermove', 1, c.x + (30 * 3.2) / 2, c.y);
     expect(h.ws().states().at(-1)?.rx).toBe(32767);
+  });
+});
+
+// ---- Phone id, link probe, dead link, slot feedback (release 0.5) --------------------------------------------------------
+
+describe('phone id', () => {
+  it('is 24 symbols from the id alphabet, made from random bytes', () => {
+    const id = T.newPhoneId(Uint8Array.from({ length: 24 }, (_, i) => i * 11));
+    expect(id).toMatch(/^[A-Za-z0-9_-]{24}$/);
+    expect(T.newPhoneId(new Uint8Array(24))).toBe('A'.repeat(24));
+    expect(T.newPhoneId([])).toBe('A'.repeat(24)); // never throws on short input
+    expect(T.isPhoneId(id)).toBe(true);
+    for (const bad of ['', 'short', 'x'.repeat(33), 'has space in it 123456', 'ünïcode-ünïcode-ünïcode', 5, null]) expect(T.isPhoneId(bad), String(bad)).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ t: 'hello', name: 'x', id }))).toEqual({ t: 'hello', name: 'x', id }); // the host accepts what the page makes
+  });
+
+  it('is sent in hello, kept in storage across loads, and used for the layout requests', async () => {
+    h = await mount();
+    const id = h.ws().frames()[0]?.['id'] as string;
+    expect(T.isPhoneId(id)).toBe(true);
+    expect(storage.get(T.ID_KEY)).toBe(id);
+    expect(host.calls.filter((c) => c.path === '/api/layouts').every((c) => c.id === id)).toBe(true);
+    h.destroy();
+    FakeSocket.all = [];
+    h = await mount();
+    expect(h.ws().frames()[0]?.['id']).toBe(id);
+  });
+
+  it('replaces a stored value of the wrong shape, and without storage stays the same for every reconnect of the page', async () => {
+    storage.set(T.ID_KEY, 'not an id!');
+    h = await mount();
+    const id = h.ws().frames()[0]?.['id'] as string;
+    expect(T.isPhoneId(id)).toBe(true);
+    expect(storage.get(T.ID_KEY)).toBe(id);
+    h.destroy();
+    vi.stubGlobal('localStorage', {
+      getItem: () => {
+        throw new Error('blocked');
+      },
+      setItem: () => {
+        throw new Error('blocked');
+      },
+    });
+    FakeSocket.all = [];
+    h = await mount();
+    const blocked = h.ws().frames()[0]?.['id'] as string;
+    expect(T.isPhoneId(blocked)).toBe(true);
+    h.ws().drop();
+    await vi.advanceTimersByTimeAsync(600);
+    h.ws().open();
+    expect(h.ws().frames()[0]?.['id']).toBe(blocked);
+  });
+});
+
+describe('link probe and round trip', () => {
+  const linkRow = (): string => [...cardEl().querySelectorAll('.card-label')].map((e) => e.textContent ?? '').find((t) => t.startsWith('Link')) ?? '';
+
+  it('parses an echo, keeps a sample window, shows the median', () => {
+    expect(T.parseServerMessage('{"t":"p","n":7}')).toEqual({ t: 'p', n: 7 });
+    for (const bad of ['{"t":"p"}', '{"t":"p","n":-1}', '{"t":"p","n":1.5}', '{"t":"p","n":"1"}']) expect(T.parseServerMessage(bad), bad).toBeNull();
+    expect(T.medianRtt([])).toBeNull();
+    expect(T.medianRtt([9])).toBe(9);
+    expect(T.medianRtt([80, 5, 6, 7, 8])).toBe(7); // one hiccup does not move it
+    expect(T.linkText(null)).toBe('Link: ...');
+    expect(T.linkText(5.6)).toBe('Link: 6 ms');
+  });
+
+  it('sends {"t":"p","n":N} once on welcome and then every second; the host parser accepts each one', async () => {
+    h = await mount();
+    const ws = h.ws();
+    expect(ws.pings).toEqual([1]);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(ws.pings).toEqual([1, 2, 3, 4]);
+    expect(ws.sent.every((f) => !f.includes('"t":"p"'))).toBe(true);
+    for (const n of ws.pings) expect(parseClientMessage(JSON.stringify({ t: 'p', n }))).toEqual({ t: 'p', n });
+    expect(h.ws().frames().every((f) => f.t !== 'p')).toBe(true);
+  });
+
+  it('no probe before welcome, none after the socket is gone', async () => {
+    h = await mount({ welcome: false });
+    h.ws().open();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(h.ws().pings).toEqual([]);
+    h.ws().receive({ t: 'welcome', slot: 1 });
+    expect(h.ws().pings).toEqual([1]);
+    const first = h.ws();
+    first.drop();
+    await vi.advanceTimersByTimeAsync(400);
+    expect(first.pings).toEqual([1]);
+  });
+
+  it('the settings card shows "Link: N ms" from the echoes and updates it while open; the dot is amber above 40 ms', async () => {
+    FakeSocket.echo = false;
+    h = await mount();
+    const ws = h.ws();
+    /** Answer probe n after `ms` have passed since it went out. */
+    const echo = async (n: number, ms: number): Promise<void> => {
+      while (!ws.pings.includes(n)) await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(ms);
+      ws.receive({ t: 'p', n });
+    };
+    expect(menuEl().dataset['state']).toBe('connected');
+    tapAt(menuEl());
+    await settle();
+    expect(linkRow()).toBe('Link: ...');
+    await vi.advanceTimersByTimeAsync(6); // probe 1 went out 16 ms ago (the 10 ms of mount count)
+    ws.receive({ t: 'p', n: 1 });
+    expect(linkRow()).toBe('Link: 16 ms');
+    await echo(2, 4);
+    expect(linkRow()).toBe('Link: 16 ms'); // median of 16 and 4 (the upper one of two)
+    expect(menuEl().dataset['state']).toBe('connected');
+    await echo(3, 60);
+    expect(linkRow()).toBe('Link: 16 ms'); // one hiccup does not move it
+    expect(menuEl().dataset['state']).toBe('connected');
+    await echo(4, 60);
+    expect(linkRow()).toBe('Link: 60 ms');
+    expect(menuEl().dataset['state']).toBe('retrying'); // amber above 40 ms
+    await echo(5, 5);
+    await echo(6, 5);
+    await echo(7, 5);
+    expect(linkRow()).toBe('Link: 5 ms');
+    expect(menuEl().dataset['state']).toBe('connected'); // and green again
+    expect(h.ws()).toBe(ws); // the same socket all along
+  });
+
+  it('an echo for an unknown probe changes nothing', async () => {
+    FakeSocket.echo = false;
+    h = await mount();
+    h.ws().receive({ t: 'p', n: 999 });
+    tapAt(menuEl());
+    await settle();
+    expect(linkRow()).toBe('Link: ...');
+  });
+});
+
+describe('dead link', () => {
+  it('no echo for 2 s drops the socket and opens a new one at once, with the same id; the echo of a live link keeps it', async () => {
+    FakeSocket.echo = false;
+    h = await mount();
+    const first = h.ws();
+    const id = first.frames()[0]?.['id'];
+    await vi.advanceTimersByTimeAsync(1980); // 10 ms were spent in mount
+    expect(FakeSocket.all).toHaveLength(1);
+    expect(first.closed).toBe(false);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(FakeSocket.all).toHaveLength(2); // at once: no 500 ms backoff
+    expect(first.closed).toBe(true);
+    expect(menuEl().dataset['state']).toBe('retrying');
+    const second = h.ws();
+    second.open();
+    expect(second.frames()).toEqual([{ t: 'hello', name: expect.any(String), id }]);
+    second.receive({ t: 'welcome', slot: 2 });
+    expect(menuEl().dataset['state']).toBe('connected');
+    expect(menuEl().getAttribute('aria-label')).toBe('Menu, Player 2');
+    expect(second.states()).toEqual([NEUTRAL]); // the current (neutral) state is sent again
+  });
+
+  it('a late echo inside the 2 s keeps the link', async () => {
+    FakeSocket.echo = false;
+    h = await mount();
+    const ws = h.ws();
+    await vi.advanceTimersByTimeAsync(1500);
+    ws.receive({ t: 'p', n: 1 });
+    await vi.advanceTimersByTimeAsync(1000);
+    ws.receive({ t: 'p', n: 2 });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(FakeSocket.all).toHaveLength(1);
+    expect(ws.closed).toBe(false);
+  });
+
+  it('the first unanswered probe counts: echoes that stop mid-game end the link 2 s after the last answered probe', async () => {
+    h = await mount();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(FakeSocket.all).toHaveLength(1);
+    FakeSocket.echo = false;
+    await vi.advanceTimersByTimeAsync(1000); // the probe at 4 s gets no answer
+    await vi.advanceTimersByTimeAsync(1980);
+    expect(FakeSocket.all).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(FakeSocket.all).toHaveLength(2);
+  });
+
+  it('releases every control on the dead link, and the new socket starts neutral', async () => {
+    FakeSocket.echo = false;
+    h = await mount();
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.A);
+    await vi.advanceTimersByTimeAsync(2100);
+    const second = h.ws();
+    expect(second).not.toBe(FakeSocket.all[0]);
+    second.open();
+    second.receive({ t: 'welcome', slot: 2 });
+    expect(second.states().at(-1)?.buttons).toBe(0);
+    expect(h.ctl('btn-a').classList.contains('is-down')).toBe(false);
+  });
+
+  it('a socket that never opens is abandoned after 4 s and retried with the backoff', async () => {
+    h = await mount({ welcome: false });
+    await vi.advanceTimersByTimeAsync(3990);
+    expect(FakeSocket.all).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(FakeSocket.all[0]?.closed).toBe(true);
+    expect(FakeSocket.all).toHaveLength(1); // the backoff is 500 ms
+    await vi.advanceTimersByTimeAsync(500);
+    expect(FakeSocket.all).toHaveLength(2);
+  });
+
+  it('the network coming back replaces an attempt that started while it was down; coming to the foreground does not', async () => {
+    h = await mount({ welcome: false });
+    await settle();
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(FakeSocket.all).toHaveLength(1); // already in flight
+    window.dispatchEvent(new Event('online'));
+    expect(FakeSocket.all).toHaveLength(2);
+    expect(FakeSocket.all[0]?.closed).toBe(true);
+    h.ws().open();
+    h.ws().receive({ t: 'welcome', slot: 3 });
+    expect(menuEl().dataset['state']).toBe('connected');
+  });
+
+  it('re-attach: after a drop the page says hello with the same id and shows the same player number again', async () => {
+    h = await mount();
+    const id = h.ws().frames()[0]?.['id'];
+    h.ws().drop();
+    await vi.advanceTimersByTimeAsync(500);
+    const second = h.ws();
+    second.open();
+    expect(second.frames()[0]).toEqual({ t: 'hello', name: expect.any(String), id });
+    second.receive({ t: 'welcome', slot: 2 });
+    expect((document.getElementById('slot-toast') as HTMLElement).textContent).toBe('Player 2');
+    expect((document.getElementById('slot-toast') as HTMLElement).hidden).toBe(false);
+  });
+});
+
+describe('player number on connect', () => {
+  const toast = (): HTMLElement => document.getElementById('slot-toast') as HTMLElement;
+  it('shows "Player N" for 1.5 s in the middle, on every welcome', async () => {
+    h = await mount({ welcome: false });
+    expect(toast().hidden).toBe(true);
+    h.ws().open();
+    h.ws().receive({ t: 'welcome', slot: 3 });
+    expect(toast().hidden).toBe(false);
+    expect(toast().textContent).toBe('Player 3');
+    expect(toast().getAttribute('role')).toBe('status');
+    await vi.advanceTimersByTimeAsync(T.SLOT_TOAST_MS - 1);
+    expect(toast().hidden).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(toast().hidden).toBe(true);
+    h.ws().drop();
+    await vi.advanceTimersByTimeAsync(500);
+    h.ws().open();
+    h.ws().receive({ t: 'welcome', slot: 3 });
+    expect(toast().hidden).toBe(false);
+  });
+});
+
+describe('full screen, landscape lock, stay awake: optional on every phone', () => {
+  const ANDROID_UA = 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36';
+  const root = (): Any => document.documentElement;
+  let fsElement: Element | null = null;
+  const setFullscreen = (on: boolean): void => {
+    fsElement = on ? root() : null;
+    document.dispatchEvent(new Event('fullscreenchange'));
+  };
+  const firstTap = (): void => {
+    ptr(document.getElementById('field') as Element, 'pointerdown', 70, 1, 1);
+    ptr(document.getElementById('field') as Element, 'pointerup', 70, 1, 1);
+  };
+  const androidUa = (): void => void Object.defineProperty(navigator, 'userAgent', { configurable: true, value: ANDROID_UA });
+  const openDevice = (): void => {
+    tapAt(menuEl());
+    const more = cardEl().querySelector<HTMLElement>('.more');
+    if (more?.getAttribute('aria-expanded') === 'false') tapAt(more);
+  };
+
+  const realPlay = (HTMLMediaElement.prototype as Any).play;
+  beforeEach(() => {
+    fsElement = null;
+    Object.defineProperty(document, 'fullscreenElement', { configurable: true, get: () => fsElement });
+    (HTMLMediaElement.prototype as Any).play = async () => {
+      throw new Error('NotAllowedError'); // a browser that refuses; tests that want it to work replace it
+    };
+  });
+  afterEach(() => {
+    delete root().requestFullscreen;
+    delete (document as Any).fullscreenElement;
+    delete (navigator as Any).wakeLock;
+    delete (screen as Any).orientation;
+    (HTMLMediaElement.prototype as Any).play = realPlay;
+  });
+
+  it('with requestFullscreen, wakeLock, orientation.lock and vibrate all missing, the page plays and says so', async () => {
+    delete root().requestFullscreen;
+    delete (navigator as Any).wakeLock;
+    delete (navigator as Any).vibrate;
+    delete (screen as Any).orientation;
+    androidUa();
+    expect(typeof navigator.vibrate).not.toBe('function');
+    h = await mount();
+    expect(() => firstTap()).not.toThrow();
+    await settle();
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.A);
+    ptr(h.ctl('btn-a'), 'pointerup', 1);
+    vi.advanceTimersByTime(40);
+    expect(h.ws().states().at(-1)?.buttons).toBe(0);
+    openDevice();
+    expect(cardEl().textContent).toContain('Not available: set Auto-Lock to Never'); // the video could not play either
+    expect(cardEl().textContent).not.toContain('Full screen'); // nothing to offer
+    expect(cardEl().textContent).toContain('Chrome menu, then Add to Home screen');
+    expect([...cardEl().querySelectorAll('.choice[aria-label="Haptics"]')]).toHaveLength(0); // no vibrate: the plain On/Off switch
+  });
+
+  it('the first tap, and only the first, asks for full screen without browser UI, then locks landscape and takes a wake lock', async () => {
+    androidUa();
+    const lock = vi.fn(async () => undefined);
+    Object.defineProperty(screen, 'orientation', { configurable: true, value: { lock } });
+    root().requestFullscreen = vi.fn(async () => {
+      setFullscreen(true);
+    });
+    const release = vi.fn(async () => undefined);
+    const request = vi.fn(async () => ({ release, addEventListener: vi.fn() }));
+    Object.defineProperty(navigator, 'wakeLock', { configurable: true, value: { request } });
+    h = await mount();
+    expect(root().requestFullscreen).not.toHaveBeenCalled(); // nothing before a gesture
+    expect(request).not.toHaveBeenCalled();
+    firstTap();
+    await settle();
+    expect(root().requestFullscreen).toHaveBeenCalledWith({ navigationUI: 'hide' });
+    expect(lock).toHaveBeenCalledWith('landscape');
+    expect(request).toHaveBeenCalledWith('screen');
+    firstTap();
+    await settle();
+    expect(root().requestFullscreen).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(1);
+    openDevice();
+    expect(cardEl().textContent).toContain('Wake lock');
+    expect(cardEl().textContent).not.toContain('Full screen'); // already in it
+    h.destroy();
+    expect(release).toHaveBeenCalled();
+  });
+
+  it('leaving full screen (back gesture) offers one tap to go back in; "Not now" closes the offer; play is released meanwhile', async () => {
+    androidUa();
+    root().requestFullscreen = vi.fn(async () => {
+      setFullscreen(true);
+    });
+    h = await mount();
+    const offer = document.getElementById('fs-offer') as HTMLElement;
+    expect(offer.hidden).toBe(true);
+    firstTap();
+    await settle();
+    ptr(h.ctl('btn-b'), 'pointerdown', 2);
+    expect(h.ws().states().at(-1)?.buttons).toBe(BTN.B);
+    setFullscreen(false);
+    expect(offer.hidden).toBe(false);
+    expect(h.ws().states().at(-1)?.buttons).toBe(0);
+    tapAt(document.getElementById('fs-go') as Element);
+    await settle();
+    expect(root().requestFullscreen).toHaveBeenCalledTimes(2);
+    expect(offer.hidden).toBe(true);
+    setFullscreen(false);
+    expect(offer.hidden).toBe(false);
+    tapAt(document.getElementById('fs-skip') as Element);
+    expect(offer.hidden).toBe(true);
+    openDevice(); // the card still has a button for it
+    expect([...cardEl().querySelectorAll('.card-btn.wide')].map((b) => b.textContent)).toContain('Full screen');
+  });
+
+  it('a refused request (no gesture, no permission) leaves no offer and no error', async () => {
+    androidUa();
+    root().requestFullscreen = vi.fn(async () => {
+      throw new Error('denied');
+    });
+    const lock = vi.fn(async () => undefined);
+    Object.defineProperty(screen, 'orientation', { configurable: true, value: { lock } });
+    h = await mount();
+    firstTap();
+    await settle();
+    expect(lock).not.toHaveBeenCalled();
+    expect((document.getElementById('fs-offer') as HTMLElement).hidden).toBe(true);
+  });
+
+  it('a lock that is refused (desktop, not fullscreen) is ignored', async () => {
+    androidUa();
+    root().requestFullscreen = vi.fn(async () => undefined);
+    Object.defineProperty(screen, 'orientation', {
+      configurable: true,
+      value: {
+        lock: () => {
+          throw new Error('NotSupportedError');
+        },
+      },
+    });
+    h = await mount();
+    expect(() => firstTap()).not.toThrow();
+    await settle();
+  });
+
+  it('iPhone: no full screen request and no offer (the home screen sheet is its way), the wake path still runs', async () => {
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: IPHONE_UA });
+    storage.set('lanplay.home.seen', '1');
+    root().requestFullscreen = vi.fn(async () => undefined);
+    const request = vi.fn(async () => ({ release: async () => undefined }));
+    Object.defineProperty(navigator, 'wakeLock', { configurable: true, value: { request } });
+    h = await mount();
+    firstTap();
+    await settle();
+    expect(root().requestFullscreen).not.toHaveBeenCalled();
+    expect(request).toHaveBeenCalledWith('screen');
+    setFullscreen(false);
+    expect((document.getElementById('fs-offer') as HTMLElement).hidden).toBe(true);
+  });
+
+  it('no navigator.wakeLock (plain http): a muted, looping, inline video is started on the first tap; the card says so', async () => {
+    delete (navigator as Any).wakeLock;
+    const play = vi.fn(async () => undefined);
+    (HTMLMediaElement.prototype as Any).play = play;
+    h = await mount();
+    expect(document.querySelector('video')).toBeNull();
+    firstTap();
+    await settle();
+    const v = document.querySelector('video') as HTMLVideoElement;
+    expect(v).toBeTruthy();
+    expect(v.getAttribute('src')).toBe('wake.mp4');
+    expect(v.muted).toBe(true);
+    expect(v.loop).toBe(true);
+    expect(v.hasAttribute('playsinline')).toBe(true);
+    expect(v.getAttribute('aria-hidden')).toBe('true');
+    expect(play).toHaveBeenCalledTimes(1);
+    openDevice();
+    expect(cardEl().textContent).toContain('Muted video');
+    // the browser pauses it while the page is hidden: shown again, it is started again
+    visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+    visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(play).toHaveBeenCalledTimes(2);
+    h.destroy();
+    expect(document.querySelector('video')).toBeNull();
+  });
+
+  it('a wake lock the browser released (page hidden) is taken again when the page is shown', async () => {
+    const listeners: Array<() => void> = [];
+    const request = vi.fn(async () => ({ release: async () => undefined, addEventListener: (_t: string, fn: () => void) => listeners.push(fn) }));
+    Object.defineProperty(navigator, 'wakeLock', { configurable: true, value: { request } });
+    h = await mount();
+    firstTap();
+    await settle();
+    expect(request).toHaveBeenCalledTimes(1);
+    visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+    for (const fn of listeners) fn(); // the browser lets go
+    visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+    await settle();
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('accidental back', () => {
+  it('pushes one history entry and puts it back whenever it is used up', async () => {
+    const push = vi.spyOn(history, 'pushState');
+    h = await mount();
+    expect(push).toHaveBeenCalledTimes(1);
+    window.dispatchEvent(new PopStateEvent('popstate'));
+    expect(push).toHaveBeenCalledTimes(2);
+    expect(String(push.mock.calls[1]?.[2])).toContain('?t=tok-123'); // the saved URL keeps its token
+    push.mockRestore();
+  });
+  it('works where history.pushState throws', async () => {
+    const push = vi.spyOn(history, 'pushState').mockImplementation(() => {
+      throw new Error('SecurityError');
+    });
+    h = await mount();
+    expect(() => window.dispatchEvent(new PopStateEvent('popstate'))).not.toThrow();
+    push.mockRestore();
+  });
+});
+
+describe('haptic strength', () => {
+  it('Light is 10 ms and Strong 25 ms on a press tick, and an unknown stored value is Light', () => {
+    expect(T.hapticLevelOf(null)).toBe('light');
+    expect(T.hapticLevelOf('strong')).toBe('strong');
+    expect(T.hapticLevelOf('x')).toBe('light');
+    const calls: number[] = [];
+    const hz = T.createHaptics({ mode: 'android', enabled: () => true, vibrate: (ms: number) => calls.push(ms), tickMs: () => 25, now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout });
+    hz.tick();
+    expect(calls).toEqual([25]);
+  });
+  it('a button press vibrates for the stored strength; Off is silent', async () => {
+    stubVibrate();
+    storage.set(T.HAPTIC_KEY, 'strong');
+    h = await mount();
+    vibrate?.mockClear();
+    ptr(h.ctl('btn-a'), 'pointerdown', 1);
+    expect(vibrate).toHaveBeenCalledWith(25);
+    ptr(h.ctl('btn-a'), 'pointerup', 1);
+    vi.advanceTimersByTime(40);
+    tapAt(menuEl());
+    await settle();
+    tapAt([...cardEl().querySelectorAll<HTMLElement>('.choice[aria-label="Haptics"] .opt')].find((e) => e.textContent === 'Off') as Element);
+    tapAt(doneEl());
+    await settle();
+    vibrate?.mockClear();
+    ptr(h.ctl('btn-a'), 'pointerdown', 2);
+    expect(vibrate).not.toHaveBeenCalled();
+  });
+});
+
+describe('input path is untouched by the new features', () => {
+  it('a stick drag sends only state frames at <= 125 per second while probes run, and a probe is never part of the pad count', async () => {
+    h = await mount();
+    const c = h.at('stick-right');
+    ptr(h.ctl('stick-right'), 'pointerdown', 1, c.x, c.y);
+    const before = h.ws().count('s');
+    for (let i = 0; i < 1000; i++) {
+      ptr(h.ctl('stick-right'), 'pointermove', 1, c.x + 20 + (i % 20), c.y);
+      vi.advanceTimersByTime(1);
+    }
+    const frames = h.ws().count('s') - before;
+    expect(frames).toBeLessThanOrEqual(130);
+    expect(frames).toBeGreaterThan(100);
+    expect(h.ws().pings.length).toBeGreaterThanOrEqual(1);
+    expect(FakeSocket.all).toHaveLength(1);
   });
 });
 

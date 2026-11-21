@@ -30,6 +30,10 @@ describe.skipIf(!has)('PowerShell wrappers (pwsh 7.7 runtime smoke test)', () =>
     ['get-firewall-rules.ps1', ['-Names', ' , '], [2]],
     ['get-firewall-rules.ps1', ['-Names', 'Sunshine,LanPlay Pair Agent'], [0, 1]],
     ['set-agent-firewall-rule.ps1', ['-Port', '0', '-Name', 'x'], [2]],
+    ['set-internet-firewall-rule.ps1', ['-Enable', '2', '-Name', 'x'], [2]],
+    ['set-internet-firewall-rule.ps1', ['-Enable', '1', '-Name', 'x', '-TcpPorts', '47984,47989', '-UdpPorts', 'abc'], [2]],
+    ['set-internet-firewall-rule.ps1', ['-Enable', '1', '-Name', 'x', '-TcpPorts', '47984', '-UdpPorts', ''], [2]],
+    ['set-internet-firewall-rule.ps1', ['-Enable', '0', '-Name', 'LanPlay Internet Play'], [0, 1]], // Get-NetFirewallRule is Windows-only: still one JSON object, exit 1
     ['get-vigembus-status.ps1', [], [0, 1]],
     ['install-vigembus.ps1', ['-Installer', 'relative.exe'], [2]],
     ['install-vigembus.ps1', ['-Installer', path.join(ROOT, 'does-not-exist.exe')], [1]], // Get-Service is Windows-only: still one JSON object, exit 1

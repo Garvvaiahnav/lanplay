@@ -13,6 +13,7 @@ import type {
   AgentPairRequest,
   AgentPairResponse,
   AgentState,
+  CodePairResult,
   CreatePairAgent,
   KeyValueStore,
   PairAgent,
@@ -20,12 +21,21 @@ import type {
   PairErrorCode,
   PairedDevice,
   PendingApproval,
+  PendingCodePairing,
 } from '../../contracts.js';
 import { isPrivateAddress, normalizeAddress, parseHostHeader } from '../shared/ipnet.js';
 
 export const AGENT_VERSION = '1';
 export const AUTO_APPROVE_KEY = 'agent.autoApprove';
 export const LEDGER_KEY = 'agent.pairedDevices';
+/** The "Allow connections from the internet" switch (D07). Read by the host services; the agent itself never looks at it. */
+export const INTERNET_KEY = 'host.internet';
+
+/** One ledger row. pairedVia 'code' marks a device paired by typing its code on the host. */
+type LedgerEntry = PairedDevice;
+
+const HEX32 = /^[0-9a-fA-F]{32}$/;
+const PIN4 = /^\d{4}$/;
 
 /* ---------------- token bucket ---------------- */
 export class TokenBucket {
@@ -103,6 +113,13 @@ export function parsePairRequest(body: unknown): AgentPairRequest | { error: str
     out.clientAddresses = [...new Set(a.map((x) => normalizeAddress(x as string)))];
   }
   return out;
+}
+
+/** A name for Sunshine's client list from an untrusted Moonlight device name: keeps what sanitizeClientName accepts, drops the rest. */
+export function cleanDeviceName(v: unknown): string {
+  const raw = typeof v === 'string' ? v.normalize('NFC') : '';
+  const kept = [...raw].filter((ch) => NAME_RE.test(ch)).join('');
+  return sanitizeClientName(kept) ?? 'Moonlight device';
 }
 
 /** Host header allow-list (DNS rebinding guard). */
@@ -389,8 +406,8 @@ export class LanPairAgent implements PairAgent {
   }
 
   /* ----- devices ----- */
-  private readLedger(): PairedDevice[] {
-    const v = this.ledger.get<PairedDevice[]>(LEDGER_KEY, []);
+  private readLedger(): LedgerEntry[] {
+    const v = this.ledger.get<LedgerEntry[]>(LEDGER_KEY, []);
     return Array.isArray(v) ? v : [];
   }
 
@@ -399,7 +416,7 @@ export class LanPairAgent implements PairAgent {
     const clients = await this.o.sunshine.listClients();
     return clients.map((c) => {
       const l = ledger.find((d) => d.uuid === c.uuid);
-      const d: PairedDevice = { uuid: c.uuid, name: c.name, enabled: c.enabled, pairedVia: l ? 'lanplay' : 'other' };
+      const d: PairedDevice = { uuid: c.uuid, name: c.name, enabled: c.enabled, pairedVia: l ? ((l.pairedVia ?? 'lanplay') as NonNullable<PairedDevice['pairedVia']>) : 'other' };
       if (l?.pairedAt) d.pairedAt = l.pairedAt;
       if (l?.lastAddress) d.lastAddress = l.lastAddress;
       return d;
@@ -414,6 +431,83 @@ export class LanPairAgent implements PairAgent {
       this.readLedger().filter((d) => d.uuid !== uuid),
     );
     this.log.log('info', 'agent', 'device revoked', { uuid });
+  }
+
+  /* ----- code pairing (local only: reached through IPC, never through handle()) ----- */
+  async listPending(): Promise<PendingCodePairing[]> {
+    try {
+      const list = await this.o.sunshine.getPendingPairings();
+      return list.map((p) => {
+        const address = normalizeAddress(p.address);
+        return { id: p.id, name: cleanDeviceName(p.name), address, remote: net.isIP(address) !== 0 && !isPrivateAddress(address) };
+      });
+    } catch (e) {
+      this.log.log('debug', 'agent', 'could not list pending pairings', { error: (e as Error).message });
+      return [];
+    }
+  }
+
+  /**
+   * The host owner typed the code a device shows. Sunshine checks it against the pairing it started with that device;
+   * a wrong code is `ok: false`, never an exception, and writes nothing to the ledger.
+   */
+  async pairWithCode(id: string, pin: string, name: string): Promise<CodePairResult> {
+    const after = async (ok: boolean, message?: string): Promise<CodePairResult> => {
+      const r: CodePairResult = { ok, pending: await this.listPending(), devices: await this.listDevices().catch(() => []) };
+      if (message !== undefined) r.message = message;
+      return r;
+    };
+    if (typeof id !== 'string' || !HEX32.test(id)) return after(false, 'That pairing request is not valid. Pick the device from the list.');
+    if (typeof pin !== 'string' || !PIN4.test(pin)) return after(false, 'The code is 4 digits.');
+    const clientName = cleanDeviceName(name);
+    return this.pairMutex.run(async () => {
+      const fail = (message: string) => {
+        this.log.log('warn', 'agent', 'code pairing failed', { id, message });
+        return after(false, message);
+      };
+      let before: string[];
+      let address = '';
+      try {
+        before = (await this.o.sunshine.listClients()).map((c) => c.uuid);
+        const found = (await this.o.sunshine.getPendingPairings()).find((p) => p.id.toLowerCase() === id.toLowerCase());
+        if (!found) return fail('That pairing request is gone (Sunshine drops it after about 5 minutes). Ask the device to start pairing again.');
+        address = normalizeAddress(found.address);
+      } catch (e) {
+        return fail(this.sunshineMessage(e));
+      }
+      let ok: boolean;
+      try {
+        ok = await this.o.sunshine.submitPin({ pairingId: id, pin, name: clientName });
+      } catch (e) {
+        return fail(this.sunshineMessage(e));
+      }
+      if (!ok) return fail('Sunshine did not accept that code. Check the 4 digits on the device. If they are right, ask the device to start pairing again to get a new code.');
+      try {
+        const clients = await this.o.sunshine.listClients();
+        const uuid = clients.find((c) => !before.includes(c.uuid))?.uuid ?? clients.filter((c) => c.name === clientName).pop()?.uuid;
+        if (uuid) {
+          const entry: LedgerEntry = { uuid, name: clientName, enabled: true, pairedVia: 'code', pairedAt: new Date(this.now()).toISOString() };
+          if (address) entry.lastAddress = address;
+          this.ledger.set(LEDGER_KEY, [...this.readLedger().filter((d) => d.uuid !== uuid), entry].slice(-100));
+        }
+      } catch {
+        /* ledger is best-effort */
+      }
+      this.log.log('info', 'agent', 'paired with a code', { clientName, address });
+      this.emit();
+      return after(true);
+    });
+  }
+
+  async rejectPending(id: string): Promise<PendingCodePairing[]> {
+    if (typeof id === 'string' && HEX32.test(id)) {
+      try {
+        await this.o.sunshine.cancelPairing(id);
+      } catch (e) {
+        this.log.log('debug', 'agent', 'could not cancel the pending pairing', { error: (e as Error).message });
+      }
+    }
+    return this.listPending();
   }
 
   /* ----- HTTP ----- */
@@ -621,6 +715,15 @@ export class LanPairAgent implements PairAgent {
     this.log.log('info', 'agent', 'paired', { remote, matchedAddress: match.address, clientName, uuid: uuid ?? null });
     this.emit();
     return { status: 'paired', sunshineClientName: clientName };
+  }
+
+  private sunshineMessage(e: unknown): string {
+    let message = 'Sunshine is not answering.';
+    this.sunshineFail(e, (code, m) => {
+      message = m;
+      return { status: 'failed', code, message: m };
+    });
+    return message;
   }
 
   private sunshineFail(e: unknown, fail: (c: PairErrorCode, m: string) => AgentPairResponse): AgentPairResponse {

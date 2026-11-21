@@ -30,11 +30,11 @@ beforeEach(() => {
 });
 
 describe('first run', () => {
-  it('offers exactly two big buttons, focuses the first', () => {
+  it('offers exactly two rows, focuses the first', () => {
     const root = document.body.appendChild(document.createElement('div'));
     LPG.App.start(root, api(), memStore());
-    const bigs = [...root.querySelectorAll('button.big')];
-    expect(bigs.map((b) => q(b as HTMLElement, '.big-title').textContent)).toEqual(['Play on this screen', 'This PC hosts games']);
+    const bigs = [...root.querySelectorAll('button.choice')];
+    expect(bigs.map((b) => q(b as HTMLElement, '.choice-title').textContent)).toEqual(['Play on this screen', 'This PC hosts games']);
     expect(document.activeElement).toBe(bigs[0]);
   });
 
@@ -42,7 +42,7 @@ describe('first run', () => {
     const root = document.body.appendChild(document.createElement('div'));
     const store = memStore();
     const h = LPG.App.start(root, api(), store);
-    (root.querySelector('button.big') as HTMLButtonElement).click();
+    (root.querySelector('button.choice') as HTMLButtonElement).click();
     await flush();
     expect(store.peek()).toBe('client');
     expect(root.querySelector('.stream-btn')).toBeTruthy();
@@ -53,13 +53,13 @@ describe('first run', () => {
     const root = document.body.appendChild(document.createElement('div'));
     const store = memStore();
     const h = LPG.App.start(root, api(), store);
-    buttonByText(root, 'This PC hosts gamesThis is the gaming PC. LanPlay sets it up for you.').click();
+    buttonByText(root, 'This PC hosts games').click();
     await flush();
     expect(store.peek()).toBe('host');
     expect(root.textContent).toMatch(/Sunshine/);
     buttonByText(root, 'Change mode').click();
     expect(store.peek()).toBeNull();
-    expect(root.querySelectorAll('button.big')).toHaveLength(2);
+    expect(root.querySelectorAll('button.choice')).toHaveLength(2);
     h.destroy();
   });
 
@@ -67,7 +67,7 @@ describe('first run', () => {
     const root = document.body.appendChild(document.createElement('div'));
     const h = LPG.App.start(root, api(), memStore('client'));
     await flush();
-    expect(root.querySelector('button.big')).toBeNull();
+    expect(root.querySelector('button.choice')).toBeNull();
     expect(root.querySelector('.stream-btn')).toBeTruthy();
     h.destroy();
   });
@@ -79,7 +79,7 @@ describe('role decided by the app (Windows = host, Mac = client)', () => {
     const store = memStore('host'); // even a stale stored choice does not win over the real role
     const h = LPG.App.start(root, api(), store, 'client');
     await flush();
-    expect(root.querySelector('button.big')).toBeNull();
+    expect(root.querySelector('button.choice')).toBeNull();
     expect(root.querySelector('.stream-btn')).toBeTruthy();
     expect([...root.querySelectorAll('button')].some((b) => b.textContent === 'Change mode')).toBe(false);
     expect(store.peek()).toBe('host');
@@ -88,7 +88,7 @@ describe('role decided by the app (Windows = host, Mac = client)', () => {
     const h2 = LPG.App.start(root2, api(), memStore(), 'host');
     await flush();
     expect(root2.textContent).toMatch(/Sunshine/);
-    expect(root2.textContent).toMatch(/keeps running in the background/);
+    expect(root2.textContent).toMatch(/keeps LanPlay running in the background/);
     expect([...root2.querySelectorAll('button')].some((b) => b.textContent === 'Change mode')).toBe(false);
     h2.destroy();
   });
@@ -102,7 +102,7 @@ describe('role decided by the app (Windows = host, Mac = client)', () => {
       LPG.App.boot();
       await flush();
       expect(document.getElementById('app')!.textContent).toMatch(/LanPlay host/);
-      expect(document.querySelector('button.big')).toBeNull();
+      expect(document.querySelector('button.choice')).toBeNull();
 
       document.body.innerHTML = '<div id="app"></div>';
       const broken = api();
@@ -111,7 +111,7 @@ describe('role decided by the app (Windows = host, Mac = client)', () => {
       window.localStorage.removeItem('lanplay.mode');
       LPG.App.boot();
       await flush();
-      expect(document.querySelectorAll('button.big')).toHaveLength(2);
+      expect(document.querySelectorAll('button.choice')).toHaveLength(2);
     } finally {
       w.__LANPLAY_NO_AUTOSTART__ = true;
       delete w.lanplay;
@@ -163,8 +163,8 @@ describe('Windows role chooser (app:role-set)', () => {
   it('no stored role: shows the chooser; picking the other role stores it and shows a restart message', async () => {
     const a = winApi({ canChooseRole: true, roleStored: false }, true);
     const root = await boot(a);
-    expect(root.querySelectorAll('button.big')).toHaveLength(2);
-    (root.querySelectorAll('button.big')[0] as HTMLButtonElement).click();
+    expect(root.querySelectorAll('button.choice')).toHaveLength(2);
+    (root.querySelectorAll('button.choice')[0] as HTMLButtonElement).click();
     await flush();
     expect(a.calls.find((c) => c.channel === 'app:role-set')?.req).toEqual({ role: 'client' });
     expect(root.textContent).toMatch(/Restarting LanPlay/);
@@ -178,8 +178,8 @@ describe('Windows role chooser (app:role-set)', () => {
     expect(root.textContent).toMatch(/Ctrl\+Alt\+Shift\+Z/);
     buttonByText(root, 'Change role').click();
     await flush();
-    expect(root.querySelectorAll('button.big')).toHaveLength(2);
-    (root.querySelectorAll('button.big')[0] as HTMLButtonElement).click();
+    expect(root.querySelectorAll('button.choice')).toHaveLength(2);
+    (root.querySelectorAll('button.choice')[0] as HTMLButtonElement).click();
     await flush();
     expect(a.calls.filter((c) => c.channel === 'app:role-set')).toHaveLength(1);
     expect(root.querySelector('.stream-btn')).toBeTruthy();
@@ -216,7 +216,7 @@ describe('Mac: role chooser reachable from the client screen, never asked on fir
 
   it('opens the client screen straight away, even if main did not mark the role as stored', async () => {
     const root = await boot(macApi({ roleStored: false }));
-    expect(root.querySelector('button.big')).toBeNull();
+    expect(root.querySelector('button.choice')).toBeNull();
     expect(root.querySelector('.stream-btn')).toBeTruthy();
   });
 
@@ -225,12 +225,12 @@ describe('Mac: role chooser reachable from the client screen, never asked on fir
     const root = await boot(a);
     buttonByText(root, 'Change role').click();
     await flush();
-    const titles = [...root.querySelectorAll('button.big .big-title')].map((t) => t.textContent);
+    const titles = [...root.querySelectorAll('button.choice .choice-title')].map((t) => t.textContent);
     expect(titles).toEqual(['Play on this screen', 'This Mac hosts games']);
-    expect(root.textContent).toContain('Play games that run on this computer from another device.');
+    expect(root.textContent).not.toMatch(/sets it up for you|connects to another computer/);
     expect(root.textContent).not.toMatch(/gaming PC|This PC/);
     expect(root.textContent).toContain('What is this Mac for?');
-    (root.querySelectorAll('button.big')[1] as HTMLButtonElement).click();
+    (root.querySelectorAll('button.choice')[1] as HTMLButtonElement).click();
     await flush();
     expect(a.called('app:role-set')).toEqual([{ role: 'host' }]);
     expect(root.textContent).toMatch(/Restarting LanPlay/);
@@ -254,7 +254,7 @@ describe('Mac: role chooser reachable from the client screen, never asked on fir
     const root = await boot(a);
     buttonByText(root, 'Change role').click();
     await flush();
-    expect([...root.querySelectorAll('button.big .big-title')].map((t) => t.textContent)).toEqual(['Play on this screen', 'This PC hosts games']);
+    expect([...root.querySelectorAll('button.choice .choice-title')].map((t) => t.textContent)).toEqual(['Play on this screen', 'This PC hosts games']);
   });
 });
 
@@ -286,7 +286,7 @@ describe('version line and Check for updates', () => {
   it('keeps the footer when the screen changes', async () => {
     const root = document.body.appendChild(document.createElement('div'));
     const h = LPG.App.start(root, api(), memStore(), null, null, { version: '0.4.0' });
-    (root.querySelector('button.big') as HTMLButtonElement).click();
+    (root.querySelector('button.choice') as HTMLButtonElement).click();
     await flush();
     expect(root.querySelectorAll('.update-line')).toHaveLength(1);
     h.destroy();

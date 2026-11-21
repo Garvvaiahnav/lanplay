@@ -21,9 +21,11 @@ export interface ControllerManagerConfig {
   staleMs: number;
   /** No message for this long: the player is removed. */
   dropMs: number;
+  /** A player with a phone id keeps its slot and pad this long after its socket closed. */
+  graceMs: number;
 }
 
-export const DEFAULT_CONTROLLER_CONFIG: ControllerManagerConfig = Object.freeze({ maxPlayers: MAX_PLAYERS, staleMs: 2500, dropMs: 20_000 });
+export const DEFAULT_CONTROLLER_CONFIG: ControllerManagerConfig = Object.freeze({ maxPlayers: MAX_PLAYERS, staleMs: 2500, dropMs: 20_000, graceMs: 15_000 });
 
 export interface PlayerInfo {
   /** Connection id (opaque). */
@@ -35,14 +37,28 @@ export interface PlayerInfo {
   joinedAt: number;
   /** True while the phone is silent and its pad is held at neutral. */
   stale: boolean;
+  /** True while the socket is gone and the slot is held for a quick reconnect (the pad is at neutral). */
+  detached: boolean;
 }
 
-export type JoinResult = { ok: true; slot: number } | { ok: false; reason: 'full' } | { ok: false; reason: 'driver'; message: string };
+export type JoinResult =
+  | {
+      ok: true;
+      slot: number;
+      /** The phone id matched a player that was waiting for it: same slot, same pad. */
+      resumed?: true;
+      /** Connection id of an older socket of the same phone that was still attached; the caller closes it. */
+      replaced?: string;
+    }
+  | { ok: false; reason: 'full' }
+  | { ok: false; reason: 'driver'; message: string };
 
 interface Player extends PlayerInfo {
   pad: VirtualPad;
   lastSeen: number;
   last: PadState;
+  phoneId: string | undefined;
+  detachedAt: number;
 }
 
 const same = (a: PadState, b: PadState): boolean => a.buttons === b.buttons && a.lt === b.lt && a.rt === b.rt && a.lx === b.lx && a.ly === b.ly && a.rx === b.rx && a.ry === b.ry;
@@ -68,9 +84,29 @@ export class ControllerManager {
     for (const l of this.listeners) l();
   }
 
-  join(id: string, name: string, address: string): JoinResult {
+  /** `phoneId` (already validated by the caller) makes the slot sticky: see detach(). */
+  join(id: string, name: string, address: string, phoneId?: string): JoinResult {
     const have = this.players.get(id);
     if (have) return { ok: true, slot: have.slot };
+    const now = this.d.now();
+    const mine = phoneId === undefined ? undefined : [...this.players.values()].find((p) => p.phoneId === phoneId);
+    if (mine) {
+      const replaced = mine.detached ? undefined : mine.id;
+      this.players.delete(mine.id);
+      mine.id = id;
+      mine.name = name;
+      mine.address = address;
+      mine.detached = false;
+      mine.stale = false;
+      mine.lastSeen = now;
+      this.players.set(id, mine);
+      if (replaced) {
+        mine.last = neutralPad();
+        mine.pad.update(mine.last);
+      }
+      this.changed();
+      return replaced ? { ok: true, slot: mine.slot, resumed: true, replaced } : { ok: true, slot: mine.slot, resumed: true };
+    }
     const used = new Set([...this.players.values()].map((p) => p.slot));
     let slot = 0;
     for (let s = 1; s <= this.cfg.maxPlayers; s++) {
@@ -86,15 +122,14 @@ export class ControllerManager {
     } catch (e) {
       return { ok: false, reason: 'driver', message: (e as Error).message };
     }
-    const now = this.d.now();
-    this.players.set(id, { id, slot, name, address, joinedAt: now, stale: false, pad, lastSeen: now, last: neutralPad() });
+    this.players.set(id, { id, slot, name, address, joinedAt: now, stale: false, detached: false, pad, lastSeen: now, last: neutralPad(), phoneId, detachedAt: 0 });
     this.changed();
     return { ok: true, slot };
   }
 
   update(id: string, state: PadState): void {
     const p = this.players.get(id);
-    if (!p) return;
+    if (!p || p.detached) return;
     p.lastSeen = this.d.now();
     const wasStale = p.stale;
     p.stale = false;
@@ -106,7 +141,7 @@ export class ControllerManager {
 
   keepalive(id: string): void {
     const p = this.players.get(id);
-    if (!p) return;
+    if (!p || p.detached) return;
     p.lastSeen = this.d.now();
     if (p.stale) {
       p.stale = false;
@@ -123,6 +158,21 @@ export class ControllerManager {
     this.changed();
   }
 
+  /**
+   * The socket of `id` closed. A player that joined with a phone id keeps its slot and its pad (held at neutral) for graceMs,
+   * so a quick reconnect with the same id is invisible to the game; one without an id is removed at once.
+   */
+  detach(id: string): void {
+    const p = this.players.get(id);
+    if (!p || p.detached) return;
+    if (p.phoneId === undefined) return this.leave(id);
+    p.detached = true;
+    p.detachedAt = this.d.now();
+    p.last = neutralPad();
+    p.pad.update(p.last);
+    this.changed();
+  }
+
   kick(id: string): boolean {
     if (!this.players.has(id)) return false;
     this.leave(id);
@@ -134,6 +184,10 @@ export class ControllerManager {
     const now = this.d.now();
     const dropped: string[] = [];
     for (const p of [...this.players.values()]) {
+      if (p.detached) {
+        if (now - p.detachedAt > this.cfg.graceMs) this.leave(p.id);
+        continue;
+      }
       const quiet = now - p.lastSeen;
       if (quiet > this.cfg.dropMs) {
         dropped.push(p.id);
@@ -150,7 +204,7 @@ export class ControllerManager {
   list(): PlayerInfo[] {
     return [...this.players.values()]
       .sort((a, b) => a.slot - b.slot)
-      .map(({ id, slot, name, address, joinedAt, stale }) => ({ id, slot, name, address, joinedAt, stale }));
+      .map(({ id, slot, name, address, joinedAt, stale, detached }) => ({ id, slot, name, address, joinedAt, stale, detached }));
   }
 
   closeAll(): void {

@@ -112,3 +112,27 @@ describe('preload allow-lists', () => {
     expect(src).toMatch(/import type \{[^}]+\} from '\.\.\/contracts\.js'/);
   });
 });
+
+describe('main.ts policy (source checks; main.ts needs Electron and cannot be imported here)', () => {
+  const main = readFileSync(path.join(__dirname, '..', '..', 'src', 'main', 'main.ts'), 'utf8');
+
+  it('the phone controller still accepts private addresses only', () => {
+    expect(main).toContain('isAllowedAddress: (a) => isPrivateAddress(a),');
+    expect(main).toContain('localAddresses: () => localAddresses().filter((a) => isPrivateAddress(a)),');
+  });
+
+  it('starts no timer of its own: the stream menu poll goes through createPollWhileActive', () => {
+    expect(main).not.toMatch(/\bsetInterval\(/);
+    expect(main).toContain('createPollWhileActive(');
+  });
+
+  it('opens the window before the macOS LaunchAgent cleanup runs, except for the background agent', () => {
+    expect(main.match(/releaseMacHost\(/g)).toHaveLength(1); // only inside releaseMac, which the two paths below call
+    expect(main).toContain("if (cli.mode === 'agent') await releaseMac();");
+    expect(main.indexOf('createWindow();\n    void releaseMac();')).toBeGreaterThan(0);
+  });
+
+  it('logs startup-ms once the first window is shown', () => {
+    expect(main).toMatch(/ready-to-show[\s\S]{0,200}startup-ms/);
+  });
+});

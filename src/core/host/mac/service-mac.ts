@@ -1,14 +1,17 @@
 // MacHostService: the macOS sibling of WindowsHostService (docs/MAC-HOST-DESIGN.md 2.6). Setup runs in-process, as the
 // user: no elevation, no handoff file.
 import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import type { NetworkInterfaceInfo } from 'node:os';
+import os from 'node:os';
 import path from 'node:path';
 import { LANPLAY, MAC_HOST_STEP_ORDER, SUNSHINE_MAC } from '../../../contracts.js';
-import type { HostSetupStatus, HostStepContext, HostStepId, KeyValueStore, Logger, PairAgent, ProcessRunner, SelfCheckReport, ServiceDeps, StepRecord } from '../../../contracts.js';
+import type { HostSetupStatus, HostStepContext, HostStepId, InternetHostState, KeyValueStore, Logger, PairAgent, ProcessRunner, SelfCheckReport, ServiceDeps, StepRecord } from '../../../contracts.js';
 import { tcpProbe, tlsPinCheck } from '../../shared/netprobe.js';
 import { JsonFileStore } from '../../shared/stores.js';
-import { LanPairAgent } from '../agent.js';
+import { INTERNET_KEY, LanPairAgent } from '../agent.js';
 import type { PairAgentExtraOptions } from '../agent.js';
 import { defaultLocalIdentity, generateAdminPassword, LAST_SETUP_KEY, LazySunshineClient, PINNED_CERT_NAME, probeAgent } from '../common.js';
+import { internetAddresses } from '../service.js';
 import type { PlatformHostService } from '../service.js';
 import { certFingerprint256, createSunshineClient } from '../sunshine-client.js';
 import { SUNSHINE_MAC_DMG_SHA256, SUNSHINE_MAC_VERSION } from '../vendor.js';
@@ -32,6 +35,8 @@ export interface MacHostServiceExtras {
   localIdentity?: () => { hostName: string; addresses: string[] };
   /** Test hooks. */
   stepsEnv?: Partial<MacStepsEnv>;
+  /** os.networkInterfaces (tests). */
+  networkInterfaces?: () => NodeJS.Dict<NetworkInterfaceInfo[]>;
   now?: () => number;
 }
 
@@ -42,6 +47,9 @@ export interface MacHostServiceExtras {
 const AFTER_PERMISSION_STEPS: readonly HostStepId[] = ['mac-launch-agent', 'mac-screen-recording'];
 const AFTER_PERMISSION_APPLY: readonly HostStepId[] = ['web-ui', 'api-auth'];
 const RESTART_STEPS: readonly HostStepId[] = ['mac-install', 'config', 'mac-launch-agent', 'mac-screen-recording', 'web-ui', 'api-auth'];
+
+/** Steps whose failure means the internet switch did not take effect (the conf was not written, or Sunshine did not come back). */
+const SWITCH_STEPS: readonly HostStepId[] = ['config', 'mac-launch-agent'];
 
 const MAX_LOG_BYTES = 256 * 1024;
 
@@ -78,6 +86,7 @@ export class MacHostService implements PlatformHostService {
   private readonly now: () => number;
   /** setupStatus() re-probes while the user grants permissions; it must not run alongside a setup. */
   private busy = false;
+  private internetError: string | undefined;
 
   constructor(
     private readonly deps: ServiceDeps,
@@ -118,6 +127,10 @@ export class MacHostService implements PlatformHostService {
   }
 
   /* ---------- plumbing ---------- */
+  private internetOn(): boolean {
+    return this.status.get<boolean>(INTERNET_KEY, false) === true;
+  }
+
   private stepsEnv(getPassword: () => Promise<string | null>): MacStepsEnv {
     const base: MacStepsEnv = {
       fileExists: (p) => existsSync(p),
@@ -154,6 +167,7 @@ export class MacHostService implements PlatformHostService {
       tlsPinCheck,
       fingerprint: certFingerprint256,
       agentProbe: () => probeAgent(this.agent),
+      internet: this.internetOn(),
       now: this.now,
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     };
@@ -273,13 +287,18 @@ export class MacHostService implements PlatformHostService {
 
   /** After an update brought a newer Sunshine, or when Sunshine misbehaves: steps 2, 3, 5 to 7 of setup, restarting even if nothing changed. */
   async restartSunshine(): Promise<HostSetupStatus> {
+    return this.runRestartSteps({ restart: true });
+  }
+
+  private async runRestartSteps(opts: MacStepsOptions, onProgress?: (s: StepRecord) => void): Promise<HostSetupStatus> {
     this.busy = true;
     try {
       const ctx = this.ctx();
       const recs: StepRecord[] = [];
-      for (const step of this.steps({ restart: true }).filter((s) => RESTART_STEPS.includes(s.id))) {
+      for (const step of this.steps(opts).filter((s) => RESTART_STEPS.includes(s.id))) {
         const rec = await step.apply(ctx);
         this.deps.log.step(rec);
+        onProgress?.(rec);
         recs.push(rec);
       }
       const last = this.status.get<HostSetupStatus | null>(LAST_SETUP_KEY, null) ?? { lastRunAt: null, ok: false, steps: [], install: null, isAdmin: false };
@@ -287,6 +306,44 @@ export class MacHostService implements PlatformHostService {
     } finally {
       this.busy = false;
     }
+  }
+
+  async getInternet(): Promise<InternetHostState> {
+    const st: InternetHostState = { enabled: this.internetOn(), ...internetAddresses((this.x.networkInterfaces ?? os.networkInterfaces)()) };
+    if (this.internetError) st.lastError = this.internetError;
+    return st;
+  }
+
+  /**
+   * Saves the switch, then rewrites sunshine.conf (UPnP, IPv6) and lets the config step restart Sunshine when the file
+   * changed. There is no firewall rule on macOS. When a step fails the switch goes back to where it was, and a failed
+   * enable runs the steps once more with the switch off (best effort) so the file does not keep UPnP and IPv6 on.
+   */
+  async setInternet(on: boolean, onProgress: (s: StepRecord) => void): Promise<InternetHostState> {
+    const was = this.internetOn();
+    this.status.set(INTERNET_KEY, on === true);
+    this.internetError = undefined;
+    try {
+      const st = await this.runRestartSteps({}, onProgress);
+      const failed = st.steps.find((r) => r.status === 'fail' && SWITCH_STEPS.includes(r.stepId as HostStepId));
+      if (failed) {
+        this.status.set(INTERNET_KEY, was);
+        this.internetError = failed.message;
+      }
+    } catch (e) {
+      this.status.set(INTERNET_KEY, was);
+      this.internetError = (e as Error).message;
+    }
+    if (on === true && !was && this.internetError !== undefined) {
+      try {
+        const back = await this.runRestartSteps({});
+        const again = back.steps.find((r) => r.status === 'fail' && SWITCH_STEPS.includes(r.stepId as HostStepId));
+        if (again) this.internetError = `${this.internetError} Turning the settings back off also failed: ${again.message}`;
+      } catch (e) {
+        this.internetError = `${this.internetError} Turning the settings back off also failed: ${(e as Error).message}`;
+      }
+    }
+    return this.getInternet();
   }
 
   async selfCheck(): Promise<SelfCheckReport> {

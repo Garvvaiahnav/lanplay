@@ -127,6 +127,22 @@ export class FakeWindowsRunner implements ProcessRunner {
         }
         return ok(JSON.stringify({ rules: [{ id: 'LanPlay-PairAgent-TCP', action: 'created' }], removedBlockRules: removed, blockRuleError: this.m.blockRulesStick ? 'Access is denied.' : '' }));
       }
+      case 'set-internet-firewall-rule': {
+        if (!this.m.isAdmin) return ok('{"error":"Access is denied."}', 1);
+        const name = this.param(a, 'Name')!;
+        const enable = this.param(a, 'Enable');
+        if ((enable !== '0' && enable !== '1') || (enable === '1' && (!this.param(a, 'TcpPorts') || !this.param(a, 'UdpPorts')))) return ok('{"error":"bad arguments"}', 2);
+        const ids = ['LanPlay-InternetPlay-TCP', 'LanPlay-InternetPlay-UDP'];
+        // Like the real script: disabling removes both ids and any inbound rule with the same display name.
+        const removed = this.m.firewall.filter((r) => ids.includes(r.id) || (enable === '0' && r.name === name && r.direction === 'Inbound')).map((r) => r.id);
+        this.m.firewall = this.m.firewall.filter((r) => !removed.includes(r.id));
+        if (enable === '1') {
+          for (const [i, proto] of (['TCP', 'UDP'] as const).entries()) {
+            this.m.firewall.push({ id: ids[i]!, name, enabled: true, direction: 'Inbound', action: 'Allow', profile: 'Any', protocol: proto, localPort: this.param(a, proto === 'TCP' ? 'TcpPorts' : 'UdpPorts')!, remoteAddress: 'Any', program: 'Any' });
+          }
+        }
+        return ok(JSON.stringify({ rules: enable === '1' ? ids.map((id) => ({ id, action: 'created' })) : [], removed }));
+      }
       case 'get-listeners':
         return ok(JSON.stringify({ listeners: [{ port: 47989, protocol: 'tcp', address: '0.0.0.0', pid: 1234, process: 'sunshine' }] }));
       case 'get-system-info':

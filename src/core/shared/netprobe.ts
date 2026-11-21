@@ -73,7 +73,7 @@ export function httpGet(host: string, port: number, path: string, timeoutMs: num
       res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString('utf8') }));
       res.on('error', reject);
     });
-    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('timeout', () => req.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })));
     req.on('error', reject);
     req.end();
   });

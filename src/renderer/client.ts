@@ -14,6 +14,8 @@ namespace LP.Client {
     let searchTimedOut = false;
     let pairing = false;
     let pairText = '';
+    let pairCode = '';
+    let recent: string[] = [];
     let stream: T.StreamState | null = null;
     let error: ErrorInfo | null = null;
     let manualBusy = false;
@@ -27,9 +29,10 @@ namespace LP.Client {
     const statusEl = h('p', { class: 'status', role: 'status', 'aria-live': 'polite' });
     const errorEl = h('div', { class: 'error', role: 'alert', hidden: true });
     const hostList = h('ul', { class: 'hosts', 'aria-label': 'Computers found' });
-    const manualInput = h('input', { type: 'text', id: 'manual-ip', class: 'text', inputmode: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: '192.168.1.20' });
+    const manualInput = h('input', { type: 'text', id: 'manual-ip', class: 'text', inputmode: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: Model.MANUAL_PLACEHOLDER });
     const manualBtn = h('button', { type: 'button', class: 'btn' }, 'Add');
     const manualMsg = h('p', { class: 'hint err', role: 'status', 'aria-live': 'polite' });
+    const recentEl = h('div', { class: 'recent', 'aria-label': 'Recent internet addresses' });
     const searchBtn = h('button', { type: 'button', class: 'btn ghost' }, 'Search again');
 
     const presetSeg = Dom.segmented<string>('Preset', [...Model.PRESETS.map((p) => ({ value: p.id as string, label: p.label })), { value: 'custom', label: 'Custom' }], (v) => {
@@ -51,25 +54,24 @@ namespace LP.Client {
     // Moonlight captures the mouse: always say how to get out of the stream (also shown before streaming starts).
     const escapeHint = h('p', { class: 'stream-escape', role: 'note' }, Model.STREAM_ESCAPE_HINT);
 
-    const field = (label: string, control: Node, hint: string | Node, id?: string): HTMLElement =>
+    const field = (label: string, control: Node, hint?: string | Node, id?: string): HTMLElement =>
       h('div', { class: 'field' }, h('label', id ? { for: id, class: 'label' } : { class: 'label' }, label), control, typeof hint === 'string' ? h('p', { class: 'hint' }, hint) : hint);
 
     const settingsBox = h('section', { class: 'card', 'aria-labelledby': 'h-settings' },
-      h('h2', { id: 'h-settings' }, 'Picture and sound'),
+      h('h2', { id: 'h-settings' }, 'Picture'),
       field('Preset', presetSeg.el, presetHint),
-      h('div', { class: 'two' },
-        field('Resolution', resSeg.el, Model.HINTS.resolution),
-        field('Frames per second', fpsSeg.el, Model.HINTS.fps)),
-      field('Bitrate', h('div', { class: 'slider' }, bitrate, bitrateOut), Model.HINTS.bitrate, 'bitrate'),
-      h('label', { class: 'check', for: 'adv' }, advanced, 'Advanced: allow up to 500 Mbps'),
-      field('Video codec', codecSeg.el, codecHint),
-      field('Audio', h('select', { class: 'text', 'aria-label': 'Audio', disabled: true }, h('option', null, 'Stereo')), Model.HINTS.audio));
+      h('details', { class: 'more' },
+        h('summary', null, 'More settings'),
+        h('div', { class: 'more-body' },
+          h('div', { class: 'two' }, field('Resolution', resSeg.el), field('Frames per second', fpsSeg.el)),
+          field('Bitrate', h('div', { class: 'slider' }, bitrate, bitrateOut), Model.HINTS.bitrate, 'bitrate'),
+          h('label', { class: 'check', for: 'adv' }, advanced, 'Allow up to 500 Mbps'),
+          field('Video codec', codecSeg.el, codecHint))));
 
     const hostBox = h('section', { class: 'card', 'aria-labelledby': 'h-host' },
-      h('div', { class: 'row' }, h('h2', { id: 'h-host' }, 'Your PC'), searchBtn),
-      h('p', { class: 'hint' }, Model.HINTS.host),
+      h('div', { class: 'row between' }, h('h2', { id: 'h-host' }, 'Computer'), searchBtn),
       hostList,
-      h('div', { class: 'manual' }, h('label', { for: 'manual-ip', class: 'label' }, 'IP address'), h('div', { class: 'row' }, manualInput, manualBtn), h('p', { class: 'hint' }, Model.HINTS.manual), manualMsg));
+      h('div', { class: 'manual' }, h('label', { for: 'manual-ip', class: 'label' }, 'Connect by IP'), h('div', { class: 'row' }, manualInput, manualBtn), recentEl, manualMsg));
 
     const screen = h('main', { class: 'screen' },
       h('header', { class: 'top' }, h('h1', null, 'LanPlay'), opts.onSwitchMode ? h('button', { type: 'button', class: 'link', onClick: () => opts.onSwitchMode?.() }, opts.switchLabel ?? 'Change mode') : null),
@@ -101,19 +103,30 @@ namespace LP.Client {
           h('label', { for: id },
             h('span', { class: 'dot ' + st.dot, 'aria-hidden': 'true' }),
             h('span', { class: 'hname' }, host.name),
+            host.remote === true ? h('span', { class: 'badge tag' }, 'Internet') : null,
             h('span', { class: 'haddr' }, host.preferredAddress),
-            h('span', { class: 'hstate' }, st.label)));
+            h('span', { class: 'hstate' }, st.label),
+            host.remote === true ? h('span', { class: 'hwarn' }, Model.REMOTE_WARNING) : null));
       });
       if (items.length === 0) items.push(h('li', { class: 'empty' }, searchTimedOut ? 'Nothing found.' : 'Searching...'));
       Dom.setChildren(hostList, items);
       if (focusId) document.getElementById(focusId)?.focus();
     }
 
+    function renderRecent(): void {
+      Dom.setChildren(recentEl, recent.map((addr) =>
+        h('button', { type: 'button', class: 'btn ghost recent-btn', disabled: manualBusy, onClick: () => addManual(addr) }, addr)));
+      recentEl.hidden = recent.length === 0;
+    }
+
     function render(): void {
       if (destroyed) return;
       const ph = phase();
       const sel = selected();
-      statusEl.textContent = ph === 'pairing' && pairText ? pairText : Model.phaseMessage(ph, sel?.name ?? null);
+      if (ph === 'pairing' && pairCode) {
+        const [lead, code, tail] = Model.pairCodeParts(pairCode);
+        Dom.setChildren(statusEl, [lead, h('strong', { class: 'pair-code' }, code), tail]);
+      } else statusEl.textContent = ph === 'pairing' && pairText ? pairText : Model.phaseMessage(ph, sel?.name ?? null);
       statusEl.className = 'status ph-' + ph;
       if (error) {
         errorEl.hidden = false;
@@ -122,6 +135,7 @@ namespace LP.Client {
       renderHosts();
       manualBtn.disabled = manualBusy;
       manualMsg.textContent = manualError;
+      renderRecent();
 
       if (settings) {
         presetSeg.set(settings.presetId);
@@ -134,7 +148,8 @@ namespace LP.Client {
         bitrateOut.textContent = Model.bitrateText(settings.bitrateMbps);
         advanced.checked = settings.advancedBitrate;
         const preset = Model.PRESETS.find((p) => p.id === settings?.presetId);
-        presetHint.textContent = preset ? preset.description : Model.HINTS.preset;
+        presetHint.textContent = preset ? preset.description : '';
+        presetHint.hidden = !preset;
         codecHint.textContent = Model.codecHint(settings.codec, chip);
       }
       const busy = ph === 'pairing' || ph === 'streaming';
@@ -142,7 +157,7 @@ namespace LP.Client {
       bitrate.disabled = busy;
       advanced.disabled = busy;
       streamBtn.disabled = busy || sel === null || settings === null;
-      streamBtn.textContent = ph === 'pairing' ? 'Pairing...' : ph === 'streaming' ? (stream?.state === 'starting' ? 'Starting...' : 'Streaming') : sel && sel.paired !== true ? 'Pair and stream' : 'Stream';
+      streamBtn.textContent = ph === 'pairing' ? 'Pairing...' : ph === 'streaming' ? (stream?.state === 'starting' ? 'Starting...' : 'Streaming') : sel && sel.paired !== true && sel.remote !== true ? 'Pair and stream' : 'Stream';
       stopBtn.hidden = ph !== 'streaming';
       escapeHint.classList.toggle('live', ph === 'streaming');
     }
@@ -199,10 +214,12 @@ namespace LP.Client {
       try {
         if (host.paired !== true) {
           pairing = true;
+          pairCode = '';
           pairText = Model.pairPhaseText({ hostId: host.id, phase: 'checking', message: '' });
           render();
           const r = await api.invoke('client:pair', { hostId: host.id });
           pairing = false;
+          pairCode = '';
           if (!r.ok) {
             showError(Model.pairErrorMessage(r));
             return;
@@ -217,6 +234,7 @@ namespace LP.Client {
         onStreamState(st);
       } catch (e) {
         pairing = false;
+        pairCode = '';
         stream = null;
         showError(msg(e));
       }
@@ -241,8 +259,9 @@ namespace LP.Client {
     searchBtn.addEventListener('click', () => {
       api.invoke('client:discover-stop').catch(() => undefined).then(startSearch);
     });
-    const addManual = (): void => {
-      const addr = Model.validAddress(manualInput.value);
+    function addManual(typed: string = manualInput.value): void {
+      if (manualBusy) return;
+      const addr = Model.validAddress(typed);
       if (!addr) {
         manualError = 'That does not look like an IP address.';
         render();
@@ -256,16 +275,46 @@ namespace LP.Client {
           manualBusy = false;
           manualInput.value = '';
           selectedId = hi.id;
-          setHosts(hosts.some((x) => x.id === hi.id) ? hosts.map((x) => (x.id === hi.id ? hi : x)) : [...hosts, hi]);
+          const known = hosts.some((x) => x.id === hi.id);
+          setHosts(known ? hosts.map((x) => (x.id === hi.id ? hi : x)) : [...hosts, hi]);
+          // The service moves the settings to the Internet preset the first time an address is typed (once per address, D12): the
+          // renderer must not do it again every app session, which would overwrite a Custom choice. It only reads the result.
+          if (hi.remote === true) {
+            void loadRecent();
+            void syncSettings();
+          }
         },
         (e: unknown) => {
           manualBusy = false;
-          manualError = 'Could not reach ' + addr + ': ' + msg(e);
+          manualError = Model.manualFailure(addr, msg(e));
           render();
         },
       );
-    };
-    manualBtn.addEventListener('click', addManual);
+    }
+
+    /** Show what the service holds (it may just have applied the Internet preset). A pending local edit wins until it is saved. */
+    async function syncSettings(): Promise<void> {
+      if (saveTimer) return;
+      try {
+        const s = await api.invoke('client:settings-get');
+        if (destroyed || saveTimer) return;
+        settings = s;
+        render();
+      } catch {
+        /* keep what is shown */
+      }
+    }
+
+    async function loadRecent(): Promise<void> {
+      try {
+        recent = await api.invoke('client:recent-remote');
+      } catch {
+        recent = [];
+      }
+      render();
+    }
+
+    manualBtn.addEventListener('click', () => addManual());
     manualInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') addManual();
     });
@@ -273,7 +322,10 @@ namespace LP.Client {
     /* ---------- wiring ---------- */
     unsubs.push(api.on('client:hosts-updated', setHosts));
     unsubs.push(api.on('client:pair-progress', (p) => {
-      if (p.hostId === selectedId) pairText = Model.pairPhaseText(p);
+      if (p.hostId === selectedId) {
+        pairText = Model.pairPhaseText(p);
+        pairCode = p.phase === 'show-code' && p.code ? p.code : '';
+      }
       render();
     }));
     unsubs.push(api.on('client:stream-state', onStreamState));
@@ -288,6 +340,7 @@ namespace LP.Client {
       (e: unknown) => showError('Could not load settings: ' + msg(e)),
     );
     startSearch();
+    void loadRecent();
 
     return {
       destroy() {

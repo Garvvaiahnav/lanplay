@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { beforeAll, describe, expect, it } from 'vitest';
-import { BITRATE_LIMITS_MBPS, DEFAULT_STREAM_SETTINGS, PRESETS, type PairErrorCode, type StreamSettings } from '../../src/contracts.js';
+import { BITRATE_LIMITS_MBPS, DEFAULT_STREAM_SETTINGS, PRESETS, LANPLAY, SUNSHINE, type PairErrorCode, type StreamSettings } from '../../src/contracts.js';
 import { loadRenderer, type LP } from './helpers.js';
 
 let M: LP;
@@ -16,6 +16,27 @@ describe('mirrors of contracts', () => {
   });
 });
 
+describe('internet card ports', () => {
+  it('the table is the SUNSHINE port family and the never-forward list is admin UI, agent and controllers', () => {
+    const rows: Array<{ protocol: string; ports: string }> = M.INTERNET_PORTS;
+    expect(rows.filter((r) => r.protocol === 'TCP').map((r) => Number(r.ports))).toEqual([SUNSHINE.httpsPort, SUNSHINE.httpPort, SUNSHINE.rtspPort]);
+    expect(rows.find((r) => r.protocol === 'UDP')?.ports.split(', ').map(Number)).toEqual([...SUNSHINE.udpPorts]);
+    expect(M.INTERNET_NEVER_PORTS).toBe([SUNSHINE.webUiPort, LANPLAY.agentPort, 47921].join(', '));
+  });
+  it('the code line is the plan sentence in three pieces', () => {
+    expect(M.pairCodeParts('4821').join('')).toBe('Tell the host this code: 4821. Waiting for them to enter it (3 min)');
+    expect(M.pairPhaseText({ hostId: 'h', phase: 'show-code', message: 'x', code: '4821' })).toBe('Tell the host this code: 4821. Waiting for them to enter it (3 min)');
+  });
+  it('exposure text names SYSTEM only on Windows', () => {
+    expect(M.exposureText(false).join(' ')).toMatch(/SYSTEM/);
+    expect(M.exposureText(true).join(' ')).not.toMatch(/SYSTEM|Windows|PC/);
+  });
+  it('validPin is exactly four digits', () => {
+    expect(['4821', '0000'].every(M.validPin)).toBe(true);
+    expect(['', '482', '48211', '48a1', ' 4821'].some(M.validPin)).toBe(false);
+  });
+});
+
 describe('settings logic', () => {
   it('applyPreset copies the preset and keeps appName/audio', () => {
     const s = M.applyPreset({ ...base(), appName: 'Steam' }, 'lowest-latency');
@@ -27,12 +48,13 @@ describe('settings logic', () => {
     expect(M.change(custom, { fps: 120 }).presetId).toBe('balanced');
   });
   it('clamps bitrate to steps and range, 500 only with advanced', () => {
-    expect(M.clampBitrate(7, false)).toBe(20);
+    expect(M.clampBitrate(7, false)).toBe(5);
+    expect(M.clampBitrate(2, false)).toBe(5);
     expect(M.clampBitrate(83, false)).toBe(85);
     expect(M.clampBitrate(400, false)).toBe(150);
     expect(M.clampBitrate(400, true)).toBe(400);
     expect(M.clampBitrate(900, true)).toBe(500);
-    expect(M.clampBitrate(Number.NaN, true)).toBe(20);
+    expect(M.clampBitrate(Number.NaN, true)).toBe(5);
   });
   it('turning advanced off pulls a high bitrate back to 150', () => {
     const adv = M.change(base(), { advancedBitrate: true, bitrateMbps: 300 });
@@ -64,7 +86,7 @@ describe('texts and states', () => {
     expect(M.clientPhase({ ...i, hostCount: 1, stream: { hostId: 'x', state: 'ended' } })).toBe('ready');
   });
   it('every pair error code has a friendly message', () => {
-    const codes: PairErrorCode[] = ['agent-unreachable', 'agent-forbidden', 'agent-rate-limited', 'approval-denied', 'approval-timeout', 'no-pending-pairing', 'wrong-pin', 'sunshine-not-ready', 'sunshine-api-error', 'moonlight-missing', 'moonlight-failed', 'verify-failed', 'timeout'];
+    const codes: PairErrorCode[] = ['agent-unreachable', 'agent-forbidden', 'agent-rate-limited', 'approval-denied', 'approval-timeout', 'no-pending-pairing', 'wrong-pin', 'sunshine-not-ready', 'sunshine-api-error', 'moonlight-missing', 'moonlight-failed', 'verify-failed', 'code-timeout', 'timeout'];
     for (const code of codes) {
       const text: string = M.pairErrorMessage({ ok: false, hostId: 'h', code, message: 'RAW', retryable: true, durationMs: 1 });
       expect(text).not.toBe('RAW');
@@ -79,8 +101,8 @@ describe('texts and states', () => {
     expect(M.pairErrorMessage({ ok: false, hostId: 'h', code: 'no-pending-pairing', message: 'x'.repeat(900), retryable: true, durationMs: 1 }).length).toBeLessThan(520);
   });
   it('validAddress accepts IPs and names, rejects URL-ish input', () => {
-    for (const ok of ['192.168.1.20', ' 10.0.0.1 ', 'fe80::1', 'gaming-pc', 'pc.local']) expect(M.validAddress(ok)).not.toBeNull();
-    for (const bad of ['', '999.1.1.1', 'http://1.2.3.4', '1.2.3.4/x', 'a b', 'pc?x=1', '1.2.3.4:47989']) expect(M.validAddress(bad)).toBeNull();
+    for (const ok of ['192.168.1.20', ' 10.0.0.1 ', 'fe80::1', 'gaming-pc', 'pc.local', '203.0.113.7', '203.0.113.7:47989', '[2001:db8::1]:47989', '[2001:db8::1]', '2001:db8::1', 'pc.example.com:47989']) expect(M.validAddress(ok)).not.toBeNull();
+    for (const bad of ['', '999.1.1.1', 'http://1.2.3.4', '1.2.3.4/x', 'a b', 'pc?x=1', '1.2.3.4:0', '1.2.3.4:70000', '1.2.3.4:', '[1.2.3.4]:47989', '[::1]:99999', 'a:b:c d']) expect(M.validAddress(bad)).toBeNull();
   });
   it('sunshineSummary reads install and service steps', () => {
     expect(M.sunshineSummary(null)).toEqual({ installed: null, running: null });

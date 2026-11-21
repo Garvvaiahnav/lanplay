@@ -26,7 +26,7 @@ const RESOLUTIONS: readonly ResolutionId[] = ['1080p', '1440p', '4k'];
 const FPS: readonly FpsOption[] = [60, 120];
 const CODECS: readonly CodecChoice[] = ['auto', 'hevc', 'av1', 'h264'];
 const MODES: readonly DisplayMode[] = ['fullscreen', 'borderless', 'windowed'];
-const PRESET_IDS: readonly PresetId[] = ['lowest-latency', 'balanced', 'best-picture', 'custom'];
+const PRESET_IDS: readonly PresetId[] = ['lowest-latency', 'balanced', 'best-picture', 'internet', 'custom'];
 
 export function clampBitrate(v: unknown, advanced: boolean): number {
   const n = typeof v === 'number' ? v : Number(v);

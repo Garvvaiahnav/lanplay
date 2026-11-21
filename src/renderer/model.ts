@@ -19,13 +19,16 @@ namespace LP.T {
   export type ControllersState = import('../contracts.js').ControllersState;
   export type SelfCheckReport = import('../contracts.js').SelfCheckReport;
   export type AppInfo = import('../contracts.js').AppInfo;
+  export type InternetHostState = import('../contracts.js').InternetHostState;
+  export type PendingCodePairing = import('../contracts.js').PendingCodePairing;
+  export type CodePairResult = import('../contracts.js').CodePairResult;
   export type SettingsPane = import('../contracts.js').SettingsPane;
   export type Api = import('../contracts.js').LanPlayPreloadApi;
 }
 
 namespace LP.Model {
   /** Mirror of BITRATE_LIMITS_MBPS (src/contracts.ts). */
-  export const BITRATE = { min: 20, max: 150, advancedMax: 500, step: 5 } as const;
+  export const BITRATE = { min: 5, max: 150, advancedMax: 500, step: 5 } as const;
 
   export interface PresetView {
     id: Exclude<T.PresetId, 'custom'>;
@@ -39,6 +42,7 @@ namespace LP.Model {
     { id: 'lowest-latency', label: 'Lowest latency', description: '1080p at 120 fps, no V-Sync, no frame pacing.', settings: { resolution: '1080p', fps: 120, bitrateMbps: 50, codec: 'auto', displayMode: 'fullscreen', vsync: false, framePacing: false } },
     { id: 'balanced', label: 'Balanced', description: '1440p at 120 fps with frame pacing.', settings: { resolution: '1440p', fps: 120, bitrateMbps: 80, codec: 'auto', displayMode: 'fullscreen', vsync: false, framePacing: true } },
     { id: 'best-picture', label: 'Best picture', description: '4K at 60 fps, high bitrate, V-Sync on.', settings: { resolution: '4k', fps: 60, bitrateMbps: 150, codec: 'auto', displayMode: 'fullscreen', vsync: true, framePacing: true } },
+    { id: 'internet', label: 'Internet', description: '1080p at 60 fps, 15 Mbps.', settings: { resolution: '1080p', fps: 60, bitrateMbps: 15, codec: 'auto', displayMode: 'fullscreen', vsync: false, framePacing: true } },
   ];
 
   export const RESOLUTIONS: ReadonlyArray<{ value: T.ResolutionId; label: string }> = [
@@ -95,19 +99,18 @@ namespace LP.Model {
   /** Status dot + words (never colour alone). */
   export function hostStatus(h: T.HostInfo): { dot: Dot; label: string } {
     if (h.paired === true) return { dot: 'ok', label: 'Ready' };
-    if (h.agentReachable === false) return { dot: 'warn', label: 'Needs pairing (LanPlay not found on that PC)' };
+    // An internet host has no pair agent by design: the missing agent is not a problem to report.
+    if (h.agentReachable === false && h.remote !== true) return { dot: 'warn', label: 'Needs pairing (LanPlay not found on that PC)' };
     return { dot: 'warn', label: 'Needs pairing' };
   }
 
   export const HINTS = {
-    preset: 'Quick starting points. Change anything below and this becomes Custom.',
-    resolution: 'Higher looks sharper but needs a faster network and PC.',
-    fps: '120 feels smoother if your screen and PC can keep up.',
-    bitrate: 'More Mbps means a cleaner picture. 50 to 100 suits most home networks.',
-    audio: 'Stereo only for now.',
-    host: 'Computers on your network running LanPlay or Sunshine.',
-    manual: 'Not listed? Type the IP address of the PC, for example 192.168.1.20.',
+    bitrate: '50 to 100 Mbps suits most home networks.',
   } as const;
+
+  /** Fixed line under every internet host (plan 2.3). */
+  export const REMOTE_WARNING = 'Internet host. Video and input go directly to this address. Only connect to people you know.';
+  export const MANUAL_PLACEHOLDER = '203.0.113.7 or 192.168.1.20';
 
   export function codecHint(choice: T.CodecChoice, chip: T.AppleChipInfo | null): string {
     const av1 = chip?.av1HardwareDecode === true;
@@ -144,6 +147,7 @@ namespace LP.Model {
     'moonlight-missing': 'Moonlight is missing from this app. Reinstall LanPlay.',
     'moonlight-failed': 'Moonlight stopped before pairing finished. Try again.',
     'verify-failed': 'Pairing looked fine but did not stick. Try again.',
+    'code-timeout': 'The host did not enter the code in time. Press Stream to get a new code.',
     timeout: 'Pairing took too long. Try again.',
   };
 
@@ -163,12 +167,19 @@ namespace LP.Model {
     'starting-moonlight': 'Starting Moonlight...',
     'contacting-agent': 'Asking the PC to accept...',
     'waiting-approval': 'Waiting for someone to approve on the PC...',
+    'show-code': 'Waiting for the host to enter the code...',
     confirming: 'Confirming...',
     verifying: 'Making sure it worked...',
     done: 'Paired.',
   };
   export function pairPhaseText(p: T.PairProgress): string {
+    if (p.phase === 'show-code' && p.code) return pairCodeParts(p.code).join('');
     return PHASES[p.phase] ?? p.message;
+  }
+
+  /** The 'show-code' status line in three pieces, so the screen can set the code itself in the larger size. */
+  export function pairCodeParts(code: string): [string, string, string] {
+    return ['Tell the host this code: ', code, '. Waiting for them to enter it (3 min)'];
   }
 
   export type ClientPhase = 'searching' | 'no-host' | 'ready' | 'pairing' | 'streaming' | 'error';
@@ -187,7 +198,7 @@ namespace LP.Model {
   export function phaseMessage(phase: ClientPhase, hostName: string | null): string {
     switch (phase) {
       case 'searching': return 'Looking for your PC...';
-      case 'no-host': return 'No PC found yet. Check that LanPlay is running on it, or type its IP address below.';
+      case 'no-host': return 'No PC found yet. Check that LanPlay is running on it, or use Connect by IP.';
       case 'ready': return hostName ? 'Ready to play on ' + hostName + '.' : 'Pick a PC.';
       case 'pairing': return 'Pairing with ' + (hostName ?? 'the PC') + '...';
       case 'streaming': return 'Streaming from ' + (hostName ?? 'the PC') + '.';
@@ -195,14 +206,54 @@ namespace LP.Model {
     }
   }
 
-  /** Same-LAN IPv4 literal or a plain hostname; rejects anything with URL/path characters. */
+  function portOk(p: string): boolean {
+    return /^\d{1,5}$/.test(p) && Number(p) >= 1 && Number(p) <= 65535;
+  }
+
+  /** `IP`, `IP:port`, `[v6]`, `[v6]:port`, a bare IPv6 or a host name with an optional `:port`; rejects anything with URL/path characters. */
   export function validAddress(raw: string): string | null {
     const s = raw.trim();
     if (s.length === 0 || s.length > 253) return null;
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(s)) return s.split('.').every((p) => Number(p) <= 255) ? s : null;
-    if (/^[0-9a-fA-F:]+$/.test(s) && s.includes(':')) return s;
-    if (/^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(s)) return s;
-    return null;
+    const v6 = /^\[([0-9a-fA-F:.]+)\](?::(\d+))?$/.exec(s);
+    if (v6) return v6[1]?.includes(':') && (v6[2] === undefined || portOk(v6[2])) ? s : null;
+    if (/^[0-9a-fA-F:]+$/.test(s) && s.includes(':') && s.split(':').length > 2) return s;
+    const m = /^([^:]+)(?::(\d*))?$/.exec(s);
+    if (!m) return null;
+    const host = m[1] ?? '';
+    if (m[2] !== undefined && !portOk(m[2])) return null;
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return host.split('.').every((p) => Number(p) <= 255) ? s : null;
+    return /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/.test(host) ? s : null;
+  }
+
+  /** The text of a failed "Connect by IP": main's sentence as is; the address is prefixed only when the sentence does not name it. */
+  export function manualFailure(address: string, message: string): string {
+    const bracket = /^\[([^\]]+)\]/.exec(address);
+    const bare = bracket ? bracket[1] ?? address : address.split(':').length === 2 ? address.split(':')[0] ?? address : address;
+    return message.includes(bare) ? message : 'Could not reach ' + address + ': ' + message;
+  }
+
+  /** Ports of the internet card, in the order a router needs them. Mirrors SUNSHINE in src/contracts.ts (asserted in tests/ui/model.test.ts). */
+  export const INTERNET_PORTS: ReadonlyArray<{ protocol: 'TCP' | 'UDP'; ports: string; use: string }> = [
+    { protocol: 'TCP', ports: '47984', use: 'HTTPS (pairing, launch)' },
+    { protocol: 'TCP', ports: '47989', use: 'HTTP (status, pairing start)' },
+    { protocol: 'TCP', ports: '48010', use: 'RTSP' },
+    { protocol: 'UDP', ports: '47998, 47999, 48000', use: 'video, control, audio' },
+  ];
+  /** Never forward these: admin web UI, pair agent, phone controllers. */
+  export const INTERNET_NEVER_PORTS = '47990, 47920, 47921';
+
+  /** Exposure text of plan 2.4, per platform (Sunshine runs as SYSTEM only on Windows). */
+  export function exposureText(mac: boolean): string[] {
+    const lines = [
+      'This opens Sunshine to the whole internet. Anyone can start a pairing, but each one needs a code you type here.',
+      'A bug in Sunshine could be reached by anyone' + (mac ? '.' : ', and on Windows Sunshine runs as SYSTEM.'),
+      'A paired device has keyboard and mouse on ' + (mac ? 'this Mac' : 'this PC') + ' while it is on.',
+    ];
+    return lines;
+  }
+
+  export function validPin(s: string): boolean {
+    return /^\d{4}$/.test(s);
   }
 
   export interface SunshineSummary { installed: boolean | null; running: boolean | null }
@@ -259,6 +310,6 @@ namespace LP.Model {
   }
 
   export function deviceVia(d: T.PairedDevice): string {
-    return d.pairedVia === 'lanplay' ? 'paired with LanPlay' : d.pairedVia === 'other' ? 'paired in Sunshine' : 'paired';
+    return d.pairedVia === 'lanplay' ? 'paired with LanPlay' : d.pairedVia === 'code' ? 'paired with a code' : d.pairedVia === 'other' ? 'paired in Sunshine' : 'paired';
   }
 }

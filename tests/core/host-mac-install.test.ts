@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { SUNSHINE_MANAGED_CONFIG, SUNSHINE_MAC } from '../../src/contracts.js';
+import { SUNSHINE_MAC, sunshineManagedConfig } from '../../src/contracts.js';
 import type { ExecRequest, ExecResult, ProcessRunner } from '../../src/contracts.js';
 import {
   bundledSunshineApp,
@@ -76,7 +76,7 @@ describe('paths', () => {
 
   it('manages the Windows keys plus absolute private paths and a hidden tray icon', () => {
     expect(macManagedConfig(P)).toEqual({
-      ...SUNSHINE_MANAGED_CONFIG,
+      ...sunshineManagedConfig(false),
       pkey: P.pkey,
       cert: P.cert,
       log_path: P.log,
@@ -85,6 +85,14 @@ describe('paths', () => {
       file_apps: P.apps,
       system_tray: 'disabled',
     });
+  });
+
+  it('turns UPnP and IPv6 on with the internet switch and nothing else', () => {
+    const on = macManagedConfig(P, true);
+    const off = macManagedConfig(P);
+    expect(on).toMatchObject({ upnp: 'enabled', address_family: 'both', origin_web_ui_allowed: 'pc' });
+    expect(off).toMatchObject({ upnp: 'disabled', address_family: 'ipv4', origin_web_ui_allowed: 'pc' });
+    expect({ ...on, upnp: 'disabled', address_family: 'ipv4' }).toEqual(off);
   });
 
   it('runs the copy with the private config as argv[1] under KeepAlive', () => {

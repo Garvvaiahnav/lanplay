@@ -42,8 +42,10 @@ describe('resolveCodec (Auto rule)', () => {
 });
 
 describe('settings validation', () => {
-  it('clamps bitrate 20..150, advanced up to 500', () => {
-    expect(clampBitrate(5, false)).toBe(20);
+  it('clamps bitrate 5..150, advanced up to 500', () => {
+    expect(clampBitrate(1, false)).toBe(5);
+    expect(clampBitrate(5, false)).toBe(5);
+    expect(clampBitrate(12.4, false)).toBe(12);
     expect(clampBitrate(200, false)).toBe(150);
     expect(clampBitrate(200, true)).toBe(200);
     expect(clampBitrate(900, true)).toBe(500);

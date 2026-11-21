@@ -50,3 +50,24 @@ export async function fetchServerInfo(host: string, port: number = SUNSHINE.http
   if (r.status !== 200) throw new Error(`GET /serverinfo -> HTTP ${r.status}`);
   return parseServerInfo(r.body);
 }
+
+/** `ip:port`, with brackets around an IPv6 literal. */
+export function formatHostPort(ip: string, port: number): string {
+  return ip.includes(':') ? `[${ip}]:${port}` : `${ip}:${port}`;
+}
+
+/** Message for a typed internet address that did not confirm as Sunshine (release plan 2.6). Socket errors carry a `code`; parse and HTTP errors do not. */
+export function describeInternetProbeError(e: unknown, ip: string, port: number): string {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code;
+  if (code === 'ECONNREFUSED') {
+    return `${ip} answered but port ${port} is closed. On the host: switch on Allow connections from the internet and forward the ports, and check that Sunshine is running.`;
+  }
+  if (code === 'ETIMEDOUT') {
+    return `No answer from ${formatHostPort(ip, port)}. The IP is wrong, the host PC is off, the ports are not forwarded, or the host's provider uses CGNAT (no public IPv4). LanPlay cannot tell which from here.`;
+  }
+  if (code === 'ENETUNREACH' || code === 'EHOSTUNREACH' || code === 'EADDRNOTAVAIL') {
+    return `This computer has no route to ${ip}. An IPv6 address needs IPv6 on both sides.`;
+  }
+  if (typeof code === 'string') return `Could not connect to ${formatHostPort(ip, port)} (${code}).`;
+  return `Something answered at ${formatHostPort(ip, port)} but it is not Sunshine.`;
+}

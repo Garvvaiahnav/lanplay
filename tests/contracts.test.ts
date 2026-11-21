@@ -10,6 +10,7 @@ import {
   PRESETS,
   SUNSHINE,
   SUNSHINE_MAC,
+  sunshineManagedConfig,
 } from '../src/contracts.js';
 
 describe('contracts', () => {
@@ -73,5 +74,27 @@ describe('contracts', () => {
 
   it('exposes the macOS host IPC channels', () => {
     for (const c of ['host:open-settings', 'host:confirm-input', 'host:sunshine-restart']) expect(IPC_INVOKE_CHANNELS as readonly string[]).toContain(c);
+  });
+
+  it('0.5 online contracts: bitrate floor, Internet preset, step id, channels', () => {
+    expect(BITRATE_LIMITS_MBPS.min).toBe(5);
+    const internet = PRESETS.find((p) => p.id === 'internet');
+    expect(internet?.settings).toMatchObject({ resolution: '1080p', fps: 60, bitrateMbps: 15, codec: 'auto' });
+    expect(HOST_STEP_ORDER).toContain('firewall-internet');
+    expect(HOST_STEP_ORDER.indexOf('firewall-internet')).toBeGreaterThan(HOST_STEP_ORDER.indexOf('firewall-agent'));
+    expect(MAC_HOST_STEP_ORDER).not.toContain('firewall-internet');
+    for (const c of ['host:internet-get', 'host:internet-set', 'host:pending-list', 'host:pending-pair', 'host:pending-reject', 'client:recent-remote']) {
+      expect(IPC_INVOKE_CHANNELS as readonly string[]).toContain(c);
+    }
+    expect(IPC_EVENT_CHANNELS as readonly string[]).toContain('host:internet-changed');
+  });
+
+  it('sunshineManagedConfig follows D08 and D09 and keeps the codec keys', () => {
+    const off = sunshineManagedConfig(false);
+    const on = sunshineManagedConfig(true);
+    expect(off).toEqual({ origin_web_ui_allowed: 'pc', upnp: 'disabled', address_family: 'ipv4', hevc_mode: '0', av1_mode: '0' });
+    expect(on).toEqual({ origin_web_ui_allowed: 'pc', upnp: 'enabled', address_family: 'both', hevc_mode: '0', av1_mode: '0' });
+    expect(Object.isFrozen(off)).toBe(true);
+    expect(Object.keys(on)).toEqual(Object.keys(off));
   });
 });

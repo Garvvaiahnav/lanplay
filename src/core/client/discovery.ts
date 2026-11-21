@@ -7,9 +7,9 @@ import os from 'node:os';
 import { Bonjour } from 'bonjour-service';
 import { LANPLAY, SUNSHINE } from '../../contracts.js';
 import type { AgentDiscoveryReply, DiscoveryService, DiscoverySource, HostInfo, Logger } from '../../contracts.js';
-import { broadcastAddress, isPrivateAddress, normalizeAddress, subnetHosts } from '../shared/ipnet.js';
+import { broadcastAddress, isPrivateAddress, isRemoteAddress, normalizeAddress, parseHostPort, subnetHosts } from '../shared/ipnet.js';
 import { httpGet, tcpProbe } from '../shared/netprobe.js';
-import { fetchServerInfo } from './serverinfo.js';
+import { describeInternetProbeError, fetchServerInfo, formatHostPort } from './serverinfo.js';
 import type { ServerInfo } from './serverinfo.js';
 
 export interface MdnsBrowser {
@@ -45,7 +45,7 @@ export function createBonjourBrowser(log: Logger): MdnsBrowser {
 
 export interface DiscoveryDeps {
   log: Logger;
-  fetchServerInfo: (host: string, port: number) => Promise<ServerInfo>;
+  fetchServerInfo: (host: string, port: number, timeoutMs?: number) => Promise<ServerInfo>;
   mdns: MdnsBrowser | null;
   /** Broadcast destinations for the agent UDP probe. */
   udpTargets: () => string[];
@@ -61,6 +61,8 @@ export interface DiscoveryDeps {
   probeConcurrency: number;
   udpRepeatMs: number;
   now: () => number;
+  /** Called once per typed internet address that was confirmed as Sunshine (never for discovered hosts). */
+  onRemoteHost?: (host: HostInfo, typed: string) => void;
 }
 
 export function localIPv4Interfaces(): Array<{ address: string; netmask: string }> {
@@ -76,7 +78,7 @@ export function localIPv4Interfaces(): Array<{ address: string; netmask: string 
 export function defaultDiscoveryDeps(log: Logger): DiscoveryDeps {
   return {
     log,
-    fetchServerInfo: (h, p) => fetchServerInfo(h, p),
+    fetchServerInfo: (h, p, t) => fetchServerInfo(h, p, t),
     mdns: createBonjourBrowser(log),
     udpTargets: () => {
       const t = new Set<string>(['255.255.255.255']);
@@ -213,17 +215,15 @@ export class LanDiscovery implements DiscoveryService {
     await Promise.all(Array.from({ length: Math.min(this.d.probeConcurrency, hosts.length) }, worker));
   }
 
-  /** Confirm a candidate via /serverinfo and merge it (by Sunshine uniqueid). */
-  private confirm(addrIn: string, source: DiscoverySource, nameHint?: string, agentKnown = false): Promise<HostInfo | null> {
+  /** Confirm a discovered candidate via /serverinfo and merge it (by Sunshine uniqueid). Discovery sources never produce a remote host. */
+  private confirm(addrIn: string, source: Exclude<DiscoverySource, 'manual'>, nameHint?: string, agentKnown = false): Promise<HostInfo | null> {
     const addr = normalizeAddress(addrIn);
     const key = `${addr}|${source}`;
     const existing = this.inflight.get(key);
     if (existing) return existing;
     const p = (async () => {
       try {
-        const info = await this.d.fetchServerInfo(addr, this.d.sunshinePort);
-        const agentReachable = agentKnown ? true : await this.d.agentCheck(addr, this.d.agentPort);
-        return this.merge(addr, source, info, nameHint, agentReachable);
+        return await this.lookup(addr, source, { port: this.d.sunshinePort, remote: false, timeoutMs: 2500 }, nameHint, agentKnown);
       } catch (e) {
         this.d.log.log('debug', 'discovery', `candidate ${addr} (${source}) not confirmed: ${(e as Error).message}`);
         return null;
@@ -235,27 +235,37 @@ export class LanDiscovery implements DiscoveryService {
     return p;
   }
 
-  private merge(addr: string, source: DiscoverySource, info: ServerInfo, nameHint: string | undefined, agentReachable: boolean): HostInfo {
-    const id = info.uniqueId ? info.uniqueId : `addr:${addr}`;
+  /** Throws when the address does not answer as Sunshine. A non-private address is only accepted for the 'manual' source. */
+  private async lookup(addr: string, source: DiscoverySource, o: { port: number; remote: boolean; timeoutMs: number }, nameHint?: string, agentKnown = false): Promise<HostInfo> {
+    if (source !== 'manual' && !isPrivateAddress(addr)) throw new Error(`${addr} is not a private address`);
+    const info = await this.d.fetchServerInfo(addr, o.port, o.timeoutMs);
+    const agentReachable = o.remote ? false : agentKnown ? true : await this.d.agentCheck(addr, this.d.agentPort);
+    return this.merge(addr, source, info, nameHint, agentReachable, o.port, o.remote);
+  }
+
+  private merge(addr: string, source: DiscoverySource, info: ServerInfo, nameHint: string | undefined, agentReachable: boolean, port: number, remote: boolean): HostInfo {
+    // An internet host is its own entry per typed address: LAN discovery never merges into it, and it never becomes a LAN entry's address.
+    const id = remote ? `remote:${formatHostPort(addr, port)}` : info.uniqueId ? info.uniqueId : `addr:${addr}`;
     const prev = this.hosts.get(id);
-    const addresses = [...new Set([...(prev?.addresses ?? []), addr])].sort((a, b) => Number(net.isIPv6(a)) - Number(net.isIPv6(b)));
+    const addresses = remote ? [addr] : [...new Set([...(prev?.addresses ?? []), addr])].sort((a, b) => Number(net.isIPv6(a)) - Number(net.isIPv6(b)));
     const host: HostInfo = {
       id,
       name: info.hostname || nameHint || prev?.name || addr,
       addresses,
-      preferredAddress: prev?.preferredAddress && addresses.includes(prev.preferredAddress) && net.isIPv4(prev.preferredAddress) ? prev.preferredAddress : (addresses[0] ?? addr),
+      preferredAddress: remote ? addr : prev?.preferredAddress && addresses.includes(prev.preferredAddress) && net.isIPv4(prev.preferredAddress) ? prev.preferredAddress : (addresses[0] ?? addr),
       sources: [...new Set([...(prev?.sources ?? []), source])],
-      httpPort: this.d.sunshinePort,
+      httpPort: port,
       agentReachable: agentReachable || prev?.agentReachable === true,
       lastSeen: new Date(this.d.now()).toISOString(),
     };
+    if (remote) host.remote = true;
     if (info.serverCodecModeSupport !== undefined) host.serverCodecModeSupport = info.serverCodecModeSupport;
     if (prev?.paired !== undefined) host.paired = prev.paired;
     // A manual entry is what the user typed: prefer it.
     if (source === 'manual') host.preferredAddress = addr;
     const isNew = !prev;
     this.hosts.set(id, host);
-    if (isNew) this.d.log.log('info', 'discovery', `found ${host.name} at ${addr} via ${source}`, { id, agentReachable, scms: info.serverCodecModeSupport ?? null });
+    if (isNew) this.d.log.log('info', 'discovery', `found ${host.name} at ${addr} via ${source}`, { id, agentReachable, remote, scms: info.serverCodecModeSupport ?? null });
     this.emit();
     return host;
   }
@@ -272,27 +282,44 @@ export class LanDiscovery implements DiscoveryService {
     return this.hosts.get(id);
   }
 
+  /** The only way a non-private address enters the host list: the user typed it. */
   async addManual(address: string): Promise<HostInfo> {
     const a = String(address ?? '').trim();
-    if (!a || a.length > 253 || /[\s/\\@?#]/.test(a)) throw new Error('Enter an IP address like 192.168.1.20 or a PC name.');
-    let ip = normalizeAddress(a);
+    const bad = 'Enter an IP address like 192.168.1.20 or a PC name.';
+    if (!a || a.length > 253 || /[\s/\\@?#]/.test(a)) throw new Error(bad);
+    const hp = parseHostPort(a);
+    if (!hp) throw new Error(bad);
+    let ip = normalizeAddress(hp.host);
     if (!net.isIP(ip)) {
-      if (!/^[A-Za-z0-9.-]+$/.test(a)) throw new Error('Enter an IP address like 192.168.1.20 or a PC name.');
+      if (!/^[A-Za-z0-9.-]+$/.test(hp.host)) throw new Error(bad);
       try {
-        const r = await dns.lookup(a, { family: 0, all: true });
+        const r = await dns.lookup(hp.host, { family: 0, all: true });
         const v4 = r.find((x) => x.family === 4) ?? r[0];
         if (!v4) throw new Error('no address');
         ip = normalizeAddress(v4.address);
       } catch {
-        throw new Error(`Could not find a computer named "${a}". Try its IP address.`);
+        throw new Error(`Could not find a computer named "${hp.host}". Try its IP address.`);
       }
     }
-    // LAN only (v1): the PIN travels to the PC's pair agent over plain HTTP, and the agent refuses non-private sources anyway.
-    if (!isPrivateAddress(ip)) {
-      throw new Error(`${ip} is not an address on a home network. LanPlay only connects inside your own network (addresses like 192.168.x.x or 10.x.x.x).`);
+    const remote = isRemoteAddress(ip);
+    const port = hp.port ?? this.d.sunshinePort;
+    if (!remote && hp.port !== null && hp.port !== this.d.sunshinePort) throw new Error('Custom ports are only supported for internet addresses. Use the plain IP.');
+    const timeoutMs = remote ? 5000 : 2500;
+    let host: HostInfo;
+    try {
+      host = await this.lookup(ip, 'manual', { port, remote, timeoutMs });
+    } catch (e) {
+      this.d.log.log('debug', 'discovery', `manual ${ip}:${port} not confirmed: ${(e as Error).message}`);
+      if (remote) throw new Error(describeInternetProbeError(e, ip, port));
+      throw new Error(`No Sunshine host answered at ${ip}:${port}. Is LanPlay set up on the PC and is the PC on?`);
     }
-    const h = await this.confirm(ip, 'manual', undefined);
-    if (!h) throw new Error(`No Sunshine host answered at ${ip}:${this.d.sunshinePort}. Is LanPlay set up on the PC and is the PC on?`);
-    return h;
+    if (remote) {
+      try {
+        this.d.onRemoteHost?.(host, a);
+      } catch (e) {
+        this.d.log.log('warn', 'discovery', `onRemoteHost failed: ${(e as Error).message}`);
+      }
+    }
+    return host;
   }
 }

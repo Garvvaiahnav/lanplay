@@ -9,6 +9,11 @@
 //  - `stream ...`: records argv and exits 0.
 // Env: FAKE_ML_STATE (JSON state file, required), FAKE_ML_HOOK (mock Sunshine hook base URL),
 //      FAKE_ML_ADDRESS (address Sunshine "sees", default 127.0.0.1), FAKE_ML_MODE (normal|crash|no-register|ignore-term|exit-on-409).
+//      Internet-host pairing (the owner types the code on the host; no Sunshine hook needed):
+//      FAKE_ML_STREAM_MS=N / FAKE_ML_STREAM_EXIT=C  how long `stream` runs and the exit code it ends with (default 0 ms, 0).
+//      FAKE_ML_PAIR_EXIT_MS=N  after N ms mark <host> paired and exit 0 (a Moonlight that quits by itself after success),
+//      FAKE_ML_PAIR_PAIRED_MS=N after N ms mark <host> paired but stay open (a Moonlight whose dialog stays up),
+//      FAKE_ML_PAIR_QUIT_MS=N  after N ms exit 0 without pairing (the player closed the window).
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 const stateFile = process.env.FAKE_ML_STATE;
@@ -39,7 +44,7 @@ if (cmd === 'stream') {
   const s = load();
   s.streams.push(argv);
   save(s);
-  setTimeout(() => process.exit(0), Number(process.env.FAKE_ML_STREAM_MS ?? 0));
+  setTimeout(() => process.exit(Number(process.env.FAKE_ML_STREAM_EXIT ?? 0)), Number(process.env.FAKE_ML_STREAM_MS ?? 0));
 } else if (cmd === 'pair') {
   const i = argv.indexOf('--pin');
   const pin = i >= 0 ? argv[i + 1] : undefined;
@@ -51,6 +56,19 @@ if (cmd === 'stream') {
     console.error('Failed to connect to host');
     process.exit(1);
   }
+  const markPaired = () => {
+    const cur = load();
+    cur.paired[host] = true;
+    save(cur);
+  };
+  if (process.env.FAKE_ML_PAIR_EXIT_MS) {
+    setTimeout(() => {
+      markPaired();
+      process.exit(0);
+    }, Number(process.env.FAKE_ML_PAIR_EXIT_MS));
+  }
+  if (process.env.FAKE_ML_PAIR_QUIT_MS) setTimeout(() => process.exit(0), Number(process.env.FAKE_ML_PAIR_QUIT_MS));
+  if (process.env.FAKE_ML_PAIR_PAIRED_MS) setTimeout(markPaired, Number(process.env.FAKE_ML_PAIR_PAIRED_MS));
   const hook = process.env.FAKE_ML_HOOK;
   const address = process.env.FAKE_ML_ADDRESS ?? '127.0.0.1';
   let pendingId = null;

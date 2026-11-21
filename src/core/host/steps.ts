@@ -2,7 +2,7 @@
 // Each step: probe() is read-only (self-check), apply() is idempotent (setup). Paths: path.win32 only.
 import { X509Certificate } from 'node:crypto';
 import path from 'node:path';
-import { LANPLAY, SUNSHINE, SUNSHINE_MANAGED_CONFIG, SunshineApiError } from '../../contracts.js';
+import { LANPLAY, SUNSHINE, sunshineManagedConfig, SunshineApiError } from '../../contracts.js';
 import type { HostStep, HostStepContext, HostStepId, SunshineClient, SunshineClientOptions, SunshineFactsPs, SunshineInstall } from '../../contracts.js';
 import { runRecorded } from '../shared/exec.js';
 import { sleep, timedStep } from '../shared/steprec.js';
@@ -20,13 +20,14 @@ export const STEP_TITLES: Record<HostStepId, string> = {
   'locate-sunshine': 'Find Sunshine',
   'install-sunshine': 'Install Sunshine',
   service: 'Sunshine service (automatic, running)',
-  config: 'Sunshine settings (LAN only, HEVC/AV1 auto, UPnP off)',
+  config: 'Sunshine settings (admin page on this PC only, HEVC/AV1 auto, UPnP and IPv6 follow the internet switch)',
   credentials: 'Sunshine admin login',
   'restart-service': 'Restart Sunshine',
   'web-ui': 'Sunshine web API reachable (pinned certificate)',
   'api-auth': 'Sunshine API login works',
   'firewall-sunshine': 'Firewall rule "Sunshine"',
   'firewall-agent': 'Firewall rule "LanPlay Pair Agent"',
+  'firewall-internet': `Firewall rule "${LANPLAY.internetFirewallRuleName}" (internet switch)`,
   'agent-autostart': 'Start LanPlay pair agent at login',
   'agent-listening': 'LanPlay pair agent answering',
   'mac-bundle': 'Sunshine for Mac is bundled and signed',
@@ -77,6 +78,8 @@ export interface HostStepsEnv {
   collectInstallerLogs?: () => string[];
   now(): number;
   sleep(ms: number): Promise<void>;
+  /** The "Allow connections from the internet" switch (D07) for this run. Absent = off. */
+  internet?: boolean;
   /** Timing knobs (tests shrink them). */
   timing?: Partial<typeof DEFAULT_TIMING>;
 }
@@ -217,6 +220,37 @@ export function evaluateAgentFirewall(rules: FirewallRuleFact[], port: number): 
   }
   const blockRules = rules.filter((r) => r.matchedBy === 'program' && r.enabled && /^inbound$/i.test(r.direction) && /^block$/i.test(r.action));
   return { ok: problems.length === 0, problems, blockRules };
+}
+
+/** Does a Windows firewall port list ("47984,47989,48010" or "47998-48000", as get-firewall-rules prints it) cover every port in `want`? */
+export function portListCovers(localPort: string, want: readonly number[]): boolean {
+  const have: Array<[number, number]> = [];
+  for (const tok of localPort.split(',').map((x) => x.trim()).filter(Boolean)) {
+    const m = /^(\d{1,5})(?:-(\d{1,5}))?$/.exec(tok);
+    if (m) have.push([Number(m[1]), Number(m[2] ?? m[1])]);
+  }
+  return want.every((p) => have.some(([a, b]) => p >= a && p <= b));
+}
+
+/** Ports the internet rule opens: Sunshine's HTTPS, HTTP and RTSP on TCP; video, control and audio on UDP. */
+export const INTERNET_TCP_PORTS: readonly number[] = Object.freeze([SUNSHINE.httpsPort, SUNSHINE.httpPort, SUNSHINE.rtspPort]);
+export const INTERNET_UDP_PORTS: readonly number[] = SUNSHINE.udpPorts;
+const udpRange = `${Math.min(...INTERNET_UDP_PORTS)}-${Math.max(...INTERNET_UDP_PORTS)}`;
+
+export function evaluateInternetFirewall(rules: FirewallRuleFact[], on: boolean): { ok: boolean; problems: string[] } {
+  const named = rules.filter((r) => r.name === LANPLAY.internetFirewallRuleName && r.matchedBy !== 'program');
+  if (!on) return named.length === 0 ? { ok: true, problems: [] } : { ok: false, problems: [`${named.length} rule(s) named "${LANPLAY.internetFirewallRuleName}" still exist while the internet switch is off`] };
+  const problems: string[] = [];
+  for (const [proto, ports] of [['TCP', INTERNET_TCP_PORTS], ['UDP', INTERNET_UDP_PORTS]] as const) {
+    const r = named.find((x) => x.protocol.toUpperCase() === proto);
+    if (!r) problems.push(`${proto} rule missing`);
+    else {
+      if (!allowsInbound(r)) problems.push(`${proto} rule is not an enabled inbound Allow rule`);
+      if (!portListCovers(r.localPort, ports)) problems.push(`${proto} rule ports are ${r.localPort || 'none'}, expected ${ports.join(', ')}`);
+      if (!/^any$/i.test(r.remoteAddress.trim())) problems.push(`${proto} rule remote address is "${r.remoteAddress}", expected Any`);
+    }
+  }
+  return { ok: problems.length === 0, problems };
 }
 
 /** Non-secret certificate facts for diagnostics (helps if Electron's BoringSSL treats Sunshine's cert differently). */
@@ -399,19 +433,21 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
       async (ctx, s) => {
         const b = needInstall(ctx);
         if (b) return b;
+        const managed = sunshineManagedConfig(env.internet === true);
         const text = env.readText(ctx.install!.configFile) ?? '';
-        const m = mergeSunshineConf(text, SUNSHINE_MANAGED_CONFIG);
+        const m = mergeSunshineConf(text, managed);
         s.data.configFile = ctx.install!.configFile;
-        return m.changed ? { status: 'fail', message: `sunshine.conf is missing LanPlay settings (${Object.keys(SUNSHINE_MANAGED_CONFIG).join(', ')}).` } : { status: 'pass', message: 'sunshine.conf has LanPlay\'s settings.' };
+        return m.changed ? { status: 'fail', message: `sunshine.conf is missing LanPlay settings (${Object.keys(managed).join(', ')}).` } : { status: 'pass', message: 'sunshine.conf has LanPlay\'s settings.' };
       },
       async (ctx, s) => {
         const b = needInstall(ctx) ?? needAdmin(ctx);
         if (b) return b;
         const file = ctx.install!.configFile;
+        const managed = sunshineManagedConfig(env.internet === true);
         const text = env.readText(file) ?? '';
-        const m = mergeSunshineConf(text, SUNSHINE_MANAGED_CONFIG);
+        const m = mergeSunshineConf(text, managed);
         s.data.configFile = file;
-        s.data.managed = SUNSHINE_MANAGED_CONFIG;
+        s.data.managed = managed;
         if (!m.changed) return { status: 'pass', message: 'sunshine.conf already correct (not rewritten).' };
         env.writeText(file, m.text);
         const back = env.readText(file);
@@ -557,6 +593,13 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
     ),
 
     mk(
+      'firewall-internet',
+      true,
+      async (ctx, s) => internetFirewall(ctx, s, false),
+      async (ctx, s) => internetFirewall(ctx, s, true),
+    ),
+
+    mk(
       'agent-autostart',
       false,
       async () => {
@@ -669,6 +712,39 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
     };
   }
 
+  async function internetFirewall(ctx: HostStepContext, s: StepScratch, apply: boolean): Promise<StepOutcome> {
+    const on = env.internet === true;
+    s.data.internet = on;
+    const check = async () => {
+      const rules = await firewallRules(ctx, env, s, [LANPLAY.internetFirewallRuleName]);
+      s.data.rules = rules;
+      return evaluateInternetFirewall(rules, on);
+    };
+    let ev = await check();
+    if (apply && !ev.ok) {
+      const a = needAdmin(ctx);
+      if (a) return a;
+      const params: Record<string, string | number | readonly number[]> = { Enable: on ? 1 : 0, Name: LANPLAY.internetFirewallRuleName };
+      if (on) {
+        params.TcpPorts = INTERNET_TCP_PORTS;
+        params.UdpPorts = udpRange;
+      }
+      const r = await runPs<{ rules: unknown; removed?: string[] | string }>(
+        { runner: ctx.runner, systemRoot: ctx.systemRoot, psDir: ctx.psDir, redactor: ctx.log.redactor },
+        'set-internet-firewall-rule',
+        params,
+        timing(env).psTimeoutMs,
+        s.commands,
+      );
+      if (!r.ok) return { status: 'fail', message: `set-internet-firewall-rule.ps1 failed: ${r.error}` };
+      ev = await check();
+    }
+    if (!ev.ok) return { status: 'fail', message: `Internet firewall rule: ${ev.problems.join('; ')}.` };
+    return on
+      ? { status: 'pass', message: `Inbound TCP ${INTERNET_TCP_PORTS.join(', ')} and UDP ${udpRange} are open to the internet (Sunshine's own ports only).` }
+      : { status: 'pass', message: `Internet play is off: no "${LANPLAY.internetFirewallRuleName}" rule.` };
+  }
+
   async function agentListening(_ctx: HostStepContext, s: StepScratch): Promise<StepOutcome> {
     if (!env.agentProbe) return { status: 'skip', message: 'Checked by the LanPlay app after the elevated part.' };
     const r = await env.agentProbe();
@@ -680,7 +756,7 @@ export function createHostSteps(env: HostStepsEnv): HostStep[] {
 }
 
 /** Steps the elevated child runs; the rest belongs to the user session. */
-export const ELEVATED_STEP_IDS: readonly HostStepId[] = ['admin', 'locate-sunshine', 'install-sunshine', 'service', 'config', 'credentials', 'restart-service', 'web-ui', 'api-auth', 'firewall-sunshine', 'firewall-agent'];
+export const ELEVATED_STEP_IDS: readonly HostStepId[] = ['admin', 'locate-sunshine', 'install-sunshine', 'service', 'config', 'credentials', 'restart-service', 'web-ui', 'api-auth', 'firewall-sunshine', 'firewall-agent', 'firewall-internet'];
 export const USER_STEP_IDS: readonly HostStepId[] = ['agent-autostart', 'agent-listening'];
 
 export { sleep };

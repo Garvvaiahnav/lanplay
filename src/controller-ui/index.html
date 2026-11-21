@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; manifest-src 'self'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; manifest-src 'self'; media-src 'self'">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#0b0d12">
   <meta name="color-scheme" content="dark">
@@ -31,7 +31,7 @@
       <circle class="gear-ring" cx="12" cy="12" r="5.4"></circle>
       <circle class="gear-hub" cx="12" cy="12" r="1.8"></circle>
     </svg>
-    <span class="menu-label"><span class="menu-dot" aria-hidden="true">●</span> <span id="menu-slot">P?</span></span>
+    <span class="menu-label"><span class="menu-dot" aria-hidden="true"></span><span id="menu-slot">P?</span></span>
   </button>
   <button type="button" id="done" class="done" hidden>Done</button>
 
@@ -61,6 +61,16 @@
     <p class="overlay-sub">In landscape Safari may hide its toolbar, so do this in portrait or from the address-bar menu.</p>
     <button type="button" id="a2hs-close" class="action">Close</button>
   </div>
+
+  <!-- Shown on Android after full screen was left (back gesture): one tap goes back in. -->
+  <div id="fs-offer" class="overlay" role="dialog" aria-modal="true" aria-labelledby="fs-title" hidden>
+    <p id="fs-title" class="overlay-title">Full screen is off</p>
+    <button type="button" id="fs-go" class="action">Full screen</button>
+    <button type="button" id="fs-skip" class="action quiet">Not now</button>
+  </div>
+
+  <!-- The player number on connect and on re-attach, in the centre for 1.5 s. -->
+  <p id="slot-toast" class="slot-toast" role="status" hidden></p>
 
   <div id="rotate" class="overlay rotate-overlay">
     <div class="phone-icon" aria-hidden="true"></div>

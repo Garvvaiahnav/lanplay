@@ -124,6 +124,13 @@ function minLevelOf(n: number): LogLevel {
   return (Object.entries(LEVELS).find(([, v]) => v === n)?.[0] ?? 'debug') as LogLevel;
 }
 
+/** Packaged builds log at `info`; a development run logs `debug`. LANPLAY_LOG_LEVEL=debug|info|warn|error overrides both. */
+export function resolveLogLevel(isPackaged: boolean, env: Record<string, string | undefined>): LogLevel {
+  const asked = env.LANPLAY_LOG_LEVEL?.toLowerCase();
+  if (asked !== undefined && Object.prototype.hasOwnProperty.call(LEVELS, asked)) return asked as LogLevel;
+  return isPackaged ? 'info' : 'debug';
+}
+
 export function createJsonlLogger(o: JsonlLoggerOptions): JsonlLogger {
   const redactor = o.redactor ?? new DefaultRedactor();
   return new JsonlLogger(new FileSink(o), redactor, '', o.minLevel ?? 'debug', o.now ?? (() => new Date()));

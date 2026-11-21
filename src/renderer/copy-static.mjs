@@ -14,5 +14,5 @@ console.log('renderer assets copied to', out);
 const uiSrc = join(here, '..', 'controller-ui');
 const uiOut = join(here, '..', '..', 'dist', 'controller-ui');
 mkdirSync(uiOut, { recursive: true });
-for (const f of ['index.html', 'controller.css', 'apple-touch-icon.png', 'manifest.webmanifest']) copyFileSync(join(uiSrc, f), join(uiOut, f));
+for (const f of ['index.html', 'controller.css', 'apple-touch-icon.png', 'icon-192.png', 'icon-512.png', 'wake.mp4', 'manifest.webmanifest']) copyFileSync(join(uiSrc, f), join(uiOut, f));
 console.log('controller page assets copied to', uiOut);

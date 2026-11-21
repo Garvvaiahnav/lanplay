@@ -102,11 +102,11 @@ describe('settings controls', () => {
     expect(radio('Balanced').getAttribute('aria-checked')).toBe('false');
   });
 
-  it('bitrate slider: 20..150, advanced switch allows up to 500 and turning it off clamps', async () => {
+  it('bitrate slider: 5..150, advanced switch allows up to 500 and turning it off clamps', async () => {
     setup();
     await ready();
     const range = q<HTMLInputElement>(root, '#bitrate');
-    expect([range.min, range.max, range.step]).toEqual(['20', '150', '5']);
+    expect([range.min, range.max, range.step]).toEqual(['5', '150', '5']);
     const adv = q<HTMLInputElement>(root, '#adv');
     adv.checked = true;
     adv.dispatchEvent(new Event('change'));
@@ -264,5 +264,194 @@ describe('cleanup', () => {
     expect(root.childNodes).toHaveLength(0);
     api.emit('client:hosts-updated', [HOST_B as never]);
     expect(root.childNodes).toHaveLength(0);
+  });
+});
+
+const REMOTE = { id: 'addr:203.0.113.7', name: '203.0.113.7', addresses: ['203.0.113.7'], preferredAddress: '203.0.113.7', sources: ['manual'], httpPort: 47989, agentReachable: false, paired: false, remote: true, lastSeen: '2026-01-01T00:00:00Z' } as const;
+
+describe('Connect by IP (internet hosts)', () => {
+  it('has the labelled input, the placeholder from the plan and no longer explains itself', async () => {
+    setup({}, []);
+    await ready();
+    expect(q(root, 'label[for="manual-ip"]').textContent).toBe('Connect by IP');
+    expect(q<HTMLInputElement>(root, '#manual-ip').placeholder).toBe('203.0.113.7 or 192.168.1.20');
+  });
+
+  it('accepts IP:port and passes it on untouched', async () => {
+    setup({ 'client:add-manual-host': () => REMOTE }, []);
+    await ready();
+    q<HTMLInputElement>(root, '#manual-ip').value = '203.0.113.7:47989';
+    buttonByText(root, 'Add').click();
+    await flush();
+    expect(api.called('client:add-manual-host')).toEqual([{ address: '203.0.113.7:47989' }]);
+  });
+
+  it('a remote host shows the Internet tag, its address, the fixed warning and no "LanPlay not found" text', async () => {
+    setup({}, [REMOTE as never]);
+    await ready();
+    const row = q(root, '.host');
+    expect(q(row, '.tag').textContent).toBe('Internet');
+    expect(row.textContent).toContain('203.0.113.7');
+    expect(row.textContent).toContain('Internet host. Video and input go directly to this address. Only connect to people you know.');
+    expect(row.textContent).not.toMatch(/LanPlay not found/);
+    expect(root.querySelectorAll('.tag')).toHaveLength(1);
+  });
+
+  it('a LAN host has no tag and no warning', async () => {
+    setup({}, [HOST_A as never]);
+    await ready();
+    expect(root.querySelector('.tag')).toBeNull();
+    expect(root.querySelector('.hwarn')).toBeNull();
+  });
+
+  it('adding a new remote host selects it and shows the Internet preset the service applied (once per address)', async () => {
+    // The service owns the "once" (MacClientService.rememberRemote); this fake does the same and the page only reads the result.
+    let svc: Record<string, unknown> = { ...DEFAULTS };
+    let firstTime = true;
+    setup(
+      {
+        'client:settings-get': () => ({ ...svc }),
+        'client:settings-set': (s) => (svc = s as Record<string, unknown>),
+        'client:add-manual-host': () => {
+          if (firstTime) svc = { ...svc, presetId: 'internet', resolution: '1080p', fps: 60, bitrateMbps: 15, codec: 'auto' };
+          firstTime = false;
+          return REMOTE;
+        },
+      },
+      [],
+    );
+    await ready();
+    q<HTMLInputElement>(root, '#manual-ip').value = '203.0.113.7';
+    buttonByText(root, 'Add').click();
+    await flush();
+    expect(q<HTMLInputElement>(root, '#host-addr_203_0_113_7').checked).toBe(true);
+    expect(radio('Internet').getAttribute('aria-checked')).toBe('true');
+    expect(q<HTMLInputElement>(root, '#bitrate').value).toBe('15');
+    // The page itself did not write the preset: the service already had it.
+    await vi.advanceTimersByTimeAsync(300);
+    expect(api.called('client:settings-set')).toEqual([]);
+    // The user changes the preset again; adding the same host once more does not override it.
+    radio('Balanced').click();
+    q<HTMLInputElement>(root, '#manual-ip').value = '203.0.113.7';
+    buttonByText(root, 'Add').click();
+    await flush();
+    expect(radio('Balanced').getAttribute('aria-checked')).toBe('true');
+    await vi.advanceTimersByTimeAsync(300);
+    expect((api.called('client:settings-set') as Array<{ presetId: string }>).at(-1)?.presetId).toBe('balanced');
+  });
+
+  it('re-adding a remembered host in a new app session keeps a Custom choice (the page never applies the preset itself)', async () => {
+    // Fresh page, empty in-memory host list, but the service already knows this address and holds Custom settings.
+    const custom = { ...DEFAULTS, presetId: 'custom', bitrateMbps: 33 };
+    setup({ 'client:settings-get': () => ({ ...custom }), 'client:add-manual-host': () => REMOTE }, []);
+    await ready();
+    q<HTMLInputElement>(root, '#manual-ip').value = '203.0.113.7';
+    buttonByText(root, 'Add').click();
+    await flush();
+    expect(q<HTMLInputElement>(root, '#host-addr_203_0_113_7').checked).toBe(true);
+    expect(radio('Custom').getAttribute('aria-checked')).toBe('true');
+    expect(q<HTMLInputElement>(root, '#bitrate').value).toBe('33');
+    await vi.advanceTimersByTimeAsync(500);
+    expect(api.called('client:settings-set')).toEqual([]);
+  });
+
+  it('adding a LAN host leaves the preset alone', async () => {
+    setup({ 'client:add-manual-host': () => HOST_B }, []);
+    await ready();
+    q<HTMLInputElement>(root, '#manual-ip').value = '192.168.1.30';
+    buttonByText(root, 'Add').click();
+    await flush();
+    expect(radio('Balanced').getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('recent remote addresses are buttons under the input; a click connects to that address', async () => {
+    setup({ 'client:recent-remote': () => ['203.0.113.7', '[2001:db8::1]:47989'], 'client:add-manual-host': () => REMOTE }, []);
+    await ready();
+    const recent = [...root.querySelectorAll('.recent button')].map((b) => b.textContent);
+    expect(recent).toEqual(['203.0.113.7', '[2001:db8::1]:47989']);
+    buttonByText(root, '[2001:db8::1]:47989').click();
+    await flush();
+    expect(api.called('client:add-manual-host')).toEqual([{ address: '[2001:db8::1]:47989' }]);
+  });
+
+  it('no recent list when there is none', async () => {
+    setup({ 'client:recent-remote': () => [] }, []);
+    await ready();
+    expect(q(root, '.recent').hidden).toBe(true);
+  });
+
+  it('the exact failure sentences of the plan are shown as they are, without a second prefix', async () => {
+    const closed = '203.0.113.7 answered but port 47989 is closed. On the host: switch on Allow connections from the internet and forward the ports, and check that Sunshine is running.';
+    setup({ 'client:add-manual-host': () => { throw new Error(closed); } }, []);
+    await ready();
+    q<HTMLInputElement>(root, '#manual-ip').value = '203.0.113.7';
+    buttonByText(root, 'Add').click();
+    await flush();
+    expect(q(root, '.manual .hint.err').textContent).toBe(closed);
+  });
+
+  it('a sentence that does not name the address gets it as a prefix', async () => {
+    setup({ 'client:add-manual-host': () => { throw new Error('Custom ports are not supported yet. Use the plain IP.'); } }, []);
+    await ready();
+    q<HTMLInputElement>(root, '#manual-ip').value = '203.0.113.7:50000';
+    buttonByText(root, 'Add').click();
+    await flush();
+    expect(q(root, '.manual .hint.err').textContent).toBe('Could not reach 203.0.113.7:50000: Custom ports are not supported yet. Use the plain IP.');
+  });
+
+  it('remote host, first time: the button says Stream, the code is shown large, then the stream starts', async () => {
+    let finish: (v: unknown) => void = () => undefined;
+    setup({ 'client:pair': () => new Promise((r) => { finish = r; }) }, [REMOTE as never]);
+    await ready();
+    buttonByText(root, 'Stream').click();
+    await flush();
+    api.emit('client:pair-progress', { hostId: REMOTE.id, phase: 'show-code', message: 'x', code: '4821' });
+    expect(status()).toBe('Tell the host this code: 4821. Waiting for them to enter it (3 min)');
+    expect(q(root, '.status .pair-code').textContent).toBe('4821');
+    finish({ ok: true, hostId: REMOTE.id, alreadyPaired: false, durationMs: 1 });
+    await flush(12);
+    expect(api.called('client:stream-start')).toHaveLength(1);
+    expect(root.querySelector('.pair-code')).toBeNull();
+  });
+
+  it('the code is not kept after a pairing that ended in a timeout; the message says what to press', async () => {
+    setup({ 'client:pair': () => ({ ok: false, hostId: REMOTE.id, code: 'code-timeout', message: 'raw', retryable: true, durationMs: 1 }) }, [REMOTE as never]);
+    await ready();
+    buttonByText(root, 'Stream').click();
+    api.emit('client:pair-progress', { hostId: REMOTE.id, phase: 'show-code', message: 'x', code: '4821' });
+    await flush(12);
+    expect(q(root, '.error').textContent).toBe('The host did not enter the code in time. Press Stream to get a new code.');
+    expect(root.querySelector('.pair-code')).toBeNull();
+    expect(buttonByText(root, 'Stream').disabled).toBe(false);
+  });
+});
+
+describe('settings layout', () => {
+  it('the preset row is visible and the rest sits under a closed "More settings"', async () => {
+    setup();
+    await ready();
+    expect([...root.querySelectorAll('[aria-label="Preset"] button')].map((b) => b.textContent)).toEqual(['Lowest latency', 'Balanced', 'Best picture', 'Internet', 'Custom']);
+    const more = q<HTMLDetailsElement>(root, 'details.more');
+    expect(q(more, 'summary').textContent).toBe('More settings');
+    expect(more.open).toBe(false);
+    for (const inner of ['[aria-label="Resolution"]', '[aria-label="Frames per second"]', '#bitrate', '#adv', '[aria-label="Video codec"]']) expect(more.querySelector(inner), inner).not.toBeNull();
+    expect(root.querySelectorAll('details')).toHaveLength(1);
+    expect(root.querySelector('select')).toBeNull();
+  });
+
+  it('the Internet preset sets 1080p, 60 fps and 15 Mbps', async () => {
+    setup();
+    await ready();
+    radio('Internet').click();
+    expect(radio('1080p').getAttribute('aria-checked')).toBe('true');
+    expect(radio('60').getAttribute('aria-checked')).toBe('true');
+    expect(q<HTMLInputElement>(root, '#bitrate').value).toBe('15');
+    expect(root.textContent).toMatch(/1080p at 60 fps, 15 Mbps/);
+  });
+
+  it('the Escape-keys hint stays', async () => {
+    setup();
+    await ready();
+    expect(q(root, '.stream-escape').textContent).toMatch(/Ctrl\+Alt\+Shift\+Q/);
   });
 });

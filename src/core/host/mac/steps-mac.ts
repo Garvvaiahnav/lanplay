@@ -53,6 +53,8 @@ export interface MacStepsEnv
   bundledApp: string;
   macOS: { major: number; arch: string };
   settings: KeyValueStore;
+  /** The "Allow connections from the internet" switch (D07) for this run. Absent = off. */
+  internet?: boolean;
   mkdirp(dir: string): void;
   /** rm -rf: a file or a whole app bundle. */
   remove(p: string): void;
@@ -277,14 +279,14 @@ export function createMacHostSteps(env: MacStepsEnv, opts: MacStepsOptions = {})
       if (blocked) return blocked;
       const P = paths(ctx);
       s.data.configFile = P.conf;
-      const m = mergeSunshineConf(env.readText(P.conf) ?? '', macManagedConfig(P));
+      const m = mergeSunshineConf(env.readText(P.conf) ?? '', macManagedConfig(P, env.internet === true));
       return m.changed ? fail(`sunshine.conf is missing LanPlay settings (${Object.keys(macManagedConfig(P)).join(', ')}).`) : { status: 'pass', message: 'sunshine.conf has LanPlay\'s settings.' };
     },
     async (ctx, s) => {
       const blocked = needInstall(ctx);
       if (blocked) return blocked;
       const P = paths(ctx);
-      const managed = macManagedConfig(P);
+      const managed = macManagedConfig(P, env.internet === true);
       s.data.configFile = P.conf;
       s.data.managed = managed;
       const m = mergeSunshineConf(env.readText(P.conf) ?? '', managed);

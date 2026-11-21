@@ -3,12 +3,16 @@
 //  2. pin = randomInt(0,10000); spawn `Moonlight pair <ip> --pin <pin>`; POST http://<ip>:47920/v1/pair {pin, clientName, clientId}.
 //  3. agent finds Moonlight's pending pairing (by our address) and submits the PIN to Sunshine.
 //  4. wait PAIR_TIMING.postSuccessFlushMs, end the pair window, verify with `Moonlight list <ip>`.
+// Internet host (host.remote): no agent (it never leaves the LAN). The PIN is shown to the player (phase 'show-code'), who reads it
+// out; the host owner types it into LanPlay on the host. We wait for `Moonlight pair` to exit or `Moonlight list` to say paired.
 import http from 'node:http';
 import { randomInt } from 'node:crypto';
 import net from 'node:net';
 import { LANPLAY, PAIR_TIMING } from '../../contracts.js';
 import type { AgentPairRequest, AgentPairResponse, HostInfo, Logger, MoonlightProcessHandle, MoonlightRunner, PairErrorCode, PairingService, PairProgress, PairResult } from '../../contracts.js';
 import { tail } from '../shared/exec.js';
+import { isPrivateAddress } from '../shared/ipnet.js';
+import { moonlightTarget } from './moonlight.js';
 
 export function generatePin(): string {
   return String(randomInt(0, 10_000)).padStart(4, '0');
@@ -62,7 +66,7 @@ export interface PairingDeps {
   /** Our private IPv4 addresses (multi-homed Macs); see AgentPairRequest.clientAddresses. */
   clientAddresses?: () => string[];
   agentPort: number;
-  timing?: Partial<Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs' | 'leftoverWaitMs', number>>;
+  timing?: Partial<Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs' | 'leftoverWaitMs' | 'codeWaitMs' | 'codePollMs', number>>;
   agentRequest?: typeof agentRequest;
   pin?: () => string;
   sleep?: (ms: number) => Promise<void>;
@@ -92,6 +96,7 @@ const RETRYABLE: Record<PairErrorCode, boolean> = {
   'moonlight-missing': false,
   'moonlight-failed': true,
   'verify-failed': true,
+  'code-timeout': true,
   timeout: true,
 };
 
@@ -99,7 +104,7 @@ export class ClientPairingService implements PairingService {
   constructor(private readonly d: PairingDeps) {}
 
   private get t() {
-    const base: Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs' | 'leftoverWaitMs', number> = { ...PAIR_TIMING, approvalPollMs: 1000, listTimeoutMs: 20_000, leftoverWaitMs: 5000 };
+    const base: Record<keyof typeof PAIR_TIMING | 'approvalPollMs' | 'listTimeoutMs' | 'leftoverWaitMs' | 'codeWaitMs' | 'codePollMs', number> = { ...PAIR_TIMING, approvalPollMs: 1000, listTimeoutMs: 20_000, leftoverWaitMs: 5000, codeWaitMs: 180_000, codePollMs: 5000 };
     return { ...base, ...(this.d.timing ?? {}) };
   }
 
@@ -107,23 +112,47 @@ export class ClientPairingService implements PairingService {
     const now = this.d.now ?? Date.now;
     const t0 = now();
     const log = this.d.log;
-    const progress = (phase: PairProgress['phase'], message: string) => {
+    const progress = (phase: PairProgress['phase'], message: string, code?: string) => {
       log.log('info', 'pair', `${phase}: ${message}`, { hostId: host.id });
       try {
-        onProgress({ hostId: host.id, phase, message });
+        onProgress(code === undefined ? { hostId: host.id, phase, message } : { hostId: host.id, phase, message, code });
       } catch {
         /* ignore UI errors */
       }
     };
     let handle: MoonlightProcessHandle | null = null;
+    /** Set by attemptWithCode when Moonlight exited non-zero within leftoverWaitMs of starting (a refused leftover pairing). */
+    let quickExit = false;
     let overallTimer: NodeJS.Timeout | undefined;
     const run = async (): Promise<PairResult> => {
-      const ip = host.preferredAddress;
-      progress('checking', 'Checking whether this Mac is already paired…');
+      const ip = moonlightTarget(host);
+      // Defence in depth (callAgent checks again): the pair agent is for home-network PCs only. A non-remote host with a
+      // public address means host.remote was set wrong, and the PIN must never be sent there.
+      if (!host.remote) assertPrivate(ip);
+      progress('checking', 'Checking whether this Mac is already paired...');
       const first = await this.list(ip);
       if (first.paired) {
         progress('done', 'Already paired.');
         return { ok: true, hostId: host.id, alreadyPaired: true, durationMs: now() - t0 };
+      }
+      if (host.remote) {
+        // Sunshine keeps the pending pairing of a timed-out code for up to 5 minutes (see the comment below), so the next
+        // attempt can be refused at once (HTTP 409, Moonlight exits non-zero within seconds); that refusal erases the leftover.
+        // Retry once on such a quick failure so "Press Stream to get a new code" works the first time.
+        for (let attempt = 1; ; attempt++) {
+          quickExit = false;
+          try {
+            return await attemptWithCode(ip);
+          } catch (e) {
+            const retry = e instanceof PairFail && e.code === 'moonlight-failed' && quickExit && attempt < 2;
+            if (!retry) throw e;
+            log.log('info', 'pair', 'first attempt hit a leftover pairing on the host; trying once more', { hostId: host.id });
+            const h = handle as MoonlightProcessHandle | null;
+            handle = null;
+            if (h) await h.terminate(this.t.terminateGraceMs).catch(() => undefined);
+            progress('starting-moonlight', 'Clearing an old pairing attempt and trying again...');
+          }
+        }
       }
       /**
        * Sunshine keeps at most ONE pending pairing per Moonlight client id ("map_id_sess.emplace(sess.client.uniqueID, ...)",
@@ -144,7 +173,7 @@ export class ClientPairingService implements PairingService {
           const h = handle as MoonlightProcessHandle | null;
           handle = null;
           if (h) await h.terminate(this.t.terminateGraceMs).catch(() => undefined);
-          progress('starting-moonlight', 'Clearing an old pairing attempt and trying again…');
+          progress('starting-moonlight', 'Clearing an old pairing attempt and trying again...');
         }
       }
     };
@@ -152,12 +181,12 @@ export class ClientPairingService implements PairingService {
     const attemptOnce = async (ip: string): Promise<PairResult> => {
       const pin = (this.d.pin ?? generatePin)();
       log.redactor.addSecret(pin);
-      progress('starting-moonlight', 'Starting Moonlight pairing…');
+      progress('starting-moonlight', 'Starting Moonlight pairing...');
       const started = this.d.moonlight.startPair(ip, pin);
       handle = started;
       const early = started.exited.then((r) => r);
 
-      progress('contacting-agent', `Asking ${host.name} to accept this Mac…`);
+      progress('contacting-agent', `Asking ${host.name} to accept this Mac...`);
       const req: AgentPairRequest = { pin, clientName: this.d.clientName(), clientId: this.d.clientId() };
       const addrs = this.d.clientAddresses?.().slice(0, 8) ?? [];
       if (addrs.length) req.clientAddresses = addrs;
@@ -185,18 +214,78 @@ export class ClientPairingService implements PairingService {
       if (resp.status === 'failed') throw new PairFail(resp.code, resp.message, RETRYABLE[resp.code] ?? true);
       if (resp.status !== 'paired') throw new PairFail('sunshine-api-error', `Unexpected agent answer: ${JSON.stringify(resp).slice(0, 200)}`, true);
 
-      progress('confirming', 'PC accepted. Finishing in Moonlight…');
+      progress('confirming', 'PC accepted. Finishing in Moonlight...');
       await this.sleep(this.t.postSuccessFlushMs);
       await started.terminate(this.t.terminateGraceMs);
-      progress('verifying', 'Checking the pairing…');
+      progress('verifying', 'Checking the pairing...');
       const verify = await this.list(ip);
       if (!verify.paired) throw new PairFail('verify-failed', `Moonlight still says it is not paired (list exit ${verify.exitCode}).`, true);
       progress('done', 'Paired.');
       return { ok: true, hostId: host.id, alreadyPaired: false, durationMs: now() - t0 };
     };
 
+    /** Internet host: the code never leaves this Mac except inside Moonlight's own pairing handshake with Sunshine. The agent is not involved. */
+    const attemptWithCode = async (target: string): Promise<PairResult> => {
+      const pin = (this.d.pin ?? generatePin)();
+      log.redactor.addSecret(pin);
+      progress('starting-moonlight', 'Starting Moonlight pairing...');
+      const started = this.d.moonlight.startPair(target, pin);
+      handle = started;
+      const startedAt = now();
+      const minutes = Math.round(this.t.codeWaitMs / 60_000);
+      progress('show-code', `Tell the host this code. Waiting for them to enter it (${minutes} min).`, pin);
+
+      let stop = false;
+      let waitTimer: NodeJS.Timeout | undefined;
+      const exited = started.exited.then((r) => ({ kind: 'exited' as const, r }));
+      const expired = new Promise<{ kind: 'expired' }>((res) => {
+        waitTimer = setTimeout(() => res({ kind: 'expired' }), this.t.codeWaitMs);
+      });
+      // `Moonlight pair` may stay open after success (it quits only when its dialog is closed): also ask `list`.
+      const polled = (async (): Promise<{ kind: 'paired' }> => {
+        while (!stop) {
+          await this.sleep(this.t.codePollMs);
+          if (stop) break;
+          try {
+            if ((await this.list(target)).paired) return { kind: 'paired' };
+          } catch {
+            /* keep waiting; the exit or the deadline decides */
+          }
+        }
+        return new Promise<{ kind: 'paired' }>(() => undefined);
+      })();
+      let outcome: { kind: 'exited'; r: Awaited<typeof started.exited> } | { kind: 'paired' } | { kind: 'expired' };
+      try {
+        outcome = await Promise.race([exited, polled, expired]);
+      } finally {
+        stop = true;
+        if (waitTimer) clearTimeout(waitTimer);
+      }
+      if (outcome.kind === 'expired') throw new PairFail('code-timeout', 'The host did not enter the code in time. Press Stream to get a new code.', true);
+      if (outcome.kind === 'exited') {
+        const r = outcome.r;
+        if (r.spawnError) throw new PairFail('moonlight-missing', `Moonlight could not start: ${r.spawnError}`, false);
+        if (r.exitCode !== 0) {
+          quickExit = now() - startedAt < this.t.leftoverWaitMs;
+          throw new PairFail('moonlight-failed', `Moonlight pair exited with ${r.exitCode}: ${tail(r.stderr || r.stdout, 300).trim()}`, true);
+        }
+      }
+      progress('confirming', 'The host entered the code. Finishing in Moonlight...');
+      // A Moonlight that exited by itself has already flushed its settings; one that stayed open gets the usual grace.
+      if (outcome.kind === 'paired') {
+        await this.sleep(this.t.postSuccessFlushMs);
+        await started.terminate(this.t.terminateGraceMs);
+      }
+      progress('verifying', 'Checking the pairing...');
+      const verify = await this.list(target);
+      if (!verify.paired) throw new PairFail('verify-failed', `Moonlight still says it is not paired (list exit ${verify.exitCode}).`, true);
+      progress('done', 'Paired.');
+      return { ok: true, hostId: host.id, alreadyPaired: false, durationMs: now() - t0 };
+    };
+
+    const overallMs = host.remote ? this.t.overallTimeoutMs + this.t.codeWaitMs : this.t.overallTimeoutMs;
     const timeout = new Promise<PairResult>((_r, reject) => {
-      overallTimer = setTimeout(() => reject(new PairFail('timeout', `Pairing took longer than ${this.t.overallTimeoutMs / 1000} s.`, true)), this.t.overallTimeoutMs);
+      overallTimer = setTimeout(() => reject(new PairFail('timeout', `Pairing took longer than ${overallMs / 1000} s.`, true)), overallMs);
     });
     try {
       return await Promise.race([run(), timeout]);
@@ -222,6 +311,7 @@ export class ClientPairingService implements PairingService {
   }
 
   private async callAgent(ip: string, body: AgentPairRequest, progress: (phase: PairProgress['phase'], m: string) => void): Promise<AgentPairResponse> {
+    assertPrivate(ip);
     const req = this.d.agentRequest ?? agentRequest;
     const port = this.d.agentPort;
     let r: AgentHttpResult;
@@ -235,7 +325,7 @@ export class ClientPairingService implements PairingService {
     if (code) throw code;
     let resp = r.json as AgentPairResponse;
     if (r.status === 202 && resp?.status === 'pending-approval') {
-      progress('waiting-approval', 'Waiting for someone to click Approve on the PC…');
+      progress('waiting-approval', 'Waiting for someone to click Approve on the PC...');
       const id = resp.requestId;
       const deadline = (this.d.now ?? Date.now)() + Math.max(resp.expiresInMs, 1000) + 5000;
       while ((this.d.now ?? Date.now)() < deadline) {
@@ -256,6 +346,11 @@ export class ClientPairingService implements PairingService {
     if (r.status !== 200 || !resp || typeof resp !== 'object') throw new PairFail('sunshine-api-error', `Agent answered HTTP ${r.status}`, true);
     return resp;
   }
+}
+
+/** The pair agent (and the PIN we send it) must only ever be addressed at a home-network IP. */
+function assertPrivate(ip: string): void {
+  if (!isPrivateAddress(ip)) throw new PairFail('agent-forbidden', 'LanPlay only asks PCs on your home network to accept this Mac. For a PC on the internet, add it with its address and use the code.', false);
 }
 
 function mapHttp(r: AgentHttpResult): PairFail | null {

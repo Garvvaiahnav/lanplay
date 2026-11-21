@@ -57,6 +57,53 @@ export const isPrivateAddress: IsPrivateAddress = (addr) => {
   return false;
 };
 
+/** A valid IP literal that is not private/loopback/link-local/ULA (100.64.0.0/10 and other overlay ranges count as remote). */
+export function isRemoteAddress(addr: string): boolean {
+  const a = normalizeAddress(addr);
+  return net.isIP(a) !== 0 && !isPrivateAddress(a);
+}
+
+/**
+ * What a player types into "Connect by IP": `1.2.3.4`, `1.2.3.4:47989`, `[2001:db8::1]:47989`, `[2001:db8::1]`,
+ * bare `2001:db8::1`, `name`, `name:port`. Host comes back lower-cased without brackets. null if malformed
+ * (empty host, port not 1-65535, brackets around a non-IPv6, several colons that are not an IPv6 literal).
+ */
+export function parseHostPort(input: string): { host: string; port: number | null } | null {
+  const v = String(input ?? '').trim();
+  if (!v || v.length > 255) return null;
+  let host: string;
+  let portStr: string | undefined;
+  if (v.startsWith('[')) {
+    const end = v.indexOf(']');
+    if (end < 0) return null;
+    host = v.slice(1, end);
+    if (!net.isIPv6(host)) return null;
+    const rest = v.slice(end + 1);
+    if (rest) {
+      if (!rest.startsWith(':')) return null;
+      portStr = rest.slice(1);
+    }
+  } else {
+    const parts = v.split(':');
+    if (parts.length === 1) host = v;
+    else if (parts.length === 2) {
+      host = parts[0]!;
+      portStr = parts[1];
+    } else {
+      if (!net.isIPv6(v)) return null;
+      host = v;
+    }
+  }
+  if (!host) return null;
+  let port: number | null = null;
+  if (portStr !== undefined) {
+    if (!/^\d{1,5}$/.test(portStr)) return null;
+    port = Number(portStr);
+    if (port < 1 || port > 65535) return null;
+  }
+  return { host: host.toLowerCase(), port };
+}
+
 /** "host:port" or "[v6]:port" -> parts; null if malformed. */
 export function parseHostHeader(h: string | undefined): { host: string; port: number | null } | null {
   if (!h) return null;

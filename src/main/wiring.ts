@@ -187,6 +187,21 @@ export function buildHandlers(
     inflight.set(key, p);
     return p;
   };
+  // Set up / Repair, the internet switch and the Mac Sunshine restart all write sunshine.conf (and Windows asks for a UAC
+  // prompt for the first two): one shared guard, so they never run at the same time. Repeating the SAME action shares the
+  // running promise (double click); a different one is refused with a sentence the UI can show.
+  let hostRun: { kind: string; label: string; p: Promise<unknown> } | null = null;
+  const hostExclusive = <T>(kind: string, label: string, fn: () => Promise<T>): Promise<T> => {
+    if (hostRun) {
+      if (hostRun.kind === kind) return hostRun.p as Promise<T>;
+      return Promise.reject(new Error(`${hostRun.label} is still running. Wait for it to finish, then try again.`));
+    }
+    const p = fn().finally(() => {
+      if (hostRun?.p === p) hostRun = null;
+    });
+    hostRun = { kind, label, p };
+    return p;
+  };
   const appInfo = async (): Promise<AppInfo> => ({
     role: env.role,
     version: env.appInfo.version,
@@ -243,6 +258,7 @@ export function buildHandlers(
       'client:pair': ({ hostId }) => once(`pair:${hostId}`, () => c.pair(hostId, (p) => push('client:pair-progress', p))),
       'client:stream-start': ({ hostId, settings }) => c.startStream(hostId, settings, (st) => push('client:stream-state', st)),
       'client:stream-stop': ({ hostId }) => c.stopStream(hostId),
+      'client:recent-remote': async () => c.recentRemote(),
     };
   }
   const h = s.host!;
@@ -257,12 +273,12 @@ export function buildHandlers(
       await env.openExternal(url);
     },
     'host:confirm-input': ({ ok }) => withUpdate(m.confirmInput(ok)),
-    'host:sunshine-restart': () => once('sunshine-restart', () => withUpdate(m.restartSunshine())),
+    'host:sunshine-restart': () => hostExclusive('sunshine-restart', 'The Sunshine restart', () => withUpdate(m.restartSunshine())),
   });
   return {
     ...common,
     'host:setup-status': () => withUpdate(h.setupStatus()),
-    'host:setup-run': () => once('setup', () => withUpdate(h.runSetup((rec) => push('host:setup-progress', rec)))),
+    'host:setup-run': () => hostExclusive('setup', 'Set up / Repair', () => withUpdate(h.runSetup((rec) => push('host:setup-progress', rec)))),
     ...(s.macHost ? macHandlers(s.macHost) : {}),
     'host:agent-state': async () => h.agent.getState(),
     'host:agent-set-auto-approve': async ({ on }) => {
@@ -278,6 +294,16 @@ export function buildHandlers(
       await h.agent.revoke(uuid);
       return h.agent.listDevices();
     },
+    'host:internet-get': () => h.getInternet(),
+    'host:internet-set': ({ on }) =>
+      hostExclusive('internet', 'The internet switch', async () => {
+        const state = await h.setInternet(on, (rec) => push('host:setup-progress', rec));
+        push('host:internet-changed', state);
+        return state;
+      }),
+    'host:pending-list': () => h.agent.listPending(),
+    'host:pending-pair': ({ id, pin, name }) => once(`pending-pair:${id}`, () => h.agent.pairWithCode(id, pin, name)),
+    'host:pending-reject': ({ id }) => h.agent.rejectPending(id),
     ...(s.controllers ? controllerHandlers(s.controllers) : {}),
   };
 }
@@ -289,6 +315,34 @@ function controllerHandlers(c: ControllerService): IpcHandlers {
     'host:controllers-kick': async ({ id }) => c.kick(id),
     'host:controllers-new-link': () => c.newLink(),
     'host:controllers-setup': () => c.setup(),
+  };
+}
+
+export interface PollWhileActiveOptions {
+  tick: () => void;
+  pollMs: number;
+  /** True while there is something for `tick` to watch (a stream starting or running). */
+  isActive: () => boolean;
+}
+
+/**
+ * Runs `tick` every `pollMs` only while `isActive()` is true, so an idle app owns no timer at all.
+ * Call `sync()` after anything that can change `isActive()`.
+ */
+export function createPollWhileActive(o: PollWhileActiveOptions): { sync(): void; readonly running: boolean } {
+  let timer: ReturnType<typeof setInterval> | null = null;
+  return {
+    sync() {
+      const want = o.isActive();
+      if (want && timer === null) timer = setInterval(o.tick, o.pollMs);
+      else if (!want && timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+    },
+    get running() {
+      return timer !== null;
+    },
   };
 }
 

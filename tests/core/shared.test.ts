@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import { DefaultRedactor, REDACTED } from '../../src/core/shared/redact.js';
 import { createJsonlLogger, localDateStamp, MemoryLogger } from '../../src/core/shared/logger.js';
 import { commandRecord, NodeProcessRunner, tail } from '../../src/core/shared/exec.js';
-import { broadcastAddress, isPrivateAddress, normalizeAddress, parseHostHeader, subnetHosts } from '../../src/core/shared/ipnet.js';
+import { broadcastAddress, isPrivateAddress, isRemoteAddress, normalizeAddress, parseHostHeader, parseHostPort, subnetHosts } from '../../src/core/shared/ipnet.js';
 import { timedStep } from '../../src/core/shared/steprec.js';
 
 describe('Redactor', () => {
@@ -152,6 +152,44 @@ describe('ipnet', () => {
     ['', false],
   ])('isPrivateAddress(%s) = %s', (a, want) => {
     expect(isPrivateAddress(a)).toBe(want);
+  });
+
+  it.each([
+    ['203.0.113.7', true],
+    ['8.8.8.8', true],
+    ['100.64.0.1', true],
+    ['100.127.255.254', true],
+    ['2001:db8::1', true],
+    ['::ffff:8.8.8.8', true],
+    ['192.168.1.1', false],
+    ['10.0.0.1', false],
+    ['127.0.0.1', false],
+    ['fe80::1%en0', false],
+    ['fd12:3456::1', false],
+    ['::ffff:192.168.0.5', false],
+    ['gaming-pc.local', false],
+    ['not-an-ip', false],
+    ['', false],
+  ])('isRemoteAddress(%s) = %s', (a, want) => {
+    expect(isRemoteAddress(a)).toBe(want);
+  });
+
+  it.each([
+    ['1.2.3.4', { host: '1.2.3.4', port: null }],
+    [' 1.2.3.4:47989 ', { host: '1.2.3.4', port: 47989 }],
+    ['[2001:db8::1]:47989', { host: '2001:db8::1', port: 47989 }],
+    ['[2001:DB8::1]', { host: '2001:db8::1', port: null }],
+    ['2001:db8::1', { host: '2001:db8::1', port: null }],
+    ['::1', { host: '::1', port: null }],
+    ['Gaming-PC.local', { host: 'gaming-pc.local', port: null }],
+    ['example.com:50000', { host: 'example.com', port: 50000 }],
+    ['1.2.3.4:65535', { host: '1.2.3.4', port: 65535 }],
+  ])('parseHostPort(%s)', (input, want) => {
+    expect(parseHostPort(input)).toEqual(want);
+  });
+
+  it.each(['', '   ', ':47989', '1.2.3.4:', '1.2.3.4:0', '1.2.3.4:65536', '1.2.3.4:abc', '1.2.3.4:-1', '[1.2.3.4]:47989', '[2001:db8::1', '[2001:db8::1]47989', '[2001:db8::1]:x', 'a:b:c', '1.2.3.4:5:6', 'x'.repeat(300)])('parseHostPort rejects %j', (input) => {
+    expect(parseHostPort(input)).toBeNull();
   });
 
   it('parses Host headers', () => {

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { HOST_STEP_ORDER, LANPLAY, SUNSHINE_MANAGED_CONFIG } from '../../src/contracts.js';
+import { HOST_STEP_ORDER, LANPLAY, sunshineManagedConfig } from '../../src/contracts.js';
 import type { AppPaths, HostStepContext, StepRecord } from '../../src/contracts.js';
 import { compareVersions, createHostSteps, ELEVATED_STEP_IDS, evaluateAgentFirewall } from '../../src/core/host/steps.js';
 import type { HostStepsEnv } from '../../src/core/host/steps.js';
@@ -98,7 +98,7 @@ describe('host steps: full setup on a clean PC', () => {
     expect(creds.secrets).toEqual([PW]);
     expect(m.credsSet).toBe(PW);
     // config merged
-    expect(m.files.get('C:\\Program Files\\Sunshine\\config\\sunshine.conf')).toBe(Object.entries(SUNSHINE_MANAGED_CONFIG).map(([k, v]) => `${k} = ${v}`).join('\n') + '\n');
+    expect(m.files.get('C:\\Program Files\\Sunshine\\config\\sunshine.conf')).toBe(Object.entries(sunshineManagedConfig(false)).map(([k, v]) => `${k} = ${v}`).join('\n') + '\n');
     // cert pinned + copied
     expect(m.files.get('C:\\ProgramData\\LanPlay\\sunshine-cert.pem')).toBe(SUNSHINE_TEST_CERT);
     // the password never appears in any step record

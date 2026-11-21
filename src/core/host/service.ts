@@ -10,6 +10,7 @@ import type {
   HostSetupResult,
   HostSetupStatus,
   HostStepContext,
+  InternetHostState,
   KeyValueStore,
   PairAgent,
   SecretKey,
@@ -22,7 +23,8 @@ import { localDateStamp } from '../shared/logger.js';
 import { tcpProbe, tlsPinCheck } from '../shared/netprobe.js';
 import { JsonFileStore } from '../shared/stores.js';
 import { timedStep } from '../shared/steprec.js';
-import { LanPairAgent } from './agent.js';
+import { INTERNET_KEY, LanPairAgent } from './agent.js';
+import { isPrivateAddress } from '../shared/ipnet.js';
 import { defaultLocalIdentity, generateAdminPassword, LAST_SETUP_KEY, LazySunshineClient, PINNED_CERT_NAME, probeAgent, SETUP_EXE_KEY } from './common.js';
 import type { PairAgentExtraOptions } from './agent.js';
 import { runPs } from './ps.js';
@@ -51,6 +53,8 @@ export interface HostServiceExtras {
   tempDir?: string;
   /** Test hooks. */
   stepsEnv?: Partial<HostStepsEnv>;
+  /** os.networkInterfaces (tests). */
+  networkInterfaces?: () => NodeJS.Dict<os.NetworkInterfaceInfo[]>;
   now?: () => number;
 }
 
@@ -81,8 +85,26 @@ export function validateHandoff(v: unknown): HostSetupHandoff {
   }
   if (typeof h.logDir !== 'string' || typeof h.sharedData !== 'string') throw new Error('handoff paths invalid');
   if (typeof h.createdAt !== 'string' || Number.isNaN(Date.parse(h.createdAt))) throw new Error('handoff createdAt invalid');
+  if (h.internet !== undefined && typeof h.internet !== 'boolean') throw new Error('handoff internet invalid');
   return h as HostSetupHandoff;
 }
+
+/** This PC's private IPv4 addresses (what a router forwards to) and global IPv6 addresses (2000::/3), for the internet card. */
+export function internetAddresses(ifaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces()): { lanAddresses: string[]; globalIpv6: string[] } {
+  const lan = new Set<string>();
+  const v6 = new Set<string>();
+  for (const list of Object.values(ifaces)) {
+    for (const i of list ?? []) {
+      if (i.internal) continue;
+      if (i.family === 'IPv4' && isPrivateAddress(i.address) && !i.address.startsWith('169.254.')) lan.add(i.address);
+      else if (i.family === 'IPv6' && /^[23]/.test(i.address)) v6.add(i.address.split('%')[0]!);
+    }
+  }
+  return { lanAddresses: [...lan], globalIpv6: [...v6] };
+}
+
+/** Steps whose failure means the internet switch did not take effect: it goes back to its old position. */
+export const INTERNET_SWITCH_STEPS: readonly string[] = ['admin', 'config', 'restart-service', 'firewall-internet'];
 
 /**
  * The silent MSI custom action runs sunshine-setup.ps1 as LocalSystem (wxs: Execute="deferred" Impersonate="no"), so
@@ -131,6 +153,7 @@ export class WindowsHostService implements HostService {
   private readonly certPath: string;
   private readonly status: KeyValueStore;
   private readonly now: () => number;
+  private internetError: string | undefined;
 
   constructor(
     private readonly deps: ServiceDeps,
@@ -160,7 +183,11 @@ export class WindowsHostService implements HostService {
   }
 
   /* ---------- plumbing ---------- */
-  private stepsEnv(getPassword: () => Promise<string | null>, userSession: boolean): HostStepsEnv {
+  private internetOn(): boolean {
+    return this.status.get<boolean>(INTERNET_KEY, false) === true;
+  }
+
+  private stepsEnv(getPassword: () => Promise<string | null>, userSession: boolean, internet: boolean = this.internetOn()): HostStepsEnv {
     const base: HostStepsEnv = {
       fileExists: (p) => existsSync(p),
       readText: (p) => {
@@ -190,6 +217,7 @@ export class WindowsHostService implements HostService {
       selfExe: this.x.selfExe,
       loginItem: userSession ? this.x.loginItem : null,
       agentProbe: userSession ? () => probeAgent(this.agent) : null,
+      internet,
       now: this.now,
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     };
@@ -264,7 +292,7 @@ export class WindowsHostService implements HostService {
     const admin = await this.isAdmin().catch(() => false);
     if (admin) {
       log.log('info', 'setup', 'already elevated: running setup in-process');
-      result = await this.runElevatedSteps(pw, onProgress);
+      result = await this.runElevatedSteps(pw, onProgress, this.internetOn());
     } else {
       result = await this.runViaUac(pw, onProgress);
     }
@@ -307,6 +335,7 @@ export class WindowsHostService implements HostService {
       sunshineAdminPassword: pw,
       logDir: this.deps.paths.logDir,
       sharedData: this.deps.paths.sharedData,
+      internet: this.internetOn(),
     };
     // User temp dir (%LOCALAPPDATA%\Temp) is private to this user; 0600 for POSIX tests.
     writeFileSync(handoffPath, JSON.stringify(handoff), { encoding: 'utf8', mode: 0o600 });
@@ -357,8 +386,8 @@ export class WindowsHostService implements HostService {
   }
 
   /** The elevated work itself (in-process when already admin, or inside --host-setup). */
-  private async runElevatedSteps(pw: string, onProgress: (s: StepRecord) => void): Promise<HostSetupResult> {
-    const env = this.stepsEnv(async () => pw, false);
+  private async runElevatedSteps(pw: string, onProgress: (s: StepRecord) => void, internet: boolean): Promise<HostSetupResult> {
+    const env = this.stepsEnv(async () => pw, false, internet);
     const ctx = this.ctx(new HandoffSecrets(pw), true);
     const steps: StepRecord[] = [];
     for (const step of this.steps(ELEVATED_STEP_IDS, env)) {
@@ -395,10 +424,53 @@ export class WindowsHostService implements HostService {
     }
     log.redactor.addSecret(handoff.sunshineAdminPassword);
     log.log('info', 'elevated', 'elevated setup started', { pid: process.pid, logDir: handoff.logDir, sharedData: handoff.sharedData });
-    const result = await this.runElevatedSteps(handoff.sunshineAdminPassword, () => undefined);
+    const result = await this.runElevatedSteps(handoff.sunshineAdminPassword, () => undefined, handoff.internet === true);
     writeResult(resultPath, result);
     log.log(result.ok ? 'info' : 'warn', 'elevated', `elevated setup finished: ${result.ok ? 'OK' : 'FAILED'}`);
     return result.ok ? 0 : 1;
+  }
+
+  async getInternet(): Promise<InternetHostState> {
+    const st: InternetHostState = { enabled: this.internetOn(), ...internetAddresses((this.x.networkInterfaces ?? os.networkInterfaces)()) };
+    if (this.internetError) st.lastError = this.internetError;
+    return st;
+  }
+
+  /**
+   * Saves the switch, then runs the normal Set up / Repair (one UAC prompt): sunshine.conf gets the D08/D09 values, the
+   * firewall rule is created or removed and Sunshine restarts. When one of those steps fails the switch goes back to
+   * where it was, so it never claims internet play is on (or off) when the PC says otherwise. A failed enable has already
+   * written UPnP and IPv6 into sunshine.conf and restarted Sunshine, so the steps run once more with the switch off
+   * (best effort, one more prompt): the PC then matches the switch instead of asking the router to open ports.
+   */
+  async setInternet(on: boolean, onProgress: (s: StepRecord) => void): Promise<InternetHostState> {
+    const was = this.internetOn();
+    this.status.set(INTERNET_KEY, on === true);
+    this.internetError = undefined;
+    let failed: StepRecord | undefined;
+    try {
+      const st = await this.runSetup(onProgress);
+      failed = st.steps.find((r) => r.status === 'fail' && INTERNET_SWITCH_STEPS.includes(r.stepId));
+      if (failed) {
+        this.status.set(INTERNET_KEY, was);
+        this.internetError = failed.message;
+      }
+    } catch (e) {
+      this.status.set(INTERNET_KEY, was);
+      this.internetError = (e as Error).message;
+    }
+    // Nothing was changed when the admin step itself failed (cancelled prompt): no second prompt then.
+    const touched = on === true && !was && (failed ? failed.stepId !== 'admin' : this.internetError !== undefined);
+    if (touched) {
+      try {
+        const back = await this.runSetup(() => undefined);
+        const again = back.steps.find((r) => r.status === 'fail' && INTERNET_SWITCH_STEPS.includes(r.stepId));
+        if (again) this.internetError = `${this.internetError} Turning the settings back off also failed: ${again.message}`;
+      } catch (e) {
+        this.internetError = `${this.internetError} Turning the settings back off also failed: ${(e as Error).message}`;
+      }
+    }
+    return this.getInternet();
   }
 
   async selfCheck(): Promise<SelfCheckReport> {

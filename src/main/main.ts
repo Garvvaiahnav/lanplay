@@ -12,7 +12,7 @@ import { createPadBackendFor } from '../core/controller/backend.js';
 import { isPrivateAddress } from '../core/shared/ipnet.js';
 import { computeAppPaths } from '../core/paths.js';
 import { NodeProcessRunner } from '../core/shared/exec.js';
-import { createJsonlLogger } from '../core/shared/logger.js';
+import { createJsonlLogger, resolveLogLevel } from '../core/shared/logger.js';
 import { chooseSecretStore, JsonFileStore } from '../core/shared/stores.js';
 import { CliError, parseCli, readStoredRole, resolveRole } from './cli.js';
 import type { CliOptions } from './cli.js';
@@ -20,7 +20,7 @@ import { createIpcRouter } from './ipc.js';
 import { applySecurity, isAllowedAppUrl } from './security.js';
 import { createStreamMenuWindow } from './stream-menu-window.js';
 import { createUpdates } from './updates.js';
-import { buildHandlers, buildServices, localAddresses, releaseMacHost, runDiagnosticsCli, runSelfCheckCli } from './wiring.js';
+import { buildHandlers, buildServices, createPollWhileActive, localAddresses, releaseMacHost, runDiagnosticsCli, runSelfCheckCli } from './wiring.js';
 import type { Services, WiringEnv } from './wiring.js';
 
 const APP_ROOT = path.resolve(__dirname, '..', '..');
@@ -87,7 +87,7 @@ async function start(): Promise<void> {
   // The elevated setup child is only ever started by the host role.
   const resolved = cli.mode === 'host-setup' ? resolveRole({ flag: cli.role ?? 'host', stored: null, platform: process.platform }) : resolveRole({ flag: cli.role, stored: readStoredRole(settings), platform: process.platform });
   role = resolved.role;
-  const log = createJsonlLogger({ dir: paths.logDir, filePattern: cli.mode === 'host-setup' ? LANPLAY.elevatedLogFilePattern : LANPLAY.logFilePattern });
+  const log = createJsonlLogger({ dir: paths.logDir, filePattern: cli.mode === 'host-setup' ? LANPLAY.elevatedLogFilePattern : LANPLAY.logFilePattern, minLevel: resolveLogLevel(app.isPackaged, process.env) });
   log.log('info', 'main', 'start', { mode: cli.mode, role, roleSource: resolved.source, version: app.getVersion(), electron: process.versions.electron, platform: process.platform, arch: process.arch, packaged: app.isPackaged, logDirFellBack: paths.logDirFellBack, ignoredArgs: cli.ignored });
   process.on('uncaughtException', (e) => log.log('error', 'main', 'uncaught exception', { error: e.message, stack: String(e.stack).split('\n').slice(0, 8) }));
   process.on('unhandledRejection', (e) => log.log('error', 'main', 'unhandled rejection', { error: String((e as Error)?.message ?? e) }));
@@ -176,11 +176,16 @@ async function start(): Promise<void> {
   }
 
   // A Mac switched to the client role must not keep a Sunshine or pair agent running (or starting at login).
-  try {
-    await releaseMacHost(env);
-  } catch (e) {
-    log.log('warn', 'main', 'could not remove the Mac host LaunchAgents', { error: (e as Error).message });
-  }
+  const releaseMac = async () => {
+    try {
+      await releaseMacHost(env);
+    } catch (e) {
+      log.log('warn', 'main', 'could not remove the Mac host LaunchAgents', { error: (e as Error).message });
+    }
+  };
+  // The background agent may be the very process the LaunchAgent started: it must be released before it decides to exit.
+  // The window is not: it opens first and the two launchctl calls run behind it.
+  if (cli.mode === 'agent') await releaseMac();
 
   // A Windows PC switched to the client role keeps its old --agent login item: nothing to run in the background.
   if (cli.mode === 'agent' && role === 'client') {
@@ -208,9 +213,14 @@ async function start(): Promise<void> {
     (msg, data) => log.log('warn', 'security', msg, data),
   );
   let win: BrowserWindow | null = null;
+  let startupLogged = false;
+  let menuPoll: ReturnType<typeof createPollWhileActive> | null = null;
   const push = <E extends IpcEventChannel>(channel: E, payload: IpcEventMap[E]) => {
     // The in-stream menu follows the same stream-state events the window gets (including streams it restarts itself).
-    if (channel === 'client:stream-state') streamMenu?.onStreamState(payload as IpcEventMap['client:stream-state']);
+    if (channel === 'client:stream-state') {
+      streamMenu?.onStreamState(payload as IpcEventMap['client:stream-state']);
+      menuPoll?.sync();
+    }
     if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
   };
   const router = createIpcRouter(buildHandlers(env, services, push, (p) => shell.showItemInFolder(p)), log.redactor, (channel, err) =>
@@ -259,7 +269,14 @@ async function start(): Promise<void> {
       backgroundColor: '#111318',
       webPreferences: { ...SECURITY.webPreferences, preload: PRELOAD },
     });
-    win.once('ready-to-show', () => win?.show());
+    win.once('ready-to-show', () => {
+      win?.show();
+      if (!startupLogged) {
+        startupLogged = true;
+        const created = process.getCreationTime?.() ?? null;
+        log.log('info', 'main', 'startup-ms', { ms: Math.round(created === null ? process.uptime() * 1000 : Date.now() - created) });
+      }
+    });
     win.on('closed', () => {
       win = null;
     });
@@ -299,13 +316,15 @@ async function start(): Promise<void> {
       sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     });
     streamMenu = ctl;
-    // Idle (returns at once) unless a stream is running.
-    setInterval(() => ctl.tick(), ctl.pollMs).unref();
+    // The cursor is only watched while a stream is starting or running; an idle app has no timer.
+    menuPoll = createPollWhileActive({ tick: () => ctl.tick(), pollMs: ctl.pollMs, isActive: () => ctl.activeHostId() !== null });
   }
 
   updates.start();
-  if (cli.mode !== 'agent') createWindow();
-  else log.log('info', 'main', 'running as background pair agent (open LanPlay to show the window)');
+  if (cli.mode !== 'agent') {
+    createWindow();
+    void releaseMac();
+  } else log.log('info', 'main', 'running as background pair agent (open LanPlay to show the window)');
 }
 
 export type { Services };

@@ -1,26 +1,29 @@
 // LAN server for phone controllers: serves the phone page, the layout API and the input WebSocket.
 // Threat model: anything on the home network can reach the port, so every request must (1) come from a private address,
 // (2) address the host by IP (no DNS-rebinding hostnames), (3) not be a cross-site browser request, and for the API and the
-// socket (4) carry the per-session token shown only on the host screen. Input frames are clamped by parseClientMessage.
+// socket (4) carry the access token shown only on the host screen. The token is persistent (saved links and home-screen
+// shortcuts keep working); only "New link" replaces it. Input frames are clamped by parseClientMessage.
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
+import { isIP } from 'node:net';
 import type { Socket } from 'node:net';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import { gzipSync } from 'node:zlib';
 import { WebSocketServer } from 'ws';
 import type { RawData, WebSocket } from 'ws';
 import { parseHostHeader } from '../shared/ipnet.js';
 import { LIMITS, defaultLayout } from './layout.js';
 import type { LayoutFileStore } from './layout-store.js';
 import type { ControllerManager } from './manager.js';
-import { parseClientMessage } from './protocol.js';
+import { parseClientMessage, sanitizePhoneId } from './protocol.js';
 import type { ServerMessage } from './protocol.js';
 
 export interface ControllerServerOptions {
   manager: ControllerManager;
   layouts: LayoutFileStore;
-  /** Folder with index.html, controller.js, controller.css (dist/controller-ui). */
+  /** Folder with index.html, controller.js, controller.css and the other static files (dist/controller-ui); read into memory once. */
   uiDir: string;
   port: number;
   token: string;
@@ -30,17 +33,35 @@ export interface ControllerServerOptions {
   tickMs?: number;
 }
 
-const STATIC: Record<string, { file: string; type: string }> = {
-  '/': { file: 'index.html', type: 'text/html; charset=utf-8' },
-  '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8' },
-  '/controller.js': { file: 'controller.js', type: 'text/javascript; charset=utf-8' },
-  '/controller.css': { file: 'controller.css', type: 'text/css; charset=utf-8' },
-  '/apple-touch-icon.png': { file: 'apple-touch-icon.png', type: 'image/png' },
+interface StaticEntry {
+  file: string;
+  type: string;
+  /** Compress with gzip (text types; images and video are already compressed). */
+  gzip: boolean;
+  /** Honour a single Range header (iOS Safari will not play a video from a server without it). */
+  ranges?: boolean;
+}
+const TEXT = true;
+const STATIC: Record<string, StaticEntry> = {
+  '/': { file: 'index.html', type: 'text/html; charset=utf-8', gzip: TEXT },
+  '/index.html': { file: 'index.html', type: 'text/html; charset=utf-8', gzip: TEXT },
+  '/controller.js': { file: 'controller.js', type: 'text/javascript; charset=utf-8', gzip: TEXT },
+  '/controller.css': { file: 'controller.css', type: 'text/css; charset=utf-8', gzip: TEXT },
+  '/apple-touch-icon.png': { file: 'apple-touch-icon.png', type: 'image/png', gzip: false },
+  '/icon-192.png': { file: 'icon-192.png', type: 'image/png', gzip: false },
+  '/icon-512.png': { file: 'icon-512.png', type: 'image/png', gzip: false },
   // Home-screen install info; contains no token, so it is served like the other static files.
-  '/manifest.webmanifest': { file: 'manifest.webmanifest', type: 'application/manifest+json; charset=utf-8' },
+  '/manifest.webmanifest': { file: 'manifest.webmanifest', type: 'application/manifest+json; charset=utf-8', gzip: TEXT },
+  // Tiny looping video the page plays to keep the screen on where the Wake Lock API is missing.
+  '/wake.mp4': { file: 'wake.mp4', type: 'video/mp4', gzip: false, ranges: true },
 };
 
-const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; manifest-src 'self'; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+interface Asset {
+  raw: Buffer;
+  gz: Buffer | null;
+}
+
+const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self'; manifest-src 'self'; connect-src 'self' ws: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const HELLO_TIMEOUT_MS = 5000;
 const MAX_SOCKETS = 8;
 const MAX_SOCKETS_PER_IP = 6;
@@ -55,6 +76,8 @@ interface Conn {
   ws: WebSocket;
   address: string;
   joined: boolean;
+  /** Phone id from hello, once validated. */
+  phoneId: string | undefined;
   windowStart: number;
   frames: number;
 }
@@ -66,6 +89,7 @@ export class ControllerServer {
   private readonly conns = new Map<string, Conn>();
   private readonly apiHits = new Map<string, { start: number; n: number }>();
   private readonly tokenDigest: Buffer;
+  private readonly assets = new Map<string, Asset>();
 
   constructor(private readonly o: ControllerServerOptions) {
     this.tokenDigest = digest(o.token);
@@ -76,7 +100,31 @@ export class ControllerServer {
   }
 
   /** Resolves with the real port (pass port 0 in tests). */
-  start(): Promise<number> {
+  async start(): Promise<number> {
+    await this.loadAssets();
+    return this.listen();
+  }
+
+  /** Reads every static file once. A file that is missing now is tried again on the first request for it. */
+  private async loadAssets(): Promise<void> {
+    await Promise.all(Object.values(STATIC).map((e) => this.asset(e)));
+  }
+
+  private async asset(e: StaticEntry): Promise<Asset | null> {
+    const have = this.assets.get(e.file);
+    if (have) return have;
+    try {
+      const raw = await readFile(path.join(this.o.uiDir, e.file));
+      const gz = e.gzip ? gzipSync(raw, { level: 9 }) : null;
+      const a: Asset = { raw, gz: gz && gz.length < raw.length ? gz : null };
+      this.assets.set(e.file, a);
+      return a;
+    } catch {
+      return null;
+    }
+  }
+
+  private listen(): Promise<number> {
     return new Promise((resolve, reject) => {
       const http = createServer((req, res) => void this.onRequest(req, res));
       this.http = http;
@@ -100,6 +148,7 @@ export class ControllerServer {
     this.timer = null;
     for (const c of this.conns.values()) c.ws.terminate();
     this.conns.clear();
+    this.assets.clear();
     this.o.manager.closeAll();
     this.wss?.close();
     const http = this.http;
@@ -120,12 +169,12 @@ export class ControllerServer {
 
   // ---- guards -------------------------------------------------------------------------------------------------
 
-  /** Private source address, IP-literal Host header, and (when a browser sends one) same-origin. */
+  /** Private source address, IP-literal Host header (net.isIP, so a DNS name made of hex letters does not pass), and (when a browser sends one) same-origin. */
   private guard(req: IncomingMessage): { ok: true; address: string } | { ok: false; status: number; reason: string } {
     const address = req.socket.remoteAddress ?? '';
     if (!this.o.isAllowedAddress(address)) return { ok: false, status: 403, reason: 'address' };
     const host = parseHostHeader(req.headers.host);
-    if (!host || !/^[0-9a-f.:]+$/i.test(host.host)) return { ok: false, status: 421, reason: 'host' };
+    if (!host || isIP(host.host) === 0) return { ok: false, status: 421, reason: 'host' };
     const origin = req.headers.origin;
     if (origin !== undefined) {
       let oh = '';
@@ -176,19 +225,54 @@ export class ControllerServer {
       if (url.pathname.startsWith('/api/')) return await this.onApi(req, res, url, g.address);
       const st = req.method === 'GET' || req.method === 'HEAD' ? STATIC[url.pathname] : undefined;
       if (!st) return this.reply(res, 404, 'Not found');
-      const body = await readFile(path.join(this.o.uiDir, st.file));
-      this.reply(res, 200, req.method === 'HEAD' ? '' : body, st.type);
+      const a = await this.asset(st);
+      if (!a) return this.reply(res, 404, 'Not found');
+      this.sendAsset(req, res, st, a);
     } catch (e) {
       this.o.log('warn', 'controller http error', { error: (e as Error).message });
       if (!res.headersSent) this.reply(res, 500, 'Server error');
     }
   }
 
+  private sendAsset(req: IncomingMessage, res: ServerResponse, st: StaticEntry, a: Asset): void {
+    const head = req.method === 'HEAD';
+    const base = {
+      'Content-Type': st.type,
+      'Cache-Control': 'no-store',
+      'Content-Security-Policy': CSP,
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      Vary: 'Accept-Encoding',
+    };
+    if (a.gz && acceptsGzip(req.headers['accept-encoding'])) {
+      res.writeHead(200, { ...base, 'Content-Encoding': 'gzip', 'Content-Length': a.gz.length });
+      res.end(head ? undefined : a.gz);
+      return;
+    }
+    const total = a.raw.length;
+    if (st.ranges) {
+      const range = parseRange(req.headers.range, total);
+      if (range === 'bad') {
+        res.writeHead(416, { ...base, 'Content-Range': `bytes */${total}`, 'Content-Length': 0 });
+        res.end();
+        return;
+      }
+      if (range) {
+        res.writeHead(206, { ...base, 'Accept-Ranges': 'bytes', 'Content-Range': `bytes ${range.start}-${range.end}/${total}`, 'Content-Length': range.end - range.start + 1 });
+        res.end(head ? undefined : a.raw.subarray(range.start, range.end + 1));
+        return;
+      }
+    }
+    res.writeHead(200, { ...base, ...(st.ranges ? { 'Accept-Ranges': 'bytes' } : {}), 'Content-Length': total });
+    res.end(head ? undefined : a.raw);
+  }
+
   private async onApi(req: IncomingMessage, res: ServerResponse, url: URL, address: string): Promise<void> {
     if (!this.tokenOk(url)) return this.reply(res, 401, 'Bad or missing token');
     if (!this.apiAllowed(address)) return this.reply(res, 429, 'Slow down');
     const json = (status: number, v: unknown) => this.reply(res, status, JSON.stringify(v), 'application/json; charset=utf-8');
-    if (url.pathname === '/api/layouts' && req.method === 'GET') return json(200, this.o.layouts.get(address));
+    const phoneId = sanitizePhoneId(url.searchParams.get('id') ?? undefined);
+    if (url.pathname === '/api/layouts' && req.method === 'GET') return json(200, this.o.layouts.get(address, phoneId));
     if (url.pathname === '/api/default-layout' && req.method === 'GET') return json(200, defaultLayout());
     if (url.pathname === '/api/layouts' && req.method === 'PUT') {
       if (!/^application\/json\b/i.test(req.headers['content-type'] ?? '')) return this.reply(res, 415, 'Send application/json');
@@ -203,7 +287,7 @@ export class ControllerServer {
       } catch {
         return this.reply(res, 400, 'Bad JSON');
       }
-      return json(200, this.o.layouts.put(address, parsed));
+      return json(200, this.o.layouts.put(address, parsed, phoneId));
     }
     return this.reply(res, 404, 'Not found');
   }
@@ -231,7 +315,7 @@ export class ControllerServer {
   }
 
   private onConnection(ws: WebSocket, address: string): void {
-    const c: Conn = { id: randomBytes(8).toString('hex'), ws, address, joined: false, windowStart: Date.now(), frames: 0 };
+    const c: Conn = { id: randomBytes(8).toString('hex'), ws, address, joined: false, phoneId: undefined, windowStart: Date.now(), frames: 0 };
     this.conns.set(c.id, c);
     const helloTimer = setTimeout(() => {
       if (!c.joined) ws.close(1008, 'hello timeout');
@@ -253,9 +337,13 @@ export class ControllerServer {
       if (!m) return;
       if (m.t === 'hello') {
         if (c.joined) return;
-        const r = this.o.manager.join(c.id, m.name, address);
+        const r = this.o.manager.join(c.id, m.name, address, m.id);
         if (r.ok) {
           c.joined = true;
+          c.phoneId = m.id;
+          // The OLD socket gets close reason 'replaced' (documented in protocol.ts): the page treats it as final so two tabs of one phone
+          // do not take the slot from each other in a loop.
+          if (r.replaced) this.conns.get(r.replaced)?.ws.close(1000, 'replaced');
           this.send(ws, { t: 'welcome', slot: r.slot });
         } else {
           if (r.reason === 'driver') this.o.log('warn', 'phone controller: cannot create a virtual pad', { message: r.message });
@@ -266,12 +354,13 @@ export class ControllerServer {
       }
       if (!c.joined) return;
       if (m.t === 's') this.o.manager.update(c.id, m.pad);
+      else if (m.t === 'p') this.send(ws, { t: 'p', n: m.n });
       else this.o.manager.keepalive(c.id);
     });
     ws.on('close', () => {
       clearTimeout(helloTimer);
       this.conns.delete(c.id);
-      this.o.manager.leave(c.id);
+      this.o.manager.detach(c.id);
     });
     ws.on('error', () => ws.terminate());
   }
@@ -279,6 +368,36 @@ export class ControllerServer {
   private onTick(): void {
     for (const id of this.o.manager.tick()) this.conns.get(id)?.ws.close(1001, 'idle');
   }
+}
+
+function acceptsGzip(h: string | undefined): boolean {
+  if (!h) return false;
+  for (const part of h.split(',')) {
+    const [coding, ...params] = part.trim().toLowerCase().split(';');
+    if (coding !== 'gzip' && coding !== '*') continue;
+    const q = params.map((p) => p.trim()).find((p) => p.startsWith('q='));
+    if (!q || Number(q.slice(2)) > 0) return true;
+  }
+  return false;
+}
+
+/** One "bytes=a-b" / "bytes=a-" / "bytes=-n" range. null: no usable header (send the whole file); 'bad': 416. */
+function parseRange(h: string | undefined, total: number): { start: number; end: number } | 'bad' | null {
+  if (!h) return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(h.trim());
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  let start: number;
+  let end: number;
+  if (m[1] === '') {
+    const n = Number(m[2]);
+    if (n === 0) return 'bad';
+    start = Math.max(0, total - n);
+    end = total - 1;
+  } else {
+    start = Number(m[1]);
+    end = m[2] === '' ? total - 1 : Math.min(Number(m[2]), total - 1);
+  }
+  return start > end || start >= total ? 'bad' : { start, end };
 }
 
 /** Collects at most maxBytes; null if the body is larger (the rest of it is read and thrown away). */

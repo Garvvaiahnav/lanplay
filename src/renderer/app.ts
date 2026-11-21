@@ -104,17 +104,15 @@ namespace LP.App {
     }
 
     function firstRun(): void {
-      const big = (title: string, sub: string, mode: Mode): HTMLButtonElement =>
-        h('button', { type: 'button', class: 'big', onClick: () => pick(mode) }, h('span', { class: 'big-title' }, title), h('span', { class: 'big-sub' }, sub));
+      const choice = (title: string, mode: Mode): HTMLButtonElement =>
+        h('button', { type: 'button', class: 'choice', onClick: () => pick(mode) }, h('span', { class: 'choice-title' }, title));
       const mac = env.platform === 'darwin';
-      const first = big('Play on this screen', mac ? 'This Mac connects to another computer and shows its games.' : 'This computer connects to a gaming PC and shows its games.', 'client');
-      const host = mac
-        ? big('This Mac hosts games', 'Play games that run on this computer from another device. LanPlay sets it up for you.', 'host')
-        : big('This PC hosts games', 'This is the gaming PC. LanPlay sets it up for you.', 'host');
+      const first = choice('Play on this screen', 'client');
+      const host = choice(mac ? 'This Mac hosts games' : 'This PC hosts games', 'host');
       Dom.setChildren(slot, [h('main', { class: 'screen first' },
         h('h1', null, 'LanPlay'),
-        h('p', { class: 'lead' }, mac ? 'Play games from one computer on another in your home. What is this Mac for?' : 'Play PC games on another computer in your home. What is this computer for?'),
-        h('div', { class: 'bigs' }, first, host))]);
+        h('p', { class: 'lead' }, mac ? 'What is this Mac for?' : 'What is this computer for?'),
+        h('div', { class: 'choices' }, first, host))]);
       first.focus();
     }
 

@@ -4,6 +4,11 @@ One Electron + TypeScript app, one codebase. On the **Windows PC** it is the **h
 Sunshine silently and runs a small LAN-only *pair agent*. On the **Mac mini (M4)** it is the **client**: it finds the
 PC, pairs with no PIN typing, and launches the bundled moonlight-qt with the right flags.
 
+**0.5 note.** This document was written for v1 and is kept as the record of it. Where it says LAN only, that is true of the
+pair agent and the phone controllers, which stay on the home network. Since 0.5 a host can also be reached over the internet
+(typed address, code pairing); that is specified in `docs/RELEASE-0.5-PLAN.md` and explained in `docs/ONLINE.md`, and the
+changes to this spec are listed in section 8.
+
 Pinned upstreams (all GPL-3.0): Sunshine **v2026.914.233613** (commit `63d35f70`), moonlight-qt **v6.2.0**
 (commit `de2467e4`). Hashes are in `vendor/manifest.json`. The single source of truth for types, IPC and
 doc-derived constants is **`src/contracts.ts`**.
@@ -76,12 +81,16 @@ and must not import anything else from `src/host`.
      `Return="ignore"`, so the following steps **verify and repair** every effect themselves.
    - `service`: SunshineService exists → `sc.exe config SunshineService start= auto` if needed → running.
      If missing: run `<root>\scripts\install-service.bat` and `autostart-service.bat` (upstream scripts).
-   - `config`: `MergeSunshineConf(<root>\config\sunshine.conf, SUNSHINE_MANAGED_CONFIG)`; write only if changed.
+   - `config`: `MergeSunshineConf(<root>\config\sunshine.conf, sunshineManagedConfig(internet))`; write only if changed.
+     Since 0.5 the managed keys are `origin_web_ui_allowed = pc`, `upnp` (`enabled` only while the internet switch is on),
+     `address_family` (`both` while it is on, else `ipv4`), `hevc_mode = 0`, `av1_mode = 0`.
    - `credentials`: `<root>\sunshine.exe --creds lanplay <password>` (argv array; password registered with Redactor).
    - `restart-service`, `web-ui` (47990 listening; copy `config\credentials\cacert.pem` to
      `%ProgramData%\LanPlay\sunshine-cert.pem`, record `fingerprint256`), `api-auth` (GET /api/clients/list = 200),
      `firewall-sunshine` (rule "Sunshine" present else `<root>\scripts\add-firewall-rule.bat`),
-     `firewall-agent` (`set-agent-firewall-rule.ps1`: TCP+UDP 47920, RemoteAddress LocalSubnet, all profiles).
+     `firewall-agent` (`set-agent-firewall-rule.ps1`: TCP+UDP 47920, RemoteAddress LocalSubnet, all profiles),
+     `firewall-internet` (0.5, `set-internet-firewall-rule.ps1`: rule "LanPlay Internet Play", TCP 47984, 47989, 48010 and UDP
+     47998-48000, RemoteAddress Any, all profiles; created while the internet switch is on, removed when it is off).
 3. Child writes `HostSetupResult`; parent shows per-step pass/fail, then sets the login item (`--agent`) and starts the agent.
 
 ### 3.2 Pairing without PIN typing
@@ -104,8 +113,20 @@ In parallel: mDNS browse `_nvstream._tcp` (`bonjour-service` 1.4.4, MIT, maintai
 255.255.255.255 and each interface's directed broadcast on 47920 (agent replies `AgentDiscoveryReply`); after 3 s with no
 host, TCP-probe 47989 on each local IPv4 subnet (cap 1024 addresses, 300 ms timeout, 64 concurrent). Every candidate is
 confirmed with `GET http://<ip>:47989/serverinfo` (XML: `hostname`, `uniqueid`, `ServerCodecModeSupport`). Manual IP entry
-uses the same confirmation. macOS needs `NSLocalNetworkUsageDescription` and `NSBonjourServices = [_nvstream._tcp]`
+uses the same confirmation. Since 0.5 a typed address may be public (the host is then `remote`); mDNS, UDP and port-probe
+results are still private addresses only, so a public host can enter the list only by being typed. macOS needs `NSLocalNetworkUsageDescription` and `NSBonjourServices = [_nvstream._tcp]`
 in Info.plist (electron-builder `mac.extendInfo`), or the local-network prompt/denial will silently break discovery.
+
+### 3.2b Pairing over the internet (0.5)
+For a `remote` host the pair agent is not used (it answers private addresses only and is never forwarded).
+1. Client: `Moonlight list <ip>`; exit 0 means already paired.
+2. Client: generate a 4-digit PIN, spawn `Moonlight pair <ip> --pin <pin>`, show the PIN on screen (phase `show-code`).
+3. The host owner reads the PIN from the friend and types it in the host's "Add a device with a code" list, which calls
+   `GET /api/pin` (pending pairings, LAN and internet) and `POST /api/pin {pairing_id, pin, name}` on Sunshine. The
+   device is written to `paired-devices.json` with `pairedVia: 'code'`.
+4. Client waits up to 180 s for `Moonlight pair` to exit and also runs `Moonlight list` every 5 s; then `Moonlight list` must
+   exit 0, else `verify-failed`; no host entry in 180 s gives `code-timeout`.
+The PIN is never sent to the host by LanPlay. The stock Moonlight app on Android, iOS or a TV pairs through the same list.
 
 ### 3.4 Stream
 `['stream', ip, appName, --1080|--1440|--4K, --fps N, --bitrate Mbps*1000, --video-codec auto|H.264|HEVC|AV1,
@@ -114,6 +135,9 @@ Codec Auto (`ResolveCodec`): AV1 only if chip generation ≥ 3 (`os.cpus()[0].mo
 host advertises AV1 in `ServerCodecModeSupport`; else HEVC; else H.264. Keyboard/mouse are Moonlight's own.
 
 ## 4. Security
+(0.5: the agent, Sunshine REST and phone-controller rules below are unchanged. Internet exposure is its own text in
+`docs/ONLINE.md`: with the internet switch on, Sunshine's TCP 47984, 47989, 48010 and UDP 47998-48000 are open to the
+internet; 47990, 47920 and 47921 are never forwarded; auto-approve applies to LAN sources only.)
 - Electron: `SECURITY` in contracts (contextIsolation, sandbox, no nodeIntegration, CSP, navigation and `window.open`
   denied except listed license URLs via `shell.openExternal`, all permission requests denied). Main validates every IPC
   payload; errors cross as `IpcEnvelope`.
@@ -185,6 +209,18 @@ Append here: date, what changed, why. Both builders re-run `npm run typecheck &&
     collecting; logs are read from `%ProgramData%\LanPlay\logs` too when the app fell back to `%LOCALAPPDATA%`.
   - Packaging: `npm run pack:*` pass `--config scripts/electron-builder.config.cjs`; mac target is `dir` only.
 
+- 2026-11-21 (release 0.5, plan `docs/RELEASE-0.5-PLAN.md`): direct-IP internet play. Supersedes the 2026-11-13 line "manual
+  and mDNS hosts must be private addresses": a typed address may now be public, mDNS/UDP/port-probe still may not.
+  - Contracts: `HostInfo.remote`; preset `internet` (1080p, 60 fps, 15 Mbps); `BITRATE_LIMITS_MBPS.min` 20 to 5;
+    `PairProgress.phase` `show-code` with `code`; `PairErrorCode` `code-timeout`; `sunshineManagedConfig(internet)` replaces the
+    constant (`origin_web_ui_allowed` is `pc` for everyone); step `firewall-internet`; `InternetHostState`,
+    `PendingCodePairing`; IPC `host:internet-get`, `host:internet-set`, `host:pending-list`, `host:pending-pair`,
+    `host:pending-reject`, event `host:internet-changed`, `client:recent-remote`.
+  - Phone controller: the access token is persistent (kept in host settings, changes only with "New link"); it was
+    wrongly called per-session. Layouts and player slots are keyed by a phone id (hello `id`); a closed socket keeps the pad
+    and slot for 15 s; ping `p` / pong; the Host header check uses `net.isIP`.
+  - Not changed: `isPrivateAddress`, the agent's HTTP handler guards, the LAN pairing flow.
+
 ## 9. Verified facts (exact quotes)
 
 **Sunshine** (tag v2026.914.233613)
@@ -230,6 +266,9 @@ Append here: date, what changed, why. Both builders re-run `npm run typecheck &&
   `expires_at` (newest last).
 - Config parsing (config.cpp): text after `#` is stripped; `parse_config` uses `emplace` => the FIRST duplicate key wins;
   `upnp` is a bool (`true/yes/enable/enabled/on/1`), `origin_web_ui_allowed` in `{pc, lan, wan}`, `hevc_mode`/`av1_mode` 0..3.
+- (0.5) The bundled macOS Sunshine's web settings page (same tag) offers `address_family` `ipv4` ("IPv4 only") and `both`
+  ("IPv4+IPv6"), defaults `upnp: disabled`, `origin_web_ui_allowed: lan`, `wan_encryption_mode: 1` ("Enabled for supported
+  clients (default)"). Read from `vendor/sunshine-macos-arm64/.../assets/web/assets/config-*.js` and `locale/en.json`, not run.
 - Silent MSI action runs as LocalSystem (`Execute="deferred" Impersonate="no" Return="ignore"`), so `sunshine-setup.ps1`
   logs to SYSTEM's `%TEMP%\Sunshine\logs\install`; it runs `migrate-config.bat`, which makes `config\credentials`
   admin-only (`icacls ... /inheritance:r`, Administrators full, Users read on the folder only): a normal user cannot
@@ -271,6 +310,10 @@ published 2026-07-28). PowerShell portable `powershell-7.7.0-osx-arm64.tar.gz` s
 8. Electron runtime: `npm install` ran with `ELECTRON_SKIP_BINARY_DOWNLOAD=1` because the Electron binary comes from
    github.com/electron/electron releases, which is outside the download allow-list. **Decision needed** to fetch it
    (checksum-verified by `@electron/get`) before `npm start` / packaging.
+
+9. (0.5) Everything about internet play on a real network: see `docs/ONLINE.md` "Known unknowns" (`Moonlight pair` exit
+   behaviour, UPnP on real routers, the Windows firewall rule, CGNAT, IPv6, `IP:port` against a real Sunshine) and
+   `docs/WINDOWS-TEST.md` section G.
 
 ## 11. Build order (test first, commit per step, aim for 80%+ line coverage on src/shared, src/client, src/host)
 **Builder A:** (1) `exec.ts` + `redact.ts` + `logger.ts` → (2) `chip.ts`, `codec.ts`, presets clamp, `moonlight.ts` argv
